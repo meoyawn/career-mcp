@@ -39,7 +39,8 @@ function registerTool<Schema extends v.GenericSchema>(
   });
 }
 
-export function createServer(db: D1Database) {
+export function createServer(database: D1Database, userId: string) {
+  const db: store.UserStore = { db: database, userId };
   const server = new McpServer({ name: "careers-mcp", version: "0.1.0" }, { instructions });
 
   registerTool(server, "get_context", "Start here: load your criteria and active pipeline. Use next_offset with list_jobs for additional jobs.",

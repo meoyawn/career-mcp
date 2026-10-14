@@ -4,7 +4,7 @@ A personal job-search CRM exposed as an MCP server on Cloudflare Workers, backed
 
 Save your selection criteria as natural-language text, import job descriptions, and let your LLM filter and rank them. Track multiple applications independently, with freely named stages, interview schedules, outcomes, recruiter details, and optional feedback. Voice feedback is stored as transcribed text; your chat/voice client handles transcription.
 
-The server is a single-user first iteration. Every MCP request requires your bearer token. The LLM does the reasoning; the Worker stores and retrieves the data. All timestamps are normalized to UTC RFC3339 strings such as `2026-11-02T17:00:00.000Z`.
+Sign in or create an account with a passkey; no password, email, or shared token is required. Multiple users share one D1 database, with separate criteria, applications, stages, feedback, and calendar links. The LLM does the reasoning; the Worker stores and retrieves the data. All timestamps are normalized to UTC RFC3339 strings such as `2026-11-02T17:00:00.000Z`.
 
 ## Local development
 
@@ -12,18 +12,11 @@ Use Node.js 22.18+ and the installed Aube package manager:
 
 ```fish
 aube install
-node -e 'require("node:fs").writeFileSync(".dev.vars", "MCP_AUTH_TOKEN=" + require("node:crypto").randomBytes(32).toString("hex") + "\n", { mode: 0o600 })'
 aube run db:migrate
 aube run dev
 ```
 
-The command creates a private `.dev.vars` file. Keep its token for your MCP client. The file is ignored by Git. A template is provided in `.dev.vars.example`.
-
-Connect a remote MCP client using Streamable HTTP at `http://localhost:8787/mcp`, with the header:
-
-```text
-Authorization: Bearer <your-token>
-```
+Open `http://localhost:8787/` to create a passkey, or connect an OAuth-capable MCP client using Streamable HTTP at `http://localhost:8787/mcp`. The client opens the sign-in page; create or use a passkey, then allow the connection. Localhost supports passkeys during development; production requires HTTPS.
 
 For clients that support the `mcpServers` configuration format:
 
@@ -31,14 +24,15 @@ For clients that support the `mcpServers` configuration format:
 {
   "mcpServers": {
     "careers": {
-      "url": "http://localhost:8787/mcp",
-      "headers": { "Authorization": "Bearer <your-token>" }
+      "url": "http://localhost:8787/mcp"
     }
   }
 }
 ```
 
-Both current MCP and stateless legacy clients are supported. Native clients can supply the bearer header without browser CORS. Browser requests must originate from the Worker's own origin. `/health` is public and reports process health; MCP fails closed with HTTP 503 if the token is absent.
+The client must support OAuth discovery, dynamic client registration, and authorization-code exchange with S256 PKCE. It manages its own access and refresh tokens. MCP supports both current and stateless legacy protocol versions after authentication. Browser MCP requests must originate from the Worker's own origin; native clients have no browser CORS restriction. `/health` is public and reports process health.
+
+The account page lets you add another passkey, sign out, or disconnect all MCP clients. Signing out clears the browser session; disconnecting clients revokes their OAuth grants. Keep a synced passkey or add a backup passkey: there is no password or email recovery flow. Passkeys are tied to the hostname, so use a stable production address.
 
 ## Deploy
 
@@ -52,11 +46,16 @@ Replace the placeholder `database_id` in `wrangler.jsonc` with the ID returned b
 ```fish
 aube run types
 aube run db:migrate:remote
-aube exec wrangler secret put MCP_AUTH_TOKEN
 aube run deploy
 ```
 
-Use a long random token and enter it at Wrangler's secret prompt. Connect your MCP client to `https://careers-mcp.<your-subdomain>.workers.dev/mcp` with the bearer header. Local and remote D1 storage are separate.
+Connect your MCP client to `https://careers-mcp.<your-subdomain>.workers.dev/mcp` and sign in with a passkey. Local and remote D1 storage are separate. Users, credential public keys, challenges, sessions, clients, and OAuth grants all use this same D1 database; no extra database, KV namespace, or identity provider is needed.
+
+Apply `0001_initial.sql` before the first deployment. It creates the complete user-scoped CRM and passkey/OAuth schema in one migration.
+
+Every store operation takes a user scope derived from a verified access token. Ownership is checked on reads, updates, ranking batches, parent-child links, resources, prompts, feedback searches, and calendar drafts. Nicknames (case-insensitive) and source URLs are unique within each user's jobs. Composite foreign keys reject stages and feedback attached to another user's records. Clients cannot supply or override a user ID.
+
+WebAuthn requires discoverable credentials and user verification. Challenges are tied to a browser cookie, expire after five minutes, and are consumed once. Browser sessions last seven days. OAuth codes expire after one minute; access tokens last one hour, and refresh tokens rotate with a 30-day lifetime. Session and OAuth token values are stored only as SHA-256 hashes. Consent displays the client name and callback host; redirect URIs, PKCE, client IDs, and the MCP resource are checked before issuing tokens.
 
 ## Workflow and tools
 
@@ -131,6 +130,6 @@ UTC `Z` timestamps follow Google Calendar's [RFC3339 event time format](https://
 aube run check
 ```
 
-This runs the TypeScript 7 native preview compiler, Oxlint, integration tests, and a Worker deployment dry run. Tests boot Wrangler with an isolated temporary D1 database and exercise MCP over HTTP: criteria/ranking, concurrent applications, stage outcomes, transcripts, UTC calendar drafts, saved event IDs, authorization, validation, and atomic import rollback. They do not touch your development or remote database and do not create Google events.
+This runs the TypeScript 7 native preview compiler, Oxlint, integration tests, and a Worker deployment dry run. Tests boot Wrangler with an isolated temporary D1 database and exercise signed WebAuthn registration/login, OAuth/PKCE, token rotation/revocation, two-user isolation across MCP tools/resources/prompts, criteria/ranking, stage outcomes, transcripts, UTC calendar drafts, validation, and atomic import rollback. Schema checks reject unowned jobs and cross-user foreign keys. Tests do not touch your development or remote database or create Google events.
 
 The native compiler is pinned as `@typescript/native-preview`; `tsgo` performs type checking and Wrangler bundles TypeScript. After changing Worker bindings or secrets, regenerate `worker-configuration.d.ts` with `aube run types`. Commit `aube-lock.yaml` for reproducible installs (`aube install --frozen-lockfile`).
