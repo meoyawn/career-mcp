@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { setTimeout } from "node:timers/promises";
-import { promisify } from "node:util";
+import { promisify, stripVTControlCharacters } from "node:util";
 import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
 import * as v from "valibot";
 import { assertion, authorize, browserFor, enroll, exchange } from "./passkey-client.ts";
@@ -60,7 +60,11 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       d1_databases: [{ binding: "DB", database_name: "careers", database_id: "00000000-0000-0000-0000-000000000000", migrations_dir: resolve("migrations") }],
     }));
     await writeFile(join(directory, ".dev.vars"), "", { mode: 0o600 });
-    const environment = { ...process.env, CI: "true", WRANGLER_SEND_METRICS: "false" };
+    // Exercise startup with the terminal formatting used by interactive deployments.
+    const environment = {
+      ...process.env, CI: "true", WRANGLER_SEND_METRICS: "false",
+      FORCE_COLOR: "1", TERM: "xterm-256color", NO_COLOR: undefined, NODE_DISABLE_COLORS: undefined,
+    };
     await execute(process.execPath, [wrangler, "d1", "migrations", "apply", "careers", "--local", "--config", testConfig, "--persist-to", directory], { env: environment });
     worker = spawn(process.execPath, [wrangler, "dev", "--local", "--port", "0", "--inspector-port", "0", "--config", testConfig, "--persist-to", directory], { env: environment, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
@@ -68,7 +72,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     worker.stdout?.on("data", capture);
     worker.stderr?.on("data", capture);
     for (let attempt = 0; attempt < 200; attempt++) {
-      const match = output.match(/Ready on (http:\/\/(?:localhost|127\.0\.0\.1):\d+)/u);
+      const match = stripVTControlCharacters(output).match(/Ready on (http:\/\/(?:localhost|127\.0\.0\.1):\d+)/u);
       if (match?.[1]) { endpoint = new URL("/mcp", match[1]); break; }
       if (worker.exitCode !== null) throw new Error(`Worker exited during startup:\n${output}`);
       await setTimeout(100);
