@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "career-mcp-local",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "secrets": { "required": ["MCP_AUTH_TOKEN"] },
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "careers",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

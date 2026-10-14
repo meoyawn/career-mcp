@@ -1,0 +1,136 @@
+# Careers MCP
+
+A personal job-search CRM exposed as an MCP server on Cloudflare Workers, backed by D1 SQLite. TypeScript, Valibot schemas, Aube, Oxlint, and the TypeScript 7 native compiler (`tsgo`).
+
+Save your selection criteria as natural-language text, import job descriptions, and let your LLM filter and rank them. Track multiple applications independently, with freely named stages, interview schedules, outcomes, recruiter details, and optional feedback. Voice feedback is stored as transcribed text; your chat/voice client handles transcription.
+
+The server is a single-user first iteration. Every MCP request requires your bearer token. The LLM does the reasoning; the Worker stores and retrieves the data. All timestamps are normalized to UTC RFC3339 strings such as `2026-11-02T17:00:00.000Z`.
+
+## Local development
+
+Use Node.js 22.18+ and the installed Aube package manager:
+
+```fish
+aube install
+node -e 'require("node:fs").writeFileSync(".dev.vars", "MCP_AUTH_TOKEN=" + require("node:crypto").randomBytes(32).toString("hex") + "\n", { mode: 0o600 })'
+aube run db:migrate
+aube run dev
+```
+
+The command creates a private `.dev.vars` file. Keep its token for your MCP client. The file is ignored by Git. A template is provided in `.dev.vars.example`.
+
+Connect a remote MCP client using Streamable HTTP at `http://localhost:8787/mcp`, with the header:
+
+```text
+Authorization: Bearer <your-token>
+```
+
+For clients that support the `mcpServers` configuration format:
+
+```json
+{
+  "mcpServers": {
+    "careers": {
+      "url": "http://localhost:8787/mcp",
+      "headers": { "Authorization": "Bearer <your-token>" }
+    }
+  }
+}
+```
+
+Both current MCP and stateless legacy clients are supported. Native clients can supply the bearer header without browser CORS. Browser requests must originate from the Worker's own origin. `/health` is public and reports process health; MCP fails closed with HTTP 503 if the token is absent.
+
+## Deploy
+
+```fish
+aube exec wrangler login
+aube exec wrangler d1 create careers
+```
+
+Replace the placeholder `database_id` in `wrangler.jsonc` with the ID returned by D1. Then:
+
+```fish
+aube run types
+aube run db:migrate:remote
+aube exec wrangler secret put MCP_AUTH_TOKEN
+aube run deploy
+```
+
+Use a long random token and enter it at Wrangler's secret prompt. Connect your MCP client to `https://careers-mcp.<your-subdomain>.workers.dev/mcp` with the bearer header. Local and remote D1 storage are separate.
+
+## Workflow and tools
+
+The server's MCP instructions tell the agent to start each conversation with `get_context`. That returns the current criteria and a page of active applications. The criteria also appear in `list_jobs`, `get_job`, the `careers://criteria` resource, and the `rank_jobs` prompt. Clients still need to actually call a tool or read the resource to put D1 data into the model's context.
+
+| Tool | Purpose |
+| --- | --- |
+| `get_context` | Load criteria and the active pipeline. |
+| `set_criteria` | Save natural-language criteria and increment their revision. |
+| `add_jobs` | Import up to 25 job descriptions atomically. |
+| `list_jobs` | Search company, title, or nickname; filter and rank by score. |
+| `get_job` | Load an opening, its stages, calendar details, and feedback. |
+| `qualify_jobs` | Save LLM decisions, scores, and rationales against a criteria revision. |
+| `update_job` | Edit opening/contact details, status, or the current stage. |
+| `add_stage` | Add any named stage and optionally its schedule. |
+| `update_stage` | Record an outcome, reschedule, or link a calendar event. |
+| `add_feedback` | Append a transcript or feedback text to a stage. |
+| `update_feedback` | Correct a feedback entry. |
+| `list_feedback` | Review feedback across jobs and stage names to improve. |
+| `get_upcoming` | Retrieve scheduled stages in a UTC time window. |
+| `get_calendar_event` | Prepare arguments for the Google Calendar plugin. |
+
+Example progression:
+
+1. `set_criteria`: “Remote TypeScript roles, product teams, no onsite-only work.”
+2. `add_jobs`: save each opening's company, title, description, optional source URL, and optional nickname such as `google-platform`.
+3. Use the `rank_jobs` prompt or call `list_jobs` with `include_descriptions: true` and `needs_review: true`. The agent evaluates the descriptions, then calls `qualify_jobs` with `criteria_revision`, each `job_id`, `qualification` (`qualified` or `excluded`), a `score` from 0–100, and a `reason`.
+4. `list_jobs` with `qualification: "qualified"` returns the strongest matches first. Excluded leads stay saved. Criteria changes mark assessments stale; editing an opening's company, title, description, or location resets its assessment to pending.
+5. “Google's recruiter offered a screening Monday at 9 AM Pacific.” The agent resolves the exact opening with `list_jobs`, clarifies if several match, and calls `add_stage` with a concrete date and UTC offset.
+6. After the round, use `update_stage` to mark `passed`, `failed`, or `completed`. Optionally add your verbatim reflection using `add_feedback`; no feedback is required.
+7. Add another stage for the next round, or use `update_job` to mark the application `rejected`, `withdrawn`, `offer`, or `accepted`.
+
+Stage names are free text. `add_stage.make_current` defaults to true; `update_stage.make_current` defaults to false. A failed stage does not automatically close the application. Different companies and multiple openings at the same company have independent UUIDs and histories. Mutations use those exact IDs; nickname and source URL uniqueness help catch duplicate imports. To retry an uncertain mutation, first retrieve its result; appending stages or feedback creates a new entry each time.
+
+`list_jobs`, `list_feedback`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. After saving a ranking batch, retrieve `offset: "0"` again: saved decisions leave the `needs_review` result set. Use `next_offset` only when reading pages without saving between them.
+
+## Google Calendar integration
+
+Connect this MCP and the [Google Calendar plugin](plugin://google-calendar@openai-curated-remote) to the same agent. The agent uses both: Careers stores the interview process, while Google Calendar performs calendar actions.
+
+1. Save the stage with `starts_at` and, when known, `ends_at`. Inputs need `Z` or a UTC offset. Optional IANA `timezone` metadata can preserve the timezone you discussed; the default is UTC. Every stored timestamp and calendar draft uses UTC.
+2. Call `get_calendar_event` with `stage_id`. It returns `missing_fields`, a suggested action, and `create_event_args`, `update_event_args`, or `delete_event_args` matching the connected plugin's tool names and fields.
+3. Resolve missing start/end details before creating a timed event. Use Google Calendar's `get_availability` to check the relevant time window, with `response_timezone_str: "UTC"`.
+4. For creation, call Google Calendar's `create_event` with the returned arguments. `attendees` defaults to `[]`, so a personal interview reminder does not invite the recruiter. Supply attendees to `get_calendar_event` only if invitations were requested. Calendar drafts include a stable `Careers MCP stage: <stage_id>` marker and omit feedback, rankings, and private CRM notes.
+5. After Google confirms creation, call `update_stage` with its returned `calendar_event_id` and `calendar_id` (`primary` or a calendar ID from `list_calendars`).
+6. For rescheduling, update the stage times, retrieve the draft, read the linked Google event, and call `update_event` using the same calendar/event IDs. The draft preserves guest membership; the agent can adjust guests through Google's tools after reading the event.
+7. For cancellation, mark the stage `cancelled`, retrieve the delete arguments, and perform the user-requested deletion. Clear both saved IDs only after Google confirms deletion.
+
+Before creating an event for an unlinked stage, search its bounded time window for the stage marker. This recovers a Google event created successfully when the response or the subsequent D1 write failed. If an event is linked, the draft selects update instead of creation. Changes in Google Calendar can be copied back through `update_stage`; this first iteration has agent-mediated synchronization rather than background polling.
+
+Example `create_event_args`:
+
+```json
+{
+  "calendar_id": "primary",
+  "title": "Google — Screening (Software Engineer)",
+  "start_time": "2026-11-02T17:00:00.000Z",
+  "end_time": "2026-11-02T17:30:00.000Z",
+  "timezone_str": "UTC",
+  "attendees": [],
+  "description": "Company: Google\nRole: Software Engineer\nStage: Screening\nCareers MCP stage: <stage_id>",
+  "location": "https://meet.google.com/example",
+  "visibility": "private"
+}
+```
+
+UTC `Z` timestamps follow Google Calendar's [RFC3339 event time format](https://developers.google.com/workspace/calendar/api/v3/reference/events/insert). Calendar clients display them in your selected local timezone. The server never calls Google directly and needs no Google credentials.
+
+## Checks
+
+```fish
+aube run check
+```
+
+This runs the TypeScript 7 native preview compiler, Oxlint, integration tests, and a Worker deployment dry run. Tests boot Wrangler with an isolated temporary D1 database and exercise MCP over HTTP: criteria/ranking, concurrent applications, stage outcomes, transcripts, UTC calendar drafts, saved event IDs, authorization, validation, and atomic import rollback. They do not touch your development or remote database and do not create Google events.
+
+The native compiler is pinned as `@typescript/native-preview`; `tsgo` performs type checking and Wrangler bundles TypeScript. After changing Worker bindings or secrets, regenerate `worker-configuration.d.ts` with `aube run types`. Commit `aube-lock.yaml` for reproducible installs (`aube install --frozen-lockfile`).
