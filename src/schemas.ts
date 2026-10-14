@@ -3,7 +3,7 @@ import * as v from "valibot";
 const text = (max: number) => v.pipe(v.string(), v.minLength(1), v.maxLength(max), v.regex(/^[\s\S]*\S[\s\S]*$/, "Use non-blank text."));
 const id = v.pipe(v.string(), v.uuid());
 const email = v.pipe(v.string(), v.email(), v.maxLength(320));
-const url = v.pipe(v.string(), v.url(), v.regex(/^https?:\/\//, "Use an HTTP or HTTPS URL."), v.maxLength(2_000));
+const url = v.pipe(v.string(), v.url(), v.regex(/^https?:\/\/[\s\S]*$/, "Use an HTTP or HTTPS URL."), v.maxLength(2_000));
 const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
 const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100));

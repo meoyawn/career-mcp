@@ -77,7 +77,6 @@ function duplicateError(error: unknown): never {
 
 export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   const { db, userId } = scope;
-  if (!await getCriteria(scope)) fail("Save your criteria with set_criteria, then evaluate openings before adding qualified leads.");
   const now = new Date().toISOString();
   const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
     (user_id, id, company, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score, created_at, updated_at)

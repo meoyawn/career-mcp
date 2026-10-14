@@ -18,6 +18,7 @@ let token: string;
 const jobSchema = v.object({
   id: v.string(), company: v.string(), title: v.string(), nickname: v.nullable(v.string()),
   current_stage: v.string(), status: v.string(), score: v.nullable(v.number()),
+  source_url: v.nullable(v.string()), created_at: v.pipe(v.string(), v.isoTimestamp(), v.regex(/Z$/u)),
 });
 const jobsSchema = v.object({ jobs: v.array(jobSchema), next_offset: v.optional(v.nullable(v.number())) });
 const stageSchema = v.object({
@@ -110,12 +111,16 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
-  test("criteria are required before saving qualified leads singly or in batches, and ranking stays independent", async () => {
+  test("explicit imports need no criteria, conflicting filters preserve leads, and ranking stays independent", async () => {
     const criteriaOutput = v.strictObject({ user_id: v.string(), text: v.string(), updated_at: v.string() });
-    const opening = { company: "Google", title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work" };
-    await error("add_jobs", { jobs: [opening] }, /set_criteria/u);
-    await error("add_job", opening, /set_criteria/u);
-    assert.deepEqual((await call("list_jobs", {}, jobsSchema)).jobs, []);
+    const opening = { company: "Google", title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work", source_url: "https://jobs.example/google" };
+    const importStartedAt = Date.now();
+    const google = await call("add_job", { ...opening, score: 95 }, jobSchema);
+    const firstBatch = await call("add_jobs", { jobs: [
+      { company: "Google", title: "Backend engineer", nickname: "google-backend", description: "Remote backend work", score: 70, source_url: "http://jobs.example/google-backend" },
+    ] }, jobsSchema);
+    assert.equal((await call("get_context", {}, v.object({ criteria: v.null() }))).criteria, null);
+    assert.equal((await call("list_jobs", {}, jobsSchema)).jobs.length, 2);
     const text = "\n# Job selection criteria\r\n\r\n- Remote TypeScript roles.\r\n- Exclude onsite-only work.\r\n\r\n## Ranking\nPrefer product teams; score stack fit from 0–100.\nПродуктовые команды в приоритете.\n ";
     const { tools } = await client.listTools();
     const criteriaTool = tools.find((tool) => tool.name === "set_criteria");
@@ -130,20 +135,41 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     for (const blank of ["", " \t\r\n", "\u00a0\u2003"]) {
       assert.equal(new RegExp(pattern).exec(blank), null);
     }
+    for (const name of ["add_job", "add_jobs", "update_job"]) {
+      const sourceTool = tools.find((tool) => tool.name === name);
+      assert.ok(sourceTool);
+      const schema = name === "add_jobs"
+        ? v.parse(v.object({ properties: v.object({ jobs: v.object({ items: v.record(v.string(), v.unknown()) }) }) }), sourceTool.inputSchema).properties.jobs.items
+        : sourceTool.inputSchema;
+      const { properties: { source_url: sourceSchema } } = v.parse(v.object({
+        properties: v.object({ source_url: v.record(v.string(), v.unknown()) }),
+      }), schema);
+      const variants = Array.isArray(sourceSchema.anyOf) ? sourceSchema.anyOf : [sourceSchema];
+      const patternSchema = v.object({ type: v.literal("string"), pattern: v.string() });
+      const { pattern: urlPattern } = v.parse(patternSchema, variants.find((variant) => v.is(patternSchema, variant)));
+      for (const sourceUrl of [opening.source_url, "http://jobs.example/engineer?team=tools#apply"]) {
+        assert.equal(new RegExp(urlPattern).exec(sourceUrl)?.[0], sourceUrl);
+      }
+      assert.equal(new RegExp(urlPattern).exec("ftp://jobs.example/engineer"), null);
+    }
     const criteria = await call("set_criteria", { text }, criteriaOutput);
     assert.equal(criteria.text, text);
     await error("set_criteria", { text: " \t\r\n" }, /non-blank/u);
     await error("set_criteria", { text: "x".repeat(20_001) }, /length|characters/u);
-    const google = await call("add_job", { ...opening, score: 95 }, jobSchema);
     assert.equal(google.current_stage, "lead");
     assert.equal(google.score, 95);
+    assert.equal(google.source_url, opening.source_url);
     const imported = await call("add_jobs", { jobs: [
-      { company: "Microsoft", title: "Backend engineer", description: "Remote backend work", score: 70 },
-      { company: "New Co", title: "TypeScript engineer", description: "Remote TypeScript product work" },
+      { company: "New Co", title: "Onsite engineer", description: "Onsite-only product work explicitly supplied by the user" },
     ] }, jobsSchema);
-    assert.equal(imported.jobs.length, 2);
-    const microsoft = imported.jobs.find((job) => job.company === "Microsoft");
-    assert.ok(microsoft);
+    assert.equal(imported.jobs.length, 1);
+    const backend = firstBatch.jobs.find((job) => job.title === "Backend engineer");
+    assert.ok(backend);
+    assert.equal(backend.source_url, "http://jobs.example/google-backend");
+    const importFinishedAt = Date.now();
+    for (const job of [google, ...firstBatch.jobs, ...imported.jobs]) {
+      assert.ok(Date.parse(job.created_at) >= importStartedAt && Date.parse(job.created_at) <= importFinishedAt);
+    }
     assert.equal(imported.jobs.find((job) => job.company === "New Co")?.score, null);
     const context = await call("get_context", {}, v.object({ criteria: criteriaOutput }));
     assert.deepEqual(context.criteria, criteria);
@@ -155,12 +181,14 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.match(prompt.messages[0].content.text, /Remote TypeScript platform work/u);
     const ranked = await call("list_jobs", { limit: 1 }, jobsSchema);
     assert.equal(ranked.jobs[0]?.id, google.id);
+    assert.equal(ranked.jobs[0]?.created_at, google.created_at);
     assert.equal(ranked.next_offset, 1);
-    assert.equal((await call("list_jobs", { limit: 1, offset: 1 }, jobsSchema)).jobs[0]?.id, microsoft.id);
+    assert.equal((await call("list_jobs", { limit: 1, offset: 1 }, jobsSchema)).jobs[0]?.id, backend.id);
     await call("set_criteria", { text }, criteriaOutput);
     const openingsOutput = v.object({ jobs: v.array(v.record(v.string(), v.unknown())), next_offset: v.null() });
     const openingsBefore = await call("list_jobs", { include_descriptions: true }, openingsOutput);
     for (const job of openingsBefore.jobs) {
+      assert.equal(job.status, "active");
       for (const field of ["qualification", "qualification_reason", "needs_review"]) assert.equal(Object.hasOwn(job, field), false);
     }
     const changed = await call("set_criteria", { text: "Remote TypeScript roles, prefer product teams." }, criteriaOutput);
@@ -171,6 +199,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal((await call("list_jobs", {}, jobsSchema)).jobs.length, 3);
     const updated = await call("update_job", { job_id: google.id, description: "Remote TypeScript product role" }, jobSchema);
     assert.equal(updated.score, null);
+    assert.equal(updated.created_at, google.created_at);
     const reranked = await call("update_job", { job_id: google.id, title: "Senior TypeScript engineer", score: 98 }, jobSchema);
     assert.equal(reranked.score, 98);
   });

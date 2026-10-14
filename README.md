@@ -2,7 +2,7 @@
 
 A personal job-search CRM exposed as an MCP server on Cloudflare Workers, backed by D1 SQLite. TypeScript, Valibot schemas, Aube, Oxlint, and the TypeScript 7 native compiler (`tsgo`).
 
-Save your selection criteria as natural-language text and let your LLM evaluate openings before saving qualified leads. Rank saved leads and track multiple applications independently, with freely named stages, interview schedules, outcomes, recruiter details, and optional feedback. Voice feedback is stored as transcribed text; your chat/voice client handles transcription.
+Import every opening you explicitly supply, then assess and rank the saved leads. Selection criteria apply to scraping: the LLM filters and ranks each company's openings and adds only its best eligible opening. Explicit imports never require criteria or a fit assessment. Track applications independently, with freely named stages, interview schedules, outcomes, recruiter details, and optional feedback. Voice feedback is stored as transcribed text; your chat/voice client handles transcription.
 
 Sign in or create an account with a passkey; no password, email, or shared token is required. Multiple users share one D1 database, with separate criteria, applications, stages, feedback, and calendar links. The LLM does the reasoning; the Worker stores and retrieves the data. All timestamps are normalized to UTC RFC3339 strings such as `2026-11-02T17:00:00.000Z`.
 
@@ -50,13 +50,13 @@ Select your intended account in the browser. To refresh an expired profile, run 
 
 For API-token authentication instead, copy `.env.deploy.example` to `.env.deploy`, restrict it with `chmod 600 .env.deploy`, and enter your token locally. Scope it to the intended account with Workers Scripts:Edit and D1:Edit; Account Settings:Read supports account discovery. `.env.deploy` and other `.env.*` files are Git-ignored; only the placeholder example is tracked. The remote migration and publish commands load `.env.deploy` through Node, so deploy credentials are not loaded by local development, type generation, or bundled into the Worker. CI can supply `CLOUDFLARE_API_TOKEN` as an encrypted secret environment variable instead; existing environment variables take precedence over the file. Never put tokens in Wrangler config, command arguments, or committed files.
 
-Once authenticated, every deployment uses:
+Once authenticated, every deployment uses the Taskfile workflow:
 
 ```fish
-aube run deploy
+task deploy
 ```
 
-This runs type checking, lint, integration tests, and a bundle dry run before applying pending remote D1 migrations and publishing the Worker. A failed step stops the deployment. Already-applied migrations are skipped on subsequent runs. Migrations and publishing are separate operations: if publishing fails after a migration succeeds, fix the failure and rerun; future schema changes should remain compatible with the currently deployed Worker.
+This runs type checking, lint, integration tests, and a bundle dry run before applying pending remote D1 migrations and publishing the Worker, then refreshes CareerMCP tools with `mcp-refresh refresh CareerMCP`. Create a new Codex thread afterward to verify through the refreshed tools; existing threads retain their cached schemas. A failed step stops the workflow. Already-applied migrations are skipped on subsequent runs. Migrations and publishing are separate operations: if publishing fails after a migration succeeds, fix the failure and rerun; future schema changes should remain compatible with the currently deployed Worker.
 
 For a new account, create the database once with `aube exec -- wrangler d1 create careers --update-config=false`, set its `database_id` in `wrangler.jsonc`, and run `aube run types` before deploying. Local and remote D1 storage are separate.
 
@@ -76,8 +76,8 @@ The server's MCP instructions tell the agent to start each conversation with `ge
 | --- | --- |
 | `get_context` | Load criteria and the active pipeline. |
 | `set_criteria` | Save or replace the user's single natural-language criteria document. |
-| `add_job` | Save one already-qualified lead, with an optional ranking score. |
-| `add_jobs` | Save 1–25 already-qualified leads atomically. |
+| `add_job` | Save one lead without a criteria prerequisite; record its UTC import time. |
+| `add_jobs` | Save 1–25 leads atomically without pre-filtering explicit imports. |
 | `list_jobs` | Search company, title, or nickname; filter and rank by score. |
 | `get_job` | Load an opening, its stages, calendar details, and feedback. |
 | `update_job` | Edit opening/contact details, status, the current stage, or ranking score. |
@@ -92,16 +92,18 @@ The server's MCP instructions tell the agent to start each conversation with `ge
 Example progression:
 
 1. `set_criteria`: “Remote TypeScript roles, product teams, no onsite-only work.”
-2. `get_context`: load the saved criteria. Evaluate each opening against them before saving; leave excluded and unevaluated openings outside the CRM.
-3. `add_job`: save a single qualified opening's company, title, description, optional source URL, and optional nickname such as `google-platform`. Use `add_jobs` for a batch. Both require saved criteria. Supply an optional `score` (0–100) and put rationale in `notes`; qualification does not need a score or another tool call.
-4. `list_jobs` returns the strongest scored leads first, with unranked leads last. Use the `rank_jobs` prompt or `list_jobs` with `include_descriptions: true` to rank saved leads, then `update_job` with `score` and `notes`. Saving criteria replaces the user's current document without changing existing openings or rankings. Recheck eligibility before editing an opening's company, title, description, or location; those edits clear its old score unless a new score is supplied.
+2. `get_context`: load criteria and the pipeline, and check for existing canonical records. When the user explicitly asks to import openings, save every supplied opening before assessing fit. Missing criteria, filter conflicts, location, language, compensation, closed postings or unavailable details never block explicit intake; record unknowns and concerns in notes. User corrections override inferred restrictions; geographic metadata alone must not become an eligibility rule. When scraping on the user's behalf, use criteria to filter and rank each company's openings, then add only its single best eligible opening.
+3. `add_job`: save an opening's company, title, description, optional source URL, and optional nickname such as `google-platform`. Use `add_jobs` for a batch. Neither requires saved criteria. Multiple explicitly supplied openings from the same company are allowed. Resolve duplicates to their existing canonical records and account for every supplied opening. Supply an optional `score` (0–100) and put assessments in `notes`.
+4. `list_jobs` returns the strongest scored leads first, with unranked leads last. Use the `rank_jobs` prompt or `list_jobs` with `include_descriptions: true` to rank saved leads, then `update_job` with `score` and `notes`. Keep imported leads visible even when they conflict with discovery filters. Assessments never authorize rejecting or withdrawing them; status changes require user direction or an actual hiring-process outcome. Saving criteria preserves existing openings and rankings. Editing company, title, description, or location clears the old score unless a new score is supplied; the lead stays saved.
 5. “Google's recruiter offered a screening Monday at 9 AM Pacific.” The agent resolves the exact opening with `list_jobs`, clarifies if several match, and calls `add_stage` with a concrete date and UTC offset.
 6. After the round, use `update_stage` to mark `passed`, `failed`, or `completed`. Optionally add your verbatim reflection using `add_feedback`; no feedback is required.
 7. Add another stage for the next round, or use `update_job` to mark the application `rejected`, `withdrawn`, `offer`, or `accepted`.
 
+Both lead-import tools automatically record the time added in `created_at` as a UTC timestamp ending in `Z`. Updates preserve this original timestamp and change `updated_at`.
+
 Stage names are free text. `add_stage.make_current` defaults to true; `update_stage.make_current` defaults to false. A failed stage does not automatically close the application. Different companies and multiple openings at the same company have independent UUIDs and histories. Mutations use those exact IDs; nickname and source URL uniqueness help catch duplicate imports. To retry an uncertain mutation, first retrieve its result; appending stages or feedback creates a new entry each time.
 
-There is no qualification column, pending review queue, or `qualify_jobs` tool. The agent evaluates natural-language criteria; the Worker checks that criteria exist and persists leads the agent has already qualified. The qualified-lead migration keeps existing leads and their histories, removes previously excluded openings, and moves earlier assessment rationales into notes.
+There is no qualification column, pending review queue, or `qualify_jobs` tool. A stored lead records an opportunity rather than proving eligibility. The Worker validates input and persists imports; criteria are an agent workflow for discovery and ranking, not an intake gate.
 
 `list_jobs`, `list_feedback`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. Read all pages before saving rankings: changing scores reorders results.
 
@@ -154,6 +156,6 @@ UTC `Z` timestamps follow Google Calendar's [RFC3339 event time format](https://
 aube run check
 ```
 
-This runs the TypeScript 7 native preview compiler, Oxlint, integration tests, and a Worker deployment dry run. Tests boot Wrangler with an isolated temporary D1 database and exercise signed WebAuthn registration/login, OAuth/PKCE, token rotation/revocation, two-user isolation across MCP tools/resources/prompts, criteria/ranking, stage outcomes, transcripts, UTC calendar drafts, validation, and atomic import rollback. Schema checks reject unowned jobs and cross-user foreign keys. Tests do not touch your development or remote database or create Google events.
+This runs the TypeScript 7 native preview compiler, Oxlint, integration tests, and a Worker deployment dry run. Tests boot Wrangler with an isolated temporary D1 database and exercise signed WebAuthn registration/login, OAuth/PKCE, token rotation/revocation, two-user isolation across MCP tools/resources/prompts, imports without criteria, imports conflicting with filters, multiple explicit openings per company, source-URL schema compatibility, stable UTC creation times, criteria/ranking, stage outcomes, transcripts, UTC calendar drafts, validation, and atomic import rollback. Schema checks reject unowned jobs and cross-user foreign keys. Tests do not touch your development or remote database or create Google events.
 
 The native compiler is pinned as `@typescript/native-preview`; `tsgo` performs type checking and Wrangler bundles TypeScript. After changing Worker bindings or secrets, regenerate `worker-configuration.d.ts` with `aube run types`. Commit `aube-lock.yaml` for reproducible installs (`aube install --frozen-lockfile`).
