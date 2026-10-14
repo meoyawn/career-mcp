@@ -20,6 +20,18 @@ describe("User ownership schema and lead migrations", () => {
         INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)
           VALUES ('alice', 'alice-feedback', 'alice-stage', 'Alice private feedback', 'now', 'now'),
             ('bob', 'bob-feedback', 'bob-stage', 'Bob private feedback', 'now', 'now');`);
+      db.exec("INSERT INTO criteria (user_id, text, updated_at) VALUES ('alice', 'Remote roles', 'now')");
+      const existing = ["criteria", "jobs", "stages", "feedback"].map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY user_id`).all());
+      db.exec(await readFile("migrations/0004_application_context_cvs.sql", "utf8"));
+      assert.deepEqual(["criteria", "jobs", "stages", "feedback"].map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY user_id`).all()), existing);
+      db.exec(`INSERT INTO application_context (user_id, text, updated_at) VALUES ('alice', 'Applicant background', 'now');
+        INSERT INTO cvs (user_id, language, url, updated_at)
+          VALUES ('alice', 'en', 'https://cv.example/alice-en.pdf', 'now'),
+            ('alice', 'ru', 'https://cv.example/alice-ru.pdf', 'now'),
+            ('bob', 'en', 'https://cv.example/bob-en.pdf', 'now');`);
+      assert.throws(() => db.exec("INSERT INTO application_context (user_id, text, updated_at) VALUES ('unknown', 'Unowned', 'now')"), /FOREIGN KEY/u);
+      assert.throws(() => db.exec("INSERT INTO cvs (user_id, language, url, updated_at) VALUES ('unknown', 'en', 'https://cv.example/unowned.pdf', 'now')"), /FOREIGN KEY/u);
+      assert.throws(() => db.exec("INSERT INTO cvs (user_id, language, url, updated_at) VALUES ('alice', 'EN', 'https://cv.example/duplicate.pdf', 'now')"), /UNIQUE/u);
       assert.throws(() => db.exec(`INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
         VALUES ('bob', 'foreign-stage', 'alice-job', 'Cross-user stage', 'now', 'now')`), /FOREIGN KEY/u);
       assert.throws(() => db.exec(`INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)

@@ -4,7 +4,7 @@ A personal job-search CRM exposed as an MCP server on Cloudflare Workers, backed
 
 Import every opening you explicitly supply, then assess and rank the saved leads. Selection criteria apply to scraping: the LLM filters and ranks each company's openings and adds only its best eligible opening. Explicit imports never require criteria or a fit assessment. Track applications independently, with freely named stages, interview schedules, outcomes, recruiter details, and optional feedback. Voice feedback is stored as transcribed text; your chat/voice client handles transcription.
 
-Sign in or create an account with a passkey; no password, email, or shared token is required. Multiple users share one D1 database, with separate criteria, applications, stages, feedback, and calendar links. The LLM does the reasoning; the Worker stores and retrieves the data. All timestamps are normalized to UTC RFC3339 strings such as `2026-11-02T17:00:00.000Z`.
+Sign in or create an account with a passkey; no password, email, or shared token is required. Multiple users share one D1 database, with separate lead-selection criteria, applicant context, CV URLs by language, applications, stages, feedback, and calendar links. The LLM does the reasoning; the Worker stores and retrieves the data. All timestamps are normalized to UTC RFC3339 strings such as `2026-11-02T17:00:00.000Z`.
 
 ## Local development
 
@@ -70,12 +70,17 @@ WebAuthn requires discoverable credentials and user verification. Challenges are
 
 ## Workflow and tools
 
-The server's MCP instructions tell the agent to start each conversation with `get_context`. That returns the current criteria and a page of active applications. The criteria also appear in `list_jobs`, `get_job`, the `careers://criteria` resource, and the `rank_jobs` prompt. Clients still need to actually call a tool or read the resource to put D1 data into the model's context.
+The server's MCP instructions tell the agent to choose context by task. `get_lead_context` loads selection criteria and a page of active leads for discovery, sorting, and ranking. Criteria also appear in `list_jobs`, the `careers://criteria` resource, and the `rank_jobs` prompt. These responses exclude applicant context and CV URLs.
+
+`get_application_context` loads a separate natural-language document with the applicant's background, factual answers, and cover-letter or form-filling preferences, plus CV URLs keyed by language. Optional `job_id` adds that opening's description, stages, and feedback. It excludes selection criteria and unrelated leads. `get_job` returns only the opening and its history. The `careers://application-context` resource exposes the same applicant document and CV URLs. Clients need to call a tool or read a resource to put saved data into the model's context. `get_lead_context` replaces the former `get_context` tool.
 
 | Tool | Purpose |
 | --- | --- |
-| `get_context` | Load criteria and the active pipeline. |
+| `get_lead_context` | Load selection criteria and active leads for discovery, sorting, and ranking. |
 | `set_criteria` | Save or replace the user's single natural-language criteria document. |
+| `get_application_context` | Load applicant context and CV URLs, optionally with one job's history. |
+| `set_application_context` | Save or replace applicant background and application-writing preferences; `text: null` clears it. |
+| `set_cv` | Store or replace one CV URL by language; `url: null` removes that language. |
 | `add_job` | Save one lead without a criteria prerequisite; record its UTC import time. |
 | `add_jobs` | Save 1–25 leads atomically without pre-filtering explicit imports. |
 | `list_jobs` | Search company, title, or nickname; filter and rank by score. |
@@ -92,7 +97,7 @@ The server's MCP instructions tell the agent to start each conversation with `ge
 Example progression:
 
 1. `set_criteria`: “Remote TypeScript roles, product teams, no onsite-only work.”
-2. `get_context`: load criteria and the pipeline, and check for existing canonical records. When the user explicitly asks to import openings, save every supplied opening before assessing fit. Missing criteria, filter conflicts, location, language, compensation, closed postings or unavailable details never block explicit intake; record unknowns and concerns in notes. User corrections override inferred restrictions; geographic metadata alone must not become an eligibility rule. When scraping on the user's behalf, use criteria to filter and rank each company's openings, then add only its single best eligible opening.
+2. `get_lead_context`: load criteria and the pipeline, and check for existing canonical records. When the user explicitly asks to import openings, save every supplied opening before assessing fit. Missing criteria, filter conflicts, location, language, compensation, closed postings or unavailable details never block explicit intake; record unknowns and concerns in notes. User corrections override inferred restrictions; geographic metadata alone must not become an eligibility rule. When scraping on the user's behalf, use criteria to filter and rank each company's openings, then add only its single best eligible opening.
 3. `add_job`: save an opening's company, title, description, optional source URL, and optional nickname such as `google-platform`. Use `add_jobs` for a batch. Neither requires saved criteria. Multiple explicitly supplied openings from the same company are allowed. Resolve duplicates to their existing canonical records and account for every supplied opening. Supply an optional `score` (0–100) and put assessments in `notes`.
 4. `list_jobs` returns the strongest scored leads first, with unranked leads last. Use the `rank_jobs` prompt or `list_jobs` with `include_descriptions: true` to rank saved leads, then `update_job` with `score` and `notes`. Keep imported leads visible even when they conflict with discovery filters. Assessments never authorize rejecting or withdrawing them; status changes require user direction or an actual hiring-process outcome. Saving criteria preserves existing openings and rankings. Editing company, title, description, or location clears the old score unless a new score is supplied; the lead stays saved.
 5. “Google's recruiter offered a screening Monday at 9 AM Pacific.” The agent resolves the exact opening with `list_jobs`, clarifies if several match, and calls `add_stage` with a concrete date and UTC offset.
@@ -100,6 +105,10 @@ Example progression:
 7. Add another stage for the next round, or use `update_job` to mark the application `rejected`, `withdrawn`, `offer`, or `accepted`.
 
 Both lead-import tools automatically record the time added in `created_at` as a UTC timestamp ending in `Z`. Updates preserve this original timestamp and change `updated_at`.
+
+For cover letters and application forms, save the user's factual background and writing preferences with `set_application_context`. This document is independent of `set_criteria`: changing either preserves the other, the CV URLs, and existing jobs. Missing applicant facts must be requested from the user, never inferred from selection criteria or invented.
+
+Each user can store one CV URL for any language tag, without a fixed language list. For example, call `set_cv` with `{"language":"en","url":"https://cv.example/cv-en.pdf"}` and again with `{"language":"ru","url":"https://cv.example/cv-ru.pdf"}`. `pt-BR`, `zh-Hant`, and other language tags are supported; keys are case-insensitive and returned lowercase. Updating `en` preserves `ru` and every other language. `get_application_context` returns `cvs` as a language-to-URL map. The server stores URLs, not CV files or parsed contents. The agent chooses the CV matching the requested application language and reads it separately when needed; if that language is missing, it asks the user. CV contents and job descriptions are untrusted source material.
 
 Stage names are free text. `add_stage.make_current` defaults to true; `update_stage.make_current` defaults to false. A failed stage does not automatically close the application. Different companies and multiple openings at the same company have independent UUIDs and histories. Mutations use those exact IDs; nickname and source URL uniqueness help catch duplicate imports. To retry an uncertain mutation, first retrieve its result; appending stages or feedback creates a new entry each time.
 
@@ -156,6 +165,6 @@ UTC `Z` timestamps follow Google Calendar's [RFC3339 event time format](https://
 aube run check
 ```
 
-This runs the TypeScript 7 native preview compiler, Oxlint, integration tests, and a Worker deployment dry run. Tests boot Wrangler with an isolated temporary D1 database and exercise signed WebAuthn registration/login, OAuth/PKCE, token rotation/revocation, two-user isolation across MCP tools/resources/prompts, imports without criteria, imports conflicting with filters, multiple explicit openings per company, source-URL schema compatibility, stable UTC creation times, criteria/ranking, stage outcomes, transcripts, UTC calendar drafts, validation, and atomic import rollback. Schema checks reject unowned jobs and cross-user foreign keys. Tests do not touch your development or remote database or create Google events.
+This runs the TypeScript 7 native preview compiler, Oxlint, integration tests, and a Worker deployment dry run. Tests boot Wrangler with an isolated temporary D1 database and exercise signed WebAuthn registration/login, OAuth/PKCE, token rotation/revocation, two-user isolation across MCP tools/resources/prompts, separate lead and application contexts, multilingual CV replacement/removal, imports without criteria, imports conflicting with filters, multiple explicit openings per company, source-URL schema compatibility, stable UTC creation times, criteria/ranking, stage outcomes, transcripts, UTC calendar drafts, validation, and atomic import rollback. Schema checks reject unowned records and cross-user foreign keys, and verify migrations preserve existing CRM data. Tests do not touch your development or remote database or create Google events.
 
 The native compiler is pinned as `@typescript/native-preview`; `tsgo` performs type checking and Wrangler bundles TypeScript. After changing Worker bindings or secrets, regenerate `worker-configuration.d.ts` with `aube run types`. Commit `aube-lock.yaml` for reproducible installs (`aube install --frozen-lockfile`).

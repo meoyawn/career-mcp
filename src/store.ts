@@ -11,6 +11,16 @@ interface Criteria {
   updated_at: string;
 }
 
+interface ApplicationContext {
+  text: string;
+  updated_at: string;
+}
+
+interface CV {
+  language: string;
+  url: string;
+}
+
 interface Job {
   id: string;
   company: string;
@@ -68,6 +78,36 @@ export function setCriteria({ db, userId }: UserStore, text: string) {
     RETURNING *`).bind(userId, text, new Date().toISOString()).first<Criteria>();
 }
 
+export async function getApplicationContext({ db, userId }: UserStore) {
+  const [applicationContext, cvs] = await Promise.all([
+    db.prepare("SELECT text, updated_at FROM application_context WHERE user_id IS ?").bind(userId).first<ApplicationContext>(),
+    db.prepare("SELECT language, url FROM cvs WHERE user_id IS ? ORDER BY language").bind(userId).all<CV>(),
+  ]);
+  return { application_context: applicationContext, cvs: Object.fromEntries(cvs.results.map((cv) => [cv.language, cv.url])) };
+}
+
+export async function setApplicationContext({ db, userId }: UserStore, text: string | null) {
+  if (text === null) {
+    await db.prepare("DELETE FROM application_context WHERE user_id IS ?").bind(userId).run();
+    return null;
+  }
+  return db.prepare(`INSERT INTO application_context (user_id, text, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at
+    RETURNING text, updated_at`).bind(userId, text, new Date().toISOString()).first<ApplicationContext>();
+}
+
+export async function setCV({ db, userId }: UserStore, language: string, url: string | null) {
+  language = language.toLowerCase();
+  if (url === null) {
+    await db.prepare("DELETE FROM cvs WHERE user_id IS ? AND language IS ?").bind(userId, language).run();
+  } else {
+    await db.prepare(`INSERT INTO cvs (user_id, language, url, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id, language) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at`)
+      .bind(userId, language, url, new Date().toISOString()).run();
+  }
+  return { language, url };
+}
+
 function duplicateError(error: unknown): never {
   if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
     fail("A nickname or source URL already exists. Use list_jobs to find the existing job; choose a distinct nickname for another opening.");
@@ -107,13 +147,12 @@ async function requireStage({ db, userId }: UserStore, id: string) {
 export async function getJob(scope: UserStore, id: string) {
   const { db, userId } = scope;
   const job = await requireJob(scope, id);
-  const [criteria, stages, feedback] = await Promise.all([
-    getCriteria(scope),
+  const [stages, feedback] = await Promise.all([
     db.prepare("SELECT * FROM stages WHERE user_id IS ? AND job_id IS ? ORDER BY created_at, rowid").bind(userId, id).all<Stage>(),
     db.prepare(`SELECT f.*, s.name AS stage_name FROM feedback f JOIN stages s ON s.id IS f.stage_id AND s.user_id IS f.user_id
       WHERE f.user_id IS ? AND s.job_id IS ? ORDER BY f.created_at, f.rowid`).bind(userId, id).all<Feedback & { stage_name: string }>(),
   ]);
-  return { criteria, job, stages: stages.results, feedback: feedback.results };
+  return { job, stages: stages.results, feedback: feedback.results };
 }
 
 const searchPattern = (query: string) => `%${query.replace(/[\\%_]/gu, "\\$&")}%`;

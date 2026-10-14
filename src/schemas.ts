@@ -14,6 +14,12 @@ const offset = v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxVa
 
 export const emptySchema = v.strictObject({});
 export const criteriaSchema = v.strictObject({ text: text(20_000) });
+export const applicationContextSchema = v.strictObject({ text: v.nullable(text(30_000)) });
+export const getApplicationContextSchema = v.strictObject({ job_id: v.optional(id) });
+export const cvSchema = v.strictObject({
+  language: v.pipe(v.string(), v.maxLength(100), v.regex(/^[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*$/, "Use a language tag such as en, ru, or pt-BR.")),
+  url: v.nullable(url),
+});
 export const jobIdSchema = v.strictObject({ job_id: id });
 
 export const addJobSchema = v.strictObject({

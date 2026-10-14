@@ -108,7 +108,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         assert.ok(tools.some((tool) => tool.name === "set_criteria" && tool.inputSchema.type === "object"));
         const { prompts } = await connection.listPrompts();
         assert.ok(prompts.some((prompt) => prompt.name === "rank_jobs" && prompt.arguments?.some((argument) => argument.name === "limit")));
-        assert.equal(parseTool(await connection.callTool({ name: "get_context", arguments: {} }), v.object({ criteria: v.null() })).criteria, null);
+        assert.equal(parseTool(await connection.callTool({ name: "get_lead_context", arguments: {} }), v.object({ criteria: v.null() })).criteria, null);
       } finally {
         await connection.close();
       }
@@ -123,7 +123,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const firstBatch = await call("add_jobs", { jobs: [
       { company: "Google", title: "Backend engineer", nickname: "google-backend", description: "Remote backend work", score: 70, source_url: "http://jobs.example/google-backend" },
     ] }, jobsSchema);
-    assert.equal((await call("get_context", {}, v.object({ criteria: v.null() }))).criteria, null);
+    assert.equal((await call("get_lead_context", {}, v.object({ criteria: v.null() }))).criteria, null);
     assert.equal((await call("list_jobs", {}, jobsSchema)).jobs.length, 2);
     const text = "\n# Job selection criteria\r\n\r\n- Remote TypeScript roles.\r\n- Exclude onsite-only work.\r\n\r\n## Ranking\nPrefer product teams; score stack fit from 0–100.\nПродуктовые команды в приоритете.\n ";
     const { tools } = await client.listTools();
@@ -175,7 +175,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.ok(Date.parse(job.created_at) >= importStartedAt && Date.parse(job.created_at) <= importFinishedAt);
     }
     assert.equal(imported.jobs.find((job) => job.company === "New Co")?.score, null);
-    const context = await call("get_context", {}, v.object({ criteria: criteriaOutput }));
+    const context = await call("get_lead_context", {}, v.object({ criteria: criteriaOutput }));
     assert.deepEqual(context.criteria, criteria);
     const resource = await client.readResource({ uri: "careers://criteria" });
     assert.ok(resource.contents[0] && "text" in resource.contents[0]);
@@ -197,7 +197,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
     const changed = await call("set_criteria", { text: "Remote TypeScript roles, prefer product teams." }, criteriaOutput);
     assert.equal(changed.text, "Remote TypeScript roles, prefer product teams.");
-    assert.deepEqual((await call("get_context", {}, v.object({ criteria: criteriaOutput }))).criteria, changed);
+    assert.deepEqual((await call("get_lead_context", {}, v.object({ criteria: criteriaOutput }))).criteria, changed);
     assert.deepEqual(await call("list_jobs", { include_descriptions: true }, openingsOutput), openingsBefore);
     await call("update_job", { job_id: google.id, score: 100, notes: "Best match for the current criteria" }, jobSchema);
     assert.equal((await call("list_jobs", {}, jobsSchema)).jobs.length, 3);
@@ -347,7 +347,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal((await browser.request("/auth/login/verify", valid)).status, 401);
       const resumed = await authorize(browser);
       await returning.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${resumed.token}` } } }));
-      const context = parseTool(await returning.callTool({ name: "get_context", arguments: {} }), v.object({ criteria: v.object({ text: v.string() }) }));
+      const context = parseTool(await returning.callTool({ name: "get_lead_context", arguments: {} }), v.object({ criteria: v.object({ text: v.string() }) }));
       assert.equal(context.criteria.text, "Returning passkey owner");
       const additional = await enroll(browser);
       assert.equal(additional.passkey.userHandle, passkey.userHandle);
@@ -402,7 +402,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal((await exchange(browser.origin, { ...refreshRequest, refresh_token: tokens.refresh_token })).status, 400);
   });
 
-  test("two users have isolated criteria, jobs, stages, feedback, prompts, resources and calendar drafts in one D1", async () => {
+  test("two users have separate lead and application contexts, multilingual CVs, and isolated pipelines in one D1", async () => {
     const aliceBrowser = browserFor(endpoint);
     const bobBrowser = browserFor(endpoint);
     await enroll(aliceBrowser);
@@ -420,6 +420,39 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped(alice, "set_criteria", { text: "Alice remote roles" }, v.unknown());
       await scoped(alice, "set_criteria", { text: "Alice remote product roles" }, v.unknown());
       await scoped(bob, "set_criteria", { text: "Bob onsite roles" }, v.unknown());
+      const applicationOutput = v.strictObject({
+        application_context: v.nullable(v.strictObject({ text: v.string(), updated_at: v.string() })),
+        cvs: v.record(v.string(), v.string()),
+      });
+      assert.deepEqual(await scoped(alice, "get_application_context", {}, applicationOutput), { application_context: null, cvs: {} });
+      const applicationText = "\nAlice applicant background.\r\nUse concise cover letters.\nОпыт работы.\n";
+      await scoped(alice, "set_application_context", { text: applicationText }, v.unknown());
+      await scoped(bob, "set_application_context", { text: "Bob applicant background" }, v.unknown());
+      for (const [owner, language, url] of [
+        [alice, "en", "https://cv.example/alice-en.pdf"],
+        [alice, "RU", "https://cv.example/alice-ru.pdf"],
+        [alice, "pt-BR", "https://cv.example/alice-pt-br.pdf"],
+        [bob, "en", "https://cv.example/bob-en.pdf"],
+      ] as const) await scoped(owner, "set_cv", { language, url }, v.unknown());
+      const aliceApplication = await scoped(alice, "get_application_context", {}, applicationOutput);
+      assert.equal(aliceApplication.application_context?.text, applicationText);
+      assert.deepEqual(aliceApplication.cvs, {
+        en: "https://cv.example/alice-en.pdf", ru: "https://cv.example/alice-ru.pdf", "pt-br": "https://cv.example/alice-pt-br.pdf",
+      });
+      const bobApplication = await scoped(bob, "get_application_context", {}, applicationOutput);
+      assert.equal(bobApplication.application_context?.text, "Bob applicant background");
+      assert.deepEqual(bobApplication.cvs, { en: "https://cv.example/bob-en.pdf" });
+      for (const [name, args] of [
+        ["set_application_context", { text: " \t\n" }],
+        ["set_application_context", { text: "x".repeat(30_001) }],
+        ["set_cv", { language: "", url: "https://cv.example/invalid.pdf" }],
+        ["set_cv", { language: "ru/en", url: "https://cv.example/invalid.pdf" }],
+        ["set_cv", { language: "en", url: "file:///private/cv.pdf" }],
+        ["set_cv", { language: "en", url: "https://cv.example/foreign.pdf", user_id: "bob" }],
+        ["set_application_context", { text: "Foreign edit", user_id: "bob" }],
+        ["get_application_context", { user_id: "bob" }],
+      ] as const) assert.equal((await alice.callTool({ name, arguments: args })).isError, true, name);
+      assert.deepEqual(await scoped(alice, "get_application_context", {}, applicationOutput), aliceApplication);
       const opening = { company: "Shared company", title: "Engineer", nickname: "shared-role", source_url: "https://jobs.example/shared", description: "A role both users can track" };
       const aliceJob = (await scoped(alice, "add_jobs", { jobs: [opening] }, jobsSchema)).jobs[0];
       const bobJob = (await scoped(bob, "add_jobs", { jobs: [opening] }, jobsSchema)).jobs[0];
@@ -432,22 +465,32 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped(alice, "update_job", { job_id: aliceJob.id, score: 90, notes: "Alice assessment" }, jobSchema);
       await scoped(bob, "update_job", { job_id: bobJob.id, score: 80, notes: "Bob assessment" }, jobSchema);
       for (const [owner, ownJob, ownStage, criteria] of [[alice, aliceJob, aliceStage, "Alice remote product roles"], [bob, bobJob, bobStage, "Bob onsite roles"]] as const) {
-        const context = await scoped(owner, "get_context", {}, v.object({ criteria: v.object({ text: v.string() }), jobs: v.array(jobSchema) }));
+        const context = await scoped(owner, "get_lead_context", {}, v.strictObject({ criteria: v.object({ text: v.string() }), jobs: v.array(jobSchema), next_offset: v.null() }));
         assert.equal(context.criteria.text, criteria);
         assert.deepEqual(context.jobs.map((job) => job.id), [ownJob.id]);
         assert.deepEqual((await scoped(owner, "list_jobs", { include_descriptions: true }, jobsSchema)).jobs.map((job) => job.id), [ownJob.id]);
         assert.deepEqual((await scoped(owner, "get_upcoming", { from: "2026-12-01T00:00:00Z" }, v.object({ stages: v.array(stageSchema) }))).stages.map((stage) => stage.id), [ownStage.id]);
         assert.deepEqual((await scoped(owner, "list_feedback", {}, v.object({ feedback: v.array(feedbackOutput) }))).feedback.map((feedback) => feedback.stage_id), [ownStage.id]);
-        const detail = await scoped(owner, "get_job", { job_id: ownJob.id }, v.object({ stages: v.array(stageSchema), feedback: v.array(feedbackOutput) }));
+        const detail = await scoped(owner, "get_job", { job_id: ownJob.id }, v.strictObject({ job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput) }));
         assert.deepEqual(detail.stages.map((stage) => stage.id), [ownStage.id]);
         assert.deepEqual(detail.feedback.map((feedback) => feedback.stage_id), [ownStage.id]);
+        const application = await scoped(owner, "get_application_context", { job_id: ownJob.id }, v.strictObject({
+          ...applicationOutput.entries, job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput),
+        }));
+        assert.equal(application.job.id, ownJob.id);
+        assert.deepEqual(application.stages, detail.stages);
+        assert.deepEqual(application.feedback, detail.feedback);
+        assert.deepEqual({ application_context: application.application_context, cvs: application.cvs }, owner === alice ? aliceApplication : bobApplication);
         const resource = await owner.readResource({ uri: "careers://criteria" });
         const first = resource.contents[0];
         assert.ok(first && "text" in first);
         assert.equal(v.parse(v.object({ text: v.string() }), JSON.parse(first.text)).text, criteria);
+        const applicationResource = await owner.readResource({ uri: "careers://application-context" });
+        assert.ok(applicationResource.contents[0] && "text" in applicationResource.contents[0]);
+        assert.deepEqual(v.parse(applicationOutput, JSON.parse(applicationResource.contents[0].text)), owner === alice ? aliceApplication : bobApplication);
       }
       const forbidden = [
-        ["get_job", { job_id: bobJob.id }], ["update_job", { job_id: bobJob.id, company: "Stolen" }],
+        ["get_job", { job_id: bobJob.id }], ["get_application_context", { job_id: bobJob.id }], ["update_job", { job_id: bobJob.id, company: "Stolen" }],
         ["add_stage", { job_id: bobJob.id, name: "Foreign stage" }], ["update_stage", { stage_id: bobStage.id, name: "Foreign round", make_current: true }],
         ["add_feedback", { stage_id: bobStage.id, text: "Foreign feedback" }], ["update_feedback", { feedback_id: bobFeedback.id, text: "Foreign edit" }],
         ["get_calendar_event", { stage_id: bobStage.id }],
@@ -479,11 +522,24 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.match(prompt.messages[0].content.text, new RegExp(lead.id, "u"));
       assert.match(prompt.messages[0].content.text, new RegExp(aliceJob.id, "u"));
       assert.doesNotMatch(prompt.messages[0].content.text, new RegExp(bobJob.id, "u"));
-      const spoofed = await alice.callTool({ name: "get_context", arguments: { user_id: "another-user" } });
+      assert.doesNotMatch(prompt.messages[0].content.text, /applicant background|cv\.example/u);
+      await scoped(alice, "set_cv", { language: "EN", url: "https://cv.example/alice-new-en.pdf" }, v.unknown());
+      await scoped(alice, "set_cv", { language: "PT-br", url: null }, v.unknown());
+      await scoped(alice, "set_application_context", { text: "Alice updated applicant background" }, v.unknown());
+      const updatedApplication = await scoped(alice, "get_application_context", {}, applicationOutput);
+      assert.equal(updatedApplication.application_context?.text, "Alice updated applicant background");
+      assert.deepEqual(updatedApplication.cvs, { en: "https://cv.example/alice-new-en.pdf", ru: "https://cv.example/alice-ru.pdf" });
+      assert.equal((await scoped(alice, "get_lead_context", {}, v.object({ criteria: v.object({ text: v.string() }) }))).criteria.text, "Alice changed again");
+      await scoped(alice, "set_application_context", { text: null }, v.null());
+      const cleared = await scoped(alice, "get_application_context", {}, applicationOutput);
+      assert.equal(cleared.application_context, null);
+      assert.deepEqual(cleared.cvs, updatedApplication.cvs);
+      assert.deepEqual(await scoped(bob, "get_application_context", {}, applicationOutput), bobApplication);
+      const spoofed = await alice.callTool({ name: "get_lead_context", arguments: { user_id: "another-user" } });
       assert.equal(spoofed.isError, true);
       assert.equal((await aliceBrowser.request("/auth/revoke", {})).status, 200);
       assert.equal((await fetch(endpoint, { headers: { Authorization: `Bearer ${aliceConnection.token}` } })).status, 401);
-      assert.equal((await scoped(bob, "get_context", {}, v.object({ criteria: v.object({ text: v.string() }) }))).criteria.text, "Bob onsite roles");
+      assert.equal((await scoped(bob, "get_lead_context", {}, v.object({ criteria: v.object({ text: v.string() }) }))).criteria.text, "Bob onsite roles");
     } finally {
       await Promise.all([alice.close(), bob.close()]);
     }
