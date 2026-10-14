@@ -36,22 +36,33 @@ The account page lets you add another passkey, sign out, or disconnect all MCP c
 
 ## Deploy
 
+The checked-in configuration targets the maintainer's personal Cloudflare account (`00000000000000000000000000000000`), Worker `example-worker`, and D1 database `careers`. Keep account and database IDs in ignored local configuration. Forks should replace both IDs with their own before deploying.
+
+For this checkout, Wrangler's existing `example-profile` OAuth profile is bound to the repository directory. Its credentials and directory binding live in Wrangler's user configuration outside Git. To authenticate a new checkout, create and activate your own profile:
+
 ```fish
-aube exec wrangler login
-aube exec wrangler d1 create careers
+aube install --frozen-lockfile
+aube exec -- wrangler auth create example-profile --scopes user:read account:read workers_scripts:write d1:write
+aube exec -- wrangler auth activate example-profile
 ```
 
-Replace the placeholder `database_id` in `wrangler.jsonc` with the ID returned by D1. Then:
+Select your intended account in the browser. To refresh an expired profile, run `wrangler auth create` with the same name and scopes again. The extra `--` after `aube exec` forwards flags to Wrangler.
+
+For API-token authentication instead, copy `.env.deploy.example` to `.env.deploy`, restrict it with `chmod 600 .env.deploy`, and enter your token locally. Scope it to the intended account with Workers Scripts:Edit and D1:Edit; Account Settings:Read supports account discovery. `.env.deploy` and other `.env.*` files are Git-ignored; only the placeholder example is tracked. The remote migration and publish commands load `.env.deploy` through Node, so deploy credentials are not loaded by local development, type generation, or bundled into the Worker. CI can supply `CLOUDFLARE_API_TOKEN` as an encrypted secret environment variable instead; existing environment variables take precedence over the file. Never put tokens in Wrangler config, command arguments, or committed files.
+
+Once authenticated, every deployment uses:
 
 ```fish
-aube run types
-aube run db:migrate:remote
 aube run deploy
 ```
 
-Connect your MCP client to `https://careers-mcp.<your-subdomain>.workers.dev/mcp` and sign in with a passkey. Local and remote D1 storage are separate. Users, credential public keys, challenges, sessions, clients, and OAuth grants all use this same D1 database; no extra database, KV namespace, or identity provider is needed.
+This runs type checking, lint, integration tests, and a bundle dry run before applying pending remote D1 migrations and publishing the Worker. A failed step stops the deployment. Already-applied migrations are skipped on subsequent runs. Migrations and publishing are separate operations: if publishing fails after a migration succeeds, fix the failure and rerun; future schema changes should remain compatible with the currently deployed Worker.
 
-Apply `0001_initial.sql` before the first deployment. It creates the complete user-scoped CRM and passkey/OAuth schema in one migration.
+For a new account, create the database once with `aube exec -- wrangler d1 create careers --update-config=false`, set its `database_id` in `wrangler.jsonc`, and run `aube run types` before deploying. Local and remote D1 storage are separate.
+
+The maintainer's deployment is [mcp.example.com](https://mcp.example.com/). Connect your MCP client to `https://mcp.example.com/mcp` and sign in with a passkey. Forks should use the hostname printed by their deployment. Users, credential public keys, challenges, sessions, clients, and OAuth grants all use this same D1 database; no extra database, KV namespace, or identity provider is needed. Verify a deployment with `curl --fail https://mcp.example.com/health` (returns `{"ok":true}`).
+
+The deploy command applies `0001_initial.sql` before the first publication. It creates the complete user-scoped CRM and passkey/OAuth schema in one migration.
 
 Every store operation takes a user scope derived from a verified access token. Ownership is checked on reads, updates, ranking batches, parent-child links, resources, prompts, feedback searches, and calendar drafts. Nicknames (case-insensitive) and source URLs are unique within each user's jobs. Composite foreign keys reject stages and feedback attached to another user's records. Clients cannot supply or override a user ID.
 

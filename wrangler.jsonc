@@ -1,9 +1,11 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "career-mcp-local",
+  "account_id": "00000000000000000000000000000000",
+  "workers_dev": true,
   "main": "src/index.ts",
   "compatibility_date": "2026-10-14",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["no_nodejs_compat", "no_nodejs_compat_v2"],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
   "d1_databases": [
     {

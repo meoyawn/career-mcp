@@ -6,6 +6,9 @@ dist/
 !.dev.vars.example
 .env
 .env.*
+!.env.deploy.example
+# Deployment credentials stay local, including when the example is copied.
+.env.deploy
 *.log
 *.db
 *.db-shm

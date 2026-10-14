@@ -2,7 +2,6 @@ import {
   generateAuthenticationOptions, generateRegistrationOptions,
   verifyAuthenticationResponse, verifyRegistrationResponse,
 } from "@simplewebauthn/server";
-import { Buffer } from "node:buffer";
 import * as v from "valibot";
 
 const credentialFields = {
@@ -26,11 +25,19 @@ interface Challenge {
   user_id: string | null;
 }
 
-export const randomToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+function encodeBase64Url(bytes: Uint8Array) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+}
+
+const decodeBase64Url = (value: string) => Uint8Array.from(atob(value.replace(/-/gu, "+").replace(/_/gu, "/")), (char) => char.charCodeAt(0));
+
+export const randomToken = () => encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 export const nowSeconds = () => Math.floor(Date.now() / 1000);
 
 export async function hashToken(token: string) {
-  return Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))).toString("base64url");
+  return encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))));
 }
 
 export function authError(message: string, status = 400): never {
@@ -165,7 +172,7 @@ export async function authRoutes(request: Request, db: D1Database) {
     const statements = [];
     if (!exists) statements.push(db.prepare("INSERT INTO users (id, created_at) VALUES (?, ?)").bind(userId, new Date().toISOString()));
     statements.push(db.prepare("INSERT INTO passkeys (id, user_id, public_key, counter, created_at) VALUES (?, ?, ?, ?, ?)")
-      .bind(credential.id, userId, Buffer.from(credential.publicKey).toString("base64url"), credential.counter, new Date().toISOString()));
+      .bind(credential.id, userId, encodeBase64Url(credential.publicKey), credential.counter, new Date().toISOString()));
     await db.batch(statements);
     return newSession(request, db, userId);
   }
@@ -178,13 +185,13 @@ export async function authRoutes(request: Request, db: D1Database) {
     const response = v.parse(authenticationSchema, await readJson(request));
     const passkey = await db.prepare("SELECT * FROM passkeys WHERE id IS ?").bind(response.id)
       .first<{ id: string; user_id: string; public_key: string; counter: number }>();
-    if (!passkey || response.response.userHandle !== Buffer.from(passkey.user_id).toString("base64url")) authError("Passkey verification failed", 401);
+    if (!passkey || response.response.userHandle !== encodeBase64Url(new TextEncoder().encode(passkey.user_id))) authError("Passkey verification failed", 401);
     let verification;
     try {
       verification = await verifyAuthenticationResponse({
         response, expectedChallenge: challenge.challenge, expectedOrigin: url.origin,
         expectedRPID: url.hostname, requireUserVerification: true,
-        credential: { id: passkey.id, publicKey: new Uint8Array(Buffer.from(passkey.public_key, "base64url")), counter: passkey.counter },
+        credential: { id: passkey.id, publicKey: decodeBase64Url(passkey.public_key), counter: passkey.counter },
       });
     } catch {
       authError("Passkey verification failed", 401);

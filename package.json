@@ -9,10 +9,11 @@
   },
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "aube run check && aube run db:migrate:remote && aube run deploy:worker",
+    "deploy:worker": "node --env-file-if-exists=.env.deploy node_modules/wrangler/bin/wrangler.js deploy",
     "build": "wrangler deploy --dry-run --outdir dist",
     "db:migrate": "wrangler d1 migrations apply careers --local",
-    "db:migrate:remote": "wrangler d1 migrations apply careers --remote",
+    "db:migrate:remote": "node --env-file-if-exists=.env.deploy node_modules/wrangler/bin/wrangler.js d1 migrations apply careers --remote",
     "types": "wrangler types --env-file .dev.vars.example",
     "typecheck": "tsgo --noEmit",
     "lint": "oxlint --deny-warnings src tests",

@@ -90,22 +90,45 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     if (directory) await rm(directory, { recursive: true, force: true });
   });
 
-  test("HTTP authentication and origin checks protect MCP, and modern clients can also call tools", async () => {
+  test("HTTP authentication and origin checks protect MCP, and legacy and modern clients discover and call tools", async () => {
     assert.equal((await fetch(endpoint, { method: "POST" })).status, 401);
     assert.equal((await fetch(endpoint, { method: "POST", headers: { Authorization: "Bearer wrong" } })).status, 401);
     assert.equal((await fetch(endpoint, { method: "POST", headers: { Authorization: `Bearer ${token}`, Origin: "https://untrusted.example" } })).status, 403);
     assert.equal((await fetch(endpoint, { headers: { Authorization: `Bearer ${token}` } })).status, 405);
-    const modern = new Client({ name: "modern-test", version: "1.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
-    try {
-      await modern.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
-      assert.equal(parseTool(await modern.callTool({ name: "get_context", arguments: {} }), v.object({ criteria: v.null() })).criteria, null);
-    } finally {
-      await modern.close();
+    for (const mode of ["legacy", { pin: "2026-07-28" }] as const) {
+      const connection = new Client({ name: "discovery-test", version: "1.0.0" }, { versionNegotiation: { mode } });
+      try {
+        await connection.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+        const { tools } = await connection.listTools();
+        assert.ok(tools.some((tool) => tool.name === "set_criteria" && tool.inputSchema.type === "object"));
+        const { prompts } = await connection.listPrompts();
+        assert.ok(prompts.some((prompt) => prompt.name === "rank_jobs" && prompt.arguments?.some((argument) => argument.name === "limit")));
+        assert.equal(parseTool(await connection.callTool({ name: "get_context", arguments: {} }), v.object({ criteria: v.null() })).criteria, null);
+      } finally {
+        await connection.close();
+      }
     }
   });
 
   test("criteria reach agent context, rankings persist, stale decisions fail, and editing an opening resets its assessment", async () => {
-    const criteria = await call("set_criteria", { text: "Remote TypeScript roles. Exclude onsite-only work." }, v.object({ revision: v.number(), text: v.string() }));
+    const text = "\n# Job selection criteria\r\n\r\n- Remote TypeScript roles.\r\n- Exclude onsite-only work.\r\n\r\n## Ranking\nPrefer product teams; score stack fit from 0–100.\nПродуктовые команды в приоритете.\n ";
+    const { tools } = await client.listTools();
+    const criteriaTool = tools.find((tool) => tool.name === "set_criteria");
+    assert.ok(criteriaTool);
+    const { properties: { text: { pattern } } } = v.parse(v.object({
+      properties: v.object({ text: v.object({ pattern: v.string() }) }),
+    }), criteriaTool.inputSchema);
+    for (const document of ["Remote TypeScript roles.", text, " \tX\n", "x".repeat(20_000)]) {
+      // Some MCP clients require patterns to match the entire argument.
+      assert.equal(new RegExp(pattern).exec(document)?.[0], document);
+    }
+    for (const blank of ["", " \t\r\n", "\u00a0\u2003"]) {
+      assert.equal(new RegExp(pattern).exec(blank), null);
+    }
+    const criteria = await call("set_criteria", { text }, v.object({ revision: v.number(), text: v.string() }));
+    assert.equal(criteria.text, text);
+    await error("set_criteria", { text: " \t\r\n" }, /non-blank/u);
+    await error("set_criteria", { text: "x".repeat(20_001) }, /length|characters/u);
     const imported = await call("add_jobs", { jobs: [
       { company: "Google", title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work" },
       { company: "Microsoft", title: "Backend engineer", description: "Remote backend work" },

@@ -1,9 +1,9 @@
 import * as v from "valibot";
 
-const text = (max: number) => v.pipe(v.string(), v.minLength(1), v.maxLength(max), v.regex(/\S/u, "Use non-blank text."));
+const text = (max: number) => v.pipe(v.string(), v.minLength(1), v.maxLength(max), v.regex(/^[\s\S]*\S[\s\S]*$/, "Use non-blank text."));
 const id = v.pipe(v.string(), v.uuid());
 const email = v.pipe(v.string(), v.email(), v.maxLength(320));
-const url = v.pipe(v.string(), v.url(), v.regex(/^https?:\/\//u, "Use an HTTP or HTTPS URL."), v.maxLength(2_000));
+const url = v.pipe(v.string(), v.url(), v.regex(/^https?:\/\//, "Use an HTTP or HTTPS URL."), v.maxLength(2_000));
 const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
 const qualification = v.picklist(["pending", "qualified", "excluded"]);
@@ -133,8 +133,8 @@ export const calendarEventSchema = v.strictObject({
 });
 
 export const rankPromptSchema = v.strictObject({
-  limit: v.optional(v.pipe(v.string(), v.regex(/^(?:[1-9]|1\d|2[0-5])$/u)), "25"),
-  offset: v.optional(v.pipe(v.string(), v.regex(/^\d{1,5}$/u)), "0"),
+  limit: v.optional(v.pipe(v.string(), v.regex(/^(?:[1-9]|1\d|2[0-5])$/)), "25"),
+  offset: v.optional(v.pipe(v.string(), v.regex(/^\d{1,5}$/)), "0"),
 });
 
 export type AddJobs = v.InferOutput<typeof addJobsSchema>;
