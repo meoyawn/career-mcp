@@ -41,7 +41,6 @@ export const listJobsSchema = v.strictObject({
 });
 
 export const qualifyJobsSchema = v.strictObject({
-  criteria_revision: v.pipe(v.number(), v.integer(), v.minValue(1)),
   decisions: v.pipe(v.array(v.strictObject({
     job_id: id,
     qualification: v.picklist(["qualified", "excluded"]),

@@ -6,9 +6,8 @@ export interface UserStore {
 }
 
 interface Criteria {
-  id: number;
+  user_id: string;
   text: string;
-  revision: number;
   updated_at: string;
 }
 
@@ -28,7 +27,6 @@ interface Job {
   qualification: string;
   score: number | null;
   qualification_reason: string | null;
-  criteria_revision: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -67,8 +65,8 @@ function fail(message: string): never {
 export const getCriteria = ({ db, userId }: UserStore) => db.prepare("SELECT * FROM criteria WHERE user_id IS ?").bind(userId).first<Criteria>();
 
 export function setCriteria({ db, userId }: UserStore, text: string) {
-  return db.prepare(`INSERT INTO criteria (user_id, id, text, revision, updated_at) VALUES (?, 1, ?, 1, ?)
-    ON CONFLICT(user_id) DO UPDATE SET text = excluded.text, revision = criteria.revision + 1, updated_at = excluded.updated_at
+  return db.prepare(`INSERT INTO criteria (user_id, text, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at
     RETURNING *`).bind(userId, text, new Date().toISOString()).first<Criteria>();
 }
 
@@ -131,11 +129,11 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
   }
   if (input.status) { where.push("status IS ?"); bindings.push(input.status); }
   if (input.qualification) { where.push("qualification IS ?"); bindings.push(input.qualification); }
-  const review = "(criteria_revision IS NULL OR criteria_revision IS NOT (SELECT revision FROM criteria WHERE user_id IS jobs.user_id))";
+  const review = "(qualification IS 'pending')";
   if (input.needs_review !== undefined) where.push(input.needs_review ? review : `NOT ${review}`);
   const columns = input.include_descriptions ? "*" : `id, company, title, nickname, source_url, location,
     recruiter_name, recruiter_email, notes, status, current_stage, qualification, score, qualification_reason,
-    criteria_revision, created_at, updated_at`;
+    created_at, updated_at`;
   const results = await db.prepare(`SELECT ${columns}, ${review} AS needs_review FROM jobs
     WHERE ${where.join(" AND ")} ORDER BY score DESC NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
     .bind(...bindings, input.limit + 1, input.offset).all<Omit<Job, "description"> & { description?: string; needs_review: number }>();
@@ -150,26 +148,17 @@ export async function qualifyJobs(scope: UserStore, input: QualifyJobs) {
   const { db, userId } = scope;
   const criteria = await getCriteria(scope);
   if (!criteria) fail("Save your criteria with set_criteria before qualifying jobs.");
-  if (criteria.revision !== input.criteria_revision) fail("Criteria changed. Load get_context and rank against the current revision.");
   const ids = input.decisions.map((decision) => decision.job_id);
   if (new Set(ids).size !== ids.length) fail("Each job_id must occur only once in decisions.");
   const found = await db.prepare(`SELECT id FROM jobs WHERE user_id IS ? AND id IN (${ids.map(() => "?").join(",")})`)
     .bind(userId, ...ids).all<{ id: string }>();
   if (found.results.length !== ids.length) fail("One or more job_id values do not exist. No decisions were saved.");
   const now = new Date().toISOString();
-  try {
-    const results = await db.batch<Job>(input.decisions.map((decision) => db.prepare(`UPDATE jobs
-      SET qualification = ?, score = ?, qualification_reason = ?,
-        criteria_revision = (SELECT revision FROM criteria WHERE user_id IS ? AND revision IS ?), updated_at = ?
-      WHERE user_id IS ? AND id IS ? RETURNING *`).bind(decision.qualification, decision.score, decision.reason,
-      userId, input.criteria_revision, now, userId, decision.job_id)));
-    return { jobs: results.flatMap((result) => result.results) };
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("CHECK constraint failed")) {
-      fail("Criteria changed while saving. No decisions were saved. Load get_context and rank again.");
-    }
-    throw error;
-  }
+  const results = await db.batch<Job>(input.decisions.map((decision) => db.prepare(`UPDATE jobs
+    SET qualification = ?, score = ?, qualification_reason = ?, updated_at = ?
+    WHERE user_id IS ? AND id IS ? RETURNING *`).bind(decision.qualification, decision.score, decision.reason,
+    now, userId, decision.job_id)));
+  return { jobs: results.flatMap((result) => result.results) };
 }
 
 function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "feedback", id: string, patch: Record<string, string | null | undefined>) {
@@ -190,8 +179,8 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
     if (invalidates) {
       const results = await db.batch<Job>([
         statement,
-        db.prepare(`UPDATE jobs SET qualification = 'pending', score = NULL, qualification_reason = NULL,
-          criteria_revision = NULL WHERE user_id IS ? AND id IS ? RETURNING *`).bind(userId, job_id),
+        db.prepare(`UPDATE jobs SET qualification = 'pending', score = NULL, qualification_reason = NULL
+          WHERE user_id IS ? AND id IS ? RETURNING *`).bind(userId, job_id),
       ]);
       return results[1]?.results[0];
     }

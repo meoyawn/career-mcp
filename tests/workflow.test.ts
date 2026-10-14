@@ -110,7 +110,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
-  test("criteria reach agent context, rankings persist, stale decisions fail, and editing an opening resets its assessment", async () => {
+  test("one current criteria document reaches agent context and criteria changes leave existing openings unchanged", async () => {
+    const criteriaOutput = v.strictObject({ user_id: v.string(), text: v.string(), updated_at: v.string() });
     const text = "\n# Job selection criteria\r\n\r\n- Remote TypeScript roles.\r\n- Exclude onsite-only work.\r\n\r\n## Ranking\nPrefer product teams; score stack fit from 0–100.\nПродуктовые команды в приоритете.\n ";
     const { tools } = await client.listTools();
     const criteriaTool = tools.find((tool) => tool.name === "set_criteria");
@@ -125,7 +126,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     for (const blank of ["", " \t\r\n", "\u00a0\u2003"]) {
       assert.equal(new RegExp(pattern).exec(blank), null);
     }
-    const criteria = await call("set_criteria", { text }, v.object({ revision: v.number(), text: v.string() }));
+    const criteria = await call("set_criteria", { text }, criteriaOutput);
     assert.equal(criteria.text, text);
     await error("set_criteria", { text: " \t\r\n" }, /non-blank/u);
     await error("set_criteria", { text: "x".repeat(20_001) }, /length|characters/u);
@@ -139,15 +140,15 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const microsoft = imported.jobs.find((job) => job.company === "Microsoft");
     const facebook = imported.jobs.find((job) => job.company === "Facebook");
     assert.ok(google && microsoft && facebook);
-    const context = await call("get_context", {}, v.object({ criteria: v.object({ text: v.string(), revision: v.number() }) }));
+    const context = await call("get_context", {}, v.object({ criteria: criteriaOutput }));
     assert.deepEqual(context.criteria, criteria);
     const resource = await client.readResource({ uri: "careers://criteria" });
     assert.ok(resource.contents[0] && "text" in resource.contents[0]);
-    assert.match(resource.contents[0].text, /Remote TypeScript roles/u);
+    assert.deepEqual(v.parse(criteriaOutput, JSON.parse(resource.contents[0].text)), criteria);
     const prompt = await client.getPrompt({ name: "rank_jobs" });
     assert.ok(prompt.messages[0]?.content.type === "text");
     assert.match(prompt.messages[0].content.text, /Remote TypeScript platform work/u);
-    await call("qualify_jobs", { criteria_revision: criteria.revision, decisions: [
+    await call("qualify_jobs", { decisions: [
       { job_id: google.id, qualification: "qualified", score: 95, reason: "Remote and exact stack match" },
       { job_id: microsoft.id, qualification: "qualified", score: 70, reason: "Remote with less stack overlap" },
       { job_id: facebook.id, qualification: "excluded", score: 0, reason: "Onsite-only fails the criteria" },
@@ -156,10 +157,17 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(ranked.jobs[0]?.id, google.id);
     assert.equal(ranked.next_offset, 1);
     assert.equal((await call("list_jobs", { qualification: "qualified", limit: 1, offset: 1 }, jobsSchema)).jobs[0]?.id, microsoft.id);
-    const changed = await call("set_criteria", { text: "Remote TypeScript roles, prefer product teams." }, v.object({ revision: v.number() }));
-    assert.equal(changed.revision, criteria.revision + 1);
-    assert.equal((await call("list_jobs", { needs_review: true }, jobsSchema)).jobs.length, 3);
-    await error("qualify_jobs", { criteria_revision: criteria.revision, decisions: [{ job_id: google.id, qualification: "qualified", score: 100, reason: "Old criteria" }] }, /Criteria changed/u);
+    await call("set_criteria", { text }, criteriaOutput);
+    assert.deepEqual((await call("list_jobs", { needs_review: true }, jobsSchema)).jobs, []);
+    const openingsOutput = v.object({ jobs: v.array(v.record(v.string(), v.unknown())), next_offset: v.null() });
+    const openingsBefore = await call("list_jobs", { include_descriptions: true }, openingsOutput);
+    const changed = await call("set_criteria", { text: "Remote TypeScript roles, prefer product teams." }, criteriaOutput);
+    assert.equal(changed.text, "Remote TypeScript roles, prefer product teams.");
+    assert.deepEqual((await call("get_context", {}, v.object({ criteria: criteriaOutput }))).criteria, changed);
+    assert.deepEqual(await call("list_jobs", { include_descriptions: true }, openingsOutput), openingsBefore);
+    assert.deepEqual((await call("list_jobs", { needs_review: true }, jobsSchema)).jobs, []);
+    await call("qualify_jobs", { decisions: [{ job_id: google.id, qualification: "qualified", score: 100, reason: "Best match for the current criteria" }] }, jobsSchema);
+    assert.equal((await call("list_jobs", { needs_review: false }, jobsSchema)).jobs.length, 3);
     const updated = await call("update_job", { job_id: google.id, description: "Now an onsite-only role" }, jobSchema);
     assert.equal(updated.qualification, "pending");
     assert.equal(updated.score, null);
@@ -277,7 +285,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const returning = new Client({ name: "returning-user", version: "1" });
     try {
       await original.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${connection.token}` } } }));
-      parseTool(await original.callTool({ name: "set_criteria", arguments: { text: "Returning passkey owner" } }), v.object({ revision: v.number() }));
+      parseTool(await original.callTool({ name: "set_criteria", arguments: { text: "Returning passkey owner" } }), v.object({ text: v.string() }));
       assert.equal((await browser.request("/auth/logout", {})).status, 200);
       assert.equal((await browser.request("/authorize/finish", { request: connection.request, allow: true })).status, 401);
       const forged = await assertion(browser, passkey);
@@ -375,7 +383,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await alice.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${aliceConnection.token}` } } }));
       await bob.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${bobConnection.token}` } } }));
       await scoped(alice, "set_criteria", { text: "Alice remote roles" }, v.unknown());
-      await scoped(alice, "set_criteria", { text: "Alice remote roles revision two" }, v.unknown());
+      await scoped(alice, "set_criteria", { text: "Alice remote product roles" }, v.unknown());
       await scoped(bob, "set_criteria", { text: "Bob onsite roles" }, v.unknown());
       const opening = { company: "Shared company", title: "Engineer", nickname: "shared-role", source_url: "https://jobs.example/shared", description: "A role both users can track" };
       const aliceJob = (await scoped(alice, "add_jobs", { jobs: [opening] }, jobsSchema)).jobs[0];
@@ -386,9 +394,9 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const bobStage = await scoped(bob, "add_stage", { job_id: bobJob.id, name: "Bob interview", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
       await scoped(alice, "add_feedback", { stage_id: aliceStage.id, text: "Alice private feedback" }, feedbackOutput);
       const bobFeedback = await scoped(bob, "add_feedback", { stage_id: bobStage.id, text: "Bob private feedback" }, feedbackOutput);
-      await scoped(alice, "qualify_jobs", { criteria_revision: 2, decisions: [{ job_id: aliceJob.id, qualification: "qualified", score: 90, reason: "Alice assessment" }] }, jobsSchema);
-      await scoped(bob, "qualify_jobs", { criteria_revision: 1, decisions: [{ job_id: bobJob.id, qualification: "qualified", score: 80, reason: "Bob assessment" }] }, jobsSchema);
-      for (const [owner, ownJob, ownStage, criteria] of [[alice, aliceJob, aliceStage, "Alice remote roles revision two"], [bob, bobJob, bobStage, "Bob onsite roles"]] as const) {
+      await scoped(alice, "qualify_jobs", { decisions: [{ job_id: aliceJob.id, qualification: "qualified", score: 90, reason: "Alice assessment" }] }, jobsSchema);
+      await scoped(bob, "qualify_jobs", { decisions: [{ job_id: bobJob.id, qualification: "qualified", score: 80, reason: "Bob assessment" }] }, jobsSchema);
+      for (const [owner, ownJob, ownStage, criteria] of [[alice, aliceJob, aliceStage, "Alice remote product roles"], [bob, bobJob, bobStage, "Bob onsite roles"]] as const) {
         const context = await scoped(owner, "get_context", {}, v.object({ criteria: v.object({ text: v.string() }), jobs: v.array(jobSchema) }));
         assert.equal(context.criteria.text, criteria);
         assert.deepEqual(context.jobs.map((job) => job.id), [ownJob.id]);
@@ -408,7 +416,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         ["add_stage", { job_id: bobJob.id, name: "Foreign stage" }], ["update_stage", { stage_id: bobStage.id, name: "Foreign round", make_current: true }],
         ["add_feedback", { stage_id: bobStage.id, text: "Foreign feedback" }], ["update_feedback", { feedback_id: bobFeedback.id, text: "Foreign edit" }],
         ["get_calendar_event", { stage_id: bobStage.id }],
-        ["qualify_jobs", { criteria_revision: 2, decisions: [
+        ["qualify_jobs", { decisions: [
           { job_id: aliceJob.id, qualification: "excluded", score: 0, reason: "Atomic foreign attempt" },
           { job_id: bobJob.id, qualification: "excluded", score: 0, reason: "Foreign assessment" },
         ] }],
@@ -431,10 +439,14 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.match(bobDraft.create_event_args.description, /Bob interview/u);
       assert.doesNotMatch(bobDraft.create_event_args.description, /Alice|private feedback/u);
       await scoped(alice, "set_criteria", { text: "Alice changed again" }, v.unknown());
+      assert.deepEqual((await scoped(alice, "list_jobs", { needs_review: false }, jobsSchema)).jobs.map((job) => job.id), [aliceJob.id]);
       assert.deepEqual((await scoped(bob, "list_jobs", { needs_review: false }, jobsSchema)).jobs.map((job) => job.id), [bobJob.id]);
+      const pending = await scoped(alice, "add_jobs", { jobs: [{ company: "Alice lead", title: "Engineer", description: "New remote role" }] }, jobsSchema);
+      assert.ok(pending.jobs[0]);
       const prompt = await alice.getPrompt({ name: "rank_jobs", arguments: { limit: "25", offset: "0" } });
       assert.ok(prompt.messages[0]?.content.type === "text");
-      assert.match(prompt.messages[0].content.text, new RegExp(aliceJob.id, "u"));
+      assert.match(prompt.messages[0].content.text, new RegExp(pending.jobs[0].id, "u"));
+      assert.doesNotMatch(prompt.messages[0].content.text, new RegExp(aliceJob.id, "u"));
       assert.doesNotMatch(prompt.messages[0].content.text, new RegExp(bobJob.id, "u"));
       const spoofed = await alice.callTool({ name: "get_context", arguments: { user_id: "another-user" } });
       assert.equal(spoofed.isError, true);

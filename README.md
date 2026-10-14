@@ -75,11 +75,11 @@ The server's MCP instructions tell the agent to start each conversation with `ge
 | Tool | Purpose |
 | --- | --- |
 | `get_context` | Load criteria and the active pipeline. |
-| `set_criteria` | Save natural-language criteria and increment their revision. |
+| `set_criteria` | Save or replace the user's single natural-language criteria document. |
 | `add_jobs` | Import up to 25 job descriptions atomically. |
 | `list_jobs` | Search company, title, or nickname; filter and rank by score. |
 | `get_job` | Load an opening, its stages, calendar details, and feedback. |
-| `qualify_jobs` | Save LLM decisions, scores, and rationales against a criteria revision. |
+| `qualify_jobs` | Save LLM decisions, scores, and rationales against the current criteria. |
 | `update_job` | Edit opening/contact details, status, or the current stage. |
 | `add_stage` | Add any named stage and optionally its schedule. |
 | `update_stage` | Record an outcome, reschedule, or link a calendar event. |
@@ -93,8 +93,8 @@ Example progression:
 
 1. `set_criteria`: “Remote TypeScript roles, product teams, no onsite-only work.”
 2. `add_jobs`: save each opening's company, title, description, optional source URL, and optional nickname such as `google-platform`.
-3. Use the `rank_jobs` prompt or call `list_jobs` with `include_descriptions: true` and `needs_review: true`. The agent evaluates the descriptions, then calls `qualify_jobs` with `criteria_revision`, each `job_id`, `qualification` (`qualified` or `excluded`), a `score` from 0–100, and a `reason`.
-4. `list_jobs` with `qualification: "qualified"` returns the strongest matches first. Excluded leads stay saved. Criteria changes mark assessments stale; editing an opening's company, title, description, or location resets its assessment to pending.
+3. Use the `rank_jobs` prompt or call `list_jobs` with `include_descriptions: true` and `needs_review: true`. The agent evaluates the descriptions, then calls `qualify_jobs` with a `decisions` array containing each `job_id`, `qualification` (`qualified` or `excluded`), a `score` from 0–100, and a `reason`.
+4. `list_jobs` with `qualification: "qualified"` returns the strongest matches first. Excluded leads stay saved. Saving criteria replaces the user's current document without changing existing openings or their assessments. `needs_review` only flags pending assessments. Editing an opening's company, title, description, or location resets its assessment to pending.
 5. “Google's recruiter offered a screening Monday at 9 AM Pacific.” The agent resolves the exact opening with `list_jobs`, clarifies if several match, and calls `add_stage` with a concrete date and UTC offset.
 6. After the round, use `update_stage` to mark `passed`, `failed`, or `completed`. Optionally add your verbatim reflection using `add_feedback`; no feedback is required.
 7. Add another stage for the next round, or use `update_job` to mark the application `rejected`, `withdrawn`, `offer`, or `accepted`.
