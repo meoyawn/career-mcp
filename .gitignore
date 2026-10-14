@@ -13,8 +13,11 @@ dist/
 *.db
 *.db-shm
 *.db-wal
-*.sqlite
-*.sqlite3
+*.sqlite*
 *.pem
 *.key
 secrets.json
+.cloudflare-api-token
+secrets/
+private/
+backups/

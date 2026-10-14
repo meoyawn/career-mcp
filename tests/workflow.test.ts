@@ -17,7 +17,7 @@ const wrangler = resolve("node_modules/wrangler/bin/wrangler.js");
 let token: string;
 const jobSchema = v.object({
   id: v.string(), company: v.string(), title: v.string(), nickname: v.nullable(v.string()),
-  current_stage: v.string(), status: v.string(), qualification: v.string(), score: v.nullable(v.number()),
+  current_stage: v.string(), status: v.string(), score: v.nullable(v.number()),
 });
 const jobsSchema = v.object({ jobs: v.array(jobSchema), next_offset: v.optional(v.nullable(v.number())) });
 const stageSchema = v.object({
@@ -110,8 +110,12 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
-  test("one current criteria document reaches agent context and criteria changes leave existing openings unchanged", async () => {
+  test("criteria are required before saving qualified leads singly or in batches, and ranking stays independent", async () => {
     const criteriaOutput = v.strictObject({ user_id: v.string(), text: v.string(), updated_at: v.string() });
+    const opening = { company: "Google", title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work" };
+    await error("add_jobs", { jobs: [opening] }, /set_criteria/u);
+    await error("add_job", opening, /set_criteria/u);
+    assert.deepEqual((await call("list_jobs", {}, jobsSchema)).jobs, []);
     const text = "\n# Job selection criteria\r\n\r\n- Remote TypeScript roles.\r\n- Exclude onsite-only work.\r\n\r\n## Ranking\nPrefer product teams; score stack fit from 0–100.\nПродуктовые команды в приоритете.\n ";
     const { tools } = await client.listTools();
     const criteriaTool = tools.find((tool) => tool.name === "set_criteria");
@@ -130,16 +134,17 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(criteria.text, text);
     await error("set_criteria", { text: " \t\r\n" }, /non-blank/u);
     await error("set_criteria", { text: "x".repeat(20_001) }, /length|characters/u);
+    const google = await call("add_job", { ...opening, score: 95 }, jobSchema);
+    assert.equal(google.current_stage, "lead");
+    assert.equal(google.score, 95);
     const imported = await call("add_jobs", { jobs: [
-      { company: "Google", title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work" },
-      { company: "Microsoft", title: "Backend engineer", description: "Remote backend work" },
-      { company: "Facebook", title: "Office engineer", description: "Onsite only" },
+      { company: "Microsoft", title: "Backend engineer", description: "Remote backend work", score: 70 },
+      { company: "New Co", title: "TypeScript engineer", description: "Remote TypeScript product work" },
     ] }, jobsSchema);
-    assert.equal(imported.jobs.length, 3);
-    const google = imported.jobs.find((job) => job.company === "Google");
+    assert.equal(imported.jobs.length, 2);
     const microsoft = imported.jobs.find((job) => job.company === "Microsoft");
-    const facebook = imported.jobs.find((job) => job.company === "Facebook");
-    assert.ok(google && microsoft && facebook);
+    assert.ok(microsoft);
+    assert.equal(imported.jobs.find((job) => job.company === "New Co")?.score, null);
     const context = await call("get_context", {}, v.object({ criteria: criteriaOutput }));
     assert.deepEqual(context.criteria, criteria);
     const resource = await client.readResource({ uri: "careers://criteria" });
@@ -148,29 +153,26 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const prompt = await client.getPrompt({ name: "rank_jobs" });
     assert.ok(prompt.messages[0]?.content.type === "text");
     assert.match(prompt.messages[0].content.text, /Remote TypeScript platform work/u);
-    await call("qualify_jobs", { decisions: [
-      { job_id: google.id, qualification: "qualified", score: 95, reason: "Remote and exact stack match" },
-      { job_id: microsoft.id, qualification: "qualified", score: 70, reason: "Remote with less stack overlap" },
-      { job_id: facebook.id, qualification: "excluded", score: 0, reason: "Onsite-only fails the criteria" },
-    ] }, jobsSchema);
-    const ranked = await call("list_jobs", { qualification: "qualified", limit: 1 }, jobsSchema);
+    const ranked = await call("list_jobs", { limit: 1 }, jobsSchema);
     assert.equal(ranked.jobs[0]?.id, google.id);
     assert.equal(ranked.next_offset, 1);
-    assert.equal((await call("list_jobs", { qualification: "qualified", limit: 1, offset: 1 }, jobsSchema)).jobs[0]?.id, microsoft.id);
+    assert.equal((await call("list_jobs", { limit: 1, offset: 1 }, jobsSchema)).jobs[0]?.id, microsoft.id);
     await call("set_criteria", { text }, criteriaOutput);
-    assert.deepEqual((await call("list_jobs", { needs_review: true }, jobsSchema)).jobs, []);
     const openingsOutput = v.object({ jobs: v.array(v.record(v.string(), v.unknown())), next_offset: v.null() });
     const openingsBefore = await call("list_jobs", { include_descriptions: true }, openingsOutput);
+    for (const job of openingsBefore.jobs) {
+      for (const field of ["qualification", "qualification_reason", "needs_review"]) assert.equal(Object.hasOwn(job, field), false);
+    }
     const changed = await call("set_criteria", { text: "Remote TypeScript roles, prefer product teams." }, criteriaOutput);
     assert.equal(changed.text, "Remote TypeScript roles, prefer product teams.");
     assert.deepEqual((await call("get_context", {}, v.object({ criteria: criteriaOutput }))).criteria, changed);
     assert.deepEqual(await call("list_jobs", { include_descriptions: true }, openingsOutput), openingsBefore);
-    assert.deepEqual((await call("list_jobs", { needs_review: true }, jobsSchema)).jobs, []);
-    await call("qualify_jobs", { decisions: [{ job_id: google.id, qualification: "qualified", score: 100, reason: "Best match for the current criteria" }] }, jobsSchema);
-    assert.equal((await call("list_jobs", { needs_review: false }, jobsSchema)).jobs.length, 3);
-    const updated = await call("update_job", { job_id: google.id, description: "Now an onsite-only role" }, jobSchema);
-    assert.equal(updated.qualification, "pending");
+    await call("update_job", { job_id: google.id, score: 100, notes: "Best match for the current criteria" }, jobSchema);
+    assert.equal((await call("list_jobs", {}, jobsSchema)).jobs.length, 3);
+    const updated = await call("update_job", { job_id: google.id, description: "Remote TypeScript product role" }, jobSchema);
     assert.equal(updated.score, null);
+    const reranked = await call("update_job", { job_id: google.id, title: "Senior TypeScript engineer", score: 98 }, jobSchema);
+    assert.equal(reranked.score, 98);
   });
 
   test("concurrent applications keep independent stages, failures, optional feedback, and corrected voice transcriptions", async () => {
@@ -394,13 +396,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const bobStage = await scoped(bob, "add_stage", { job_id: bobJob.id, name: "Bob interview", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
       await scoped(alice, "add_feedback", { stage_id: aliceStage.id, text: "Alice private feedback" }, feedbackOutput);
       const bobFeedback = await scoped(bob, "add_feedback", { stage_id: bobStage.id, text: "Bob private feedback" }, feedbackOutput);
-      await scoped(alice, "qualify_jobs", { decisions: [{ job_id: aliceJob.id, qualification: "qualified", score: 90, reason: "Alice assessment" }] }, jobsSchema);
-      await scoped(bob, "qualify_jobs", { decisions: [{ job_id: bobJob.id, qualification: "qualified", score: 80, reason: "Bob assessment" }] }, jobsSchema);
+      await scoped(alice, "update_job", { job_id: aliceJob.id, score: 90, notes: "Alice assessment" }, jobSchema);
+      await scoped(bob, "update_job", { job_id: bobJob.id, score: 80, notes: "Bob assessment" }, jobSchema);
       for (const [owner, ownJob, ownStage, criteria] of [[alice, aliceJob, aliceStage, "Alice remote product roles"], [bob, bobJob, bobStage, "Bob onsite roles"]] as const) {
         const context = await scoped(owner, "get_context", {}, v.object({ criteria: v.object({ text: v.string() }), jobs: v.array(jobSchema) }));
         assert.equal(context.criteria.text, criteria);
         assert.deepEqual(context.jobs.map((job) => job.id), [ownJob.id]);
-        assert.deepEqual((await scoped(owner, "list_jobs", { include_descriptions: true, needs_review: false }, jobsSchema)).jobs.map((job) => job.id), [ownJob.id]);
+        assert.deepEqual((await scoped(owner, "list_jobs", { include_descriptions: true }, jobsSchema)).jobs.map((job) => job.id), [ownJob.id]);
         assert.deepEqual((await scoped(owner, "get_upcoming", { from: "2026-12-01T00:00:00Z" }, v.object({ stages: v.array(stageSchema) }))).stages.map((stage) => stage.id), [ownStage.id]);
         assert.deepEqual((await scoped(owner, "list_feedback", {}, v.object({ feedback: v.array(feedbackOutput) }))).feedback.map((feedback) => feedback.stage_id), [ownStage.id]);
         const detail = await scoped(owner, "get_job", { job_id: ownJob.id }, v.object({ stages: v.array(stageSchema), feedback: v.array(feedbackOutput) }));
@@ -416,10 +418,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         ["add_stage", { job_id: bobJob.id, name: "Foreign stage" }], ["update_stage", { stage_id: bobStage.id, name: "Foreign round", make_current: true }],
         ["add_feedback", { stage_id: bobStage.id, text: "Foreign feedback" }], ["update_feedback", { feedback_id: bobFeedback.id, text: "Foreign edit" }],
         ["get_calendar_event", { stage_id: bobStage.id }],
-        ["qualify_jobs", { decisions: [
-          { job_id: aliceJob.id, qualification: "excluded", score: 0, reason: "Atomic foreign attempt" },
-          { job_id: bobJob.id, qualification: "excluded", score: 0, reason: "Foreign assessment" },
-        ] }],
+        ["update_job", { job_id: bobJob.id, score: 0, notes: "Foreign assessment" }],
       ] as const;
       for (const [name, args] of forbidden) {
         const result = await alice.callTool({ name, arguments: args });
@@ -439,14 +438,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.match(bobDraft.create_event_args.description, /Bob interview/u);
       assert.doesNotMatch(bobDraft.create_event_args.description, /Alice|private feedback/u);
       await scoped(alice, "set_criteria", { text: "Alice changed again" }, v.unknown());
-      assert.deepEqual((await scoped(alice, "list_jobs", { needs_review: false }, jobsSchema)).jobs.map((job) => job.id), [aliceJob.id]);
-      assert.deepEqual((await scoped(bob, "list_jobs", { needs_review: false }, jobsSchema)).jobs.map((job) => job.id), [bobJob.id]);
-      const pending = await scoped(alice, "add_jobs", { jobs: [{ company: "Alice lead", title: "Engineer", description: "New remote role" }] }, jobsSchema);
-      assert.ok(pending.jobs[0]);
+      assert.deepEqual((await scoped(alice, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [aliceJob.id]);
+      assert.deepEqual((await scoped(bob, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [bobJob.id]);
+      const lead = await scoped(alice, "add_job", { company: "Alice lead", title: "Engineer", description: "New remote role" }, jobSchema);
       const prompt = await alice.getPrompt({ name: "rank_jobs", arguments: { limit: "25", offset: "0" } });
       assert.ok(prompt.messages[0]?.content.type === "text");
-      assert.match(prompt.messages[0].content.text, new RegExp(pending.jobs[0].id, "u"));
-      assert.doesNotMatch(prompt.messages[0].content.text, new RegExp(aliceJob.id, "u"));
+      assert.match(prompt.messages[0].content.text, new RegExp(lead.id, "u"));
+      assert.match(prompt.messages[0].content.text, new RegExp(aliceJob.id, "u"));
       assert.doesNotMatch(prompt.messages[0].content.text, new RegExp(bobJob.id, "u"));
       const spoofed = await alice.callTool({ name: "get_context", arguments: { user_id: "another-user" } });
       assert.equal(spoofed.isError, true);

@@ -2,7 +2,7 @@
 
 A personal job-search CRM exposed as an MCP server on Cloudflare Workers, backed by D1 SQLite. TypeScript, Valibot schemas, Aube, Oxlint, and the TypeScript 7 native compiler (`tsgo`).
 
-Save your selection criteria as natural-language text, import job descriptions, and let your LLM filter and rank them. Track multiple applications independently, with freely named stages, interview schedules, outcomes, recruiter details, and optional feedback. Voice feedback is stored as transcribed text; your chat/voice client handles transcription.
+Save your selection criteria as natural-language text and let your LLM evaluate openings before saving qualified leads. Rank saved leads and track multiple applications independently, with freely named stages, interview schedules, outcomes, recruiter details, and optional feedback. Voice feedback is stored as transcribed text; your chat/voice client handles transcription.
 
 Sign in or create an account with a passkey; no password, email, or shared token is required. Multiple users share one D1 database, with separate criteria, applications, stages, feedback, and calendar links. The LLM does the reasoning; the Worker stores and retrieves the data. All timestamps are normalized to UTC RFC3339 strings such as `2026-11-02T17:00:00.000Z`.
 
@@ -64,7 +64,7 @@ The maintainer's deployment is [mcp.example.com](https://mcp.example.com/). Conn
 
 The deploy command applies `0001_initial.sql` before the first publication. It creates the complete user-scoped CRM and passkey/OAuth schema in one migration.
 
-Every store operation takes a user scope derived from a verified access token. Ownership is checked on reads, updates, ranking batches, parent-child links, resources, prompts, feedback searches, and calendar drafts. Nicknames (case-insensitive) and source URLs are unique within each user's jobs. Composite foreign keys reject stages and feedback attached to another user's records. Clients cannot supply or override a user ID.
+Every store operation takes a user scope derived from a verified access token. Ownership is checked on reads, updates, rankings, parent-child links, resources, prompts, feedback searches, and calendar drafts. Nicknames (case-insensitive) and source URLs are unique within each user's jobs. Composite foreign keys reject stages and feedback attached to another user's records. Clients cannot supply or override a user ID.
 
 WebAuthn requires discoverable credentials and user verification. Challenges are tied to a browser cookie, expire after five minutes, and are consumed once. Browser sessions last seven days. OAuth codes expire after one minute; access tokens last one hour, and refresh tokens rotate with a 30-day lifetime. Session and OAuth token values are stored only as SHA-256 hashes. Consent displays the client name and callback host; redirect URIs, PKCE, client IDs, and the MCP resource are checked before issuing tokens.
 
@@ -76,11 +76,11 @@ The server's MCP instructions tell the agent to start each conversation with `ge
 | --- | --- |
 | `get_context` | Load criteria and the active pipeline. |
 | `set_criteria` | Save or replace the user's single natural-language criteria document. |
-| `add_jobs` | Import up to 25 job descriptions atomically. |
+| `add_job` | Save one already-qualified lead, with an optional ranking score. |
+| `add_jobs` | Save 1–25 already-qualified leads atomically. |
 | `list_jobs` | Search company, title, or nickname; filter and rank by score. |
 | `get_job` | Load an opening, its stages, calendar details, and feedback. |
-| `qualify_jobs` | Save LLM decisions, scores, and rationales against the current criteria. |
-| `update_job` | Edit opening/contact details, status, or the current stage. |
+| `update_job` | Edit opening/contact details, status, the current stage, or ranking score. |
 | `add_stage` | Add any named stage and optionally its schedule. |
 | `update_stage` | Record an outcome, reschedule, or link a calendar event. |
 | `add_feedback` | Append a transcript or feedback text to a stage. |
@@ -92,16 +92,29 @@ The server's MCP instructions tell the agent to start each conversation with `ge
 Example progression:
 
 1. `set_criteria`: “Remote TypeScript roles, product teams, no onsite-only work.”
-2. `add_jobs`: save each opening's company, title, description, optional source URL, and optional nickname such as `google-platform`.
-3. Use the `rank_jobs` prompt or call `list_jobs` with `include_descriptions: true` and `needs_review: true`. The agent evaluates the descriptions, then calls `qualify_jobs` with a `decisions` array containing each `job_id`, `qualification` (`qualified` or `excluded`), a `score` from 0–100, and a `reason`.
-4. `list_jobs` with `qualification: "qualified"` returns the strongest matches first. Excluded leads stay saved. Saving criteria replaces the user's current document without changing existing openings or their assessments. `needs_review` only flags pending assessments. Editing an opening's company, title, description, or location resets its assessment to pending.
+2. `get_context`: load the saved criteria. Evaluate each opening against them before saving; leave excluded and unevaluated openings outside the CRM.
+3. `add_job`: save a single qualified opening's company, title, description, optional source URL, and optional nickname such as `google-platform`. Use `add_jobs` for a batch. Both require saved criteria. Supply an optional `score` (0–100) and put rationale in `notes`; qualification does not need a score or another tool call.
+4. `list_jobs` returns the strongest scored leads first, with unranked leads last. Use the `rank_jobs` prompt or `list_jobs` with `include_descriptions: true` to rank saved leads, then `update_job` with `score` and `notes`. Saving criteria replaces the user's current document without changing existing openings or rankings. Recheck eligibility before editing an opening's company, title, description, or location; those edits clear its old score unless a new score is supplied.
 5. “Google's recruiter offered a screening Monday at 9 AM Pacific.” The agent resolves the exact opening with `list_jobs`, clarifies if several match, and calls `add_stage` with a concrete date and UTC offset.
 6. After the round, use `update_stage` to mark `passed`, `failed`, or `completed`. Optionally add your verbatim reflection using `add_feedback`; no feedback is required.
 7. Add another stage for the next round, or use `update_job` to mark the application `rejected`, `withdrawn`, `offer`, or `accepted`.
 
 Stage names are free text. `add_stage.make_current` defaults to true; `update_stage.make_current` defaults to false. A failed stage does not automatically close the application. Different companies and multiple openings at the same company have independent UUIDs and histories. Mutations use those exact IDs; nickname and source URL uniqueness help catch duplicate imports. To retry an uncertain mutation, first retrieve its result; appending stages or feedback creates a new entry each time.
 
-`list_jobs`, `list_feedback`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. After saving a ranking batch, retrieve `offset: "0"` again: saved decisions leave the `needs_review` result set. Use `next_offset` only when reading pages without saving between them.
+There is no qualification column, pending review queue, or `qualify_jobs` tool. The agent evaluates natural-language criteria; the Worker checks that criteria exist and persists leads the agent has already qualified. The qualified-lead migration keeps existing leads and their histories, removes previously excluded openings, and moves earlier assessment rationales into notes.
+
+`list_jobs`, `list_feedback`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. Read all pages before saving rankings: changing scores reorders results.
+
+## Read-only database queries
+
+`scripts/d1.ts` uses this checkout's Wrangler authentication and remote `careers` database. It also loads `.env.deploy` when present. It accepts one `SELECT` or read-only CTE, wraps it in a subquery so SQL writes cannot execute, and checks that D1 reports no writes.
+
+```fish
+node scripts/d1.ts 'SELECT COUNT(*) AS count FROM jobs'
+node scripts/d1.ts "SELECT name FROM pragma_table_info('jobs')"
+```
+
+Results print as JSON. Query results can contain private account or CRM data: redirect saved output into `private/` or `backups/`, which are Git-ignored. Environment files, `.cloudflare-api-token`, secret files, local databases, and `.wrangler/` backups are also ignored. Keep credentials and database exports out of tracked files; `AGENTS.md` requires this.
 
 ## Google Calendar integration
 

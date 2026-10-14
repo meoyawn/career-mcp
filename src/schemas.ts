@@ -6,7 +6,7 @@ const email = v.pipe(v.string(), v.email(), v.maxLength(320));
 const url = v.pipe(v.string(), v.url(), v.regex(/^https?:\/\//, "Use an HTTP or HTTPS URL."), v.maxLength(2_000));
 const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
-const qualification = v.picklist(["pending", "qualified", "excluded"]);
+const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
 const source = v.picklist(["self", "recruiter", "interviewer"]);
 const limit = v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100)), 25);
@@ -16,37 +16,29 @@ export const emptySchema = v.strictObject({});
 export const criteriaSchema = v.strictObject({ text: text(20_000) });
 export const jobIdSchema = v.strictObject({ job_id: id });
 
+export const addJobSchema = v.strictObject({
+  company: text(200),
+  title: text(300),
+  nickname: v.optional(text(200)),
+  description: text(30_000),
+  source_url: v.optional(url),
+  location: v.optional(text(500)),
+  recruiter_name: v.optional(text(200)),
+  recruiter_email: v.optional(email),
+  notes: v.optional(text(20_000)),
+  score: v.optional(score),
+});
+
 export const addJobsSchema = v.strictObject({
-  jobs: v.pipe(v.array(v.strictObject({
-    company: text(200),
-    title: text(300),
-    nickname: v.optional(text(200)),
-    description: text(30_000),
-    source_url: v.optional(url),
-    location: v.optional(text(500)),
-    recruiter_name: v.optional(text(200)),
-    recruiter_email: v.optional(email),
-    notes: v.optional(text(20_000)),
-  })), v.minLength(1), v.maxLength(25)),
+  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(25)),
 });
 
 export const listJobsSchema = v.strictObject({
   query: v.optional(text(300)),
   status: v.optional(jobStatus),
-  qualification: v.optional(qualification),
-  needs_review: v.optional(v.boolean()),
   include_descriptions: v.optional(v.boolean(), false),
   limit,
   offset,
-});
-
-export const qualifyJobsSchema = v.strictObject({
-  decisions: v.pipe(v.array(v.strictObject({
-    job_id: id,
-    qualification: v.picklist(["qualified", "excluded"]),
-    score: v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100)),
-    reason: text(10_000),
-  })), v.minLength(1), v.maxLength(25)),
 });
 
 export const updateJobSchema = v.strictObject({
@@ -62,6 +54,7 @@ export const updateJobSchema = v.strictObject({
   notes: v.optional(v.nullable(text(20_000))),
   status: v.optional(jobStatus),
   current_stage: v.optional(text(200)),
+  score: v.optional(v.nullable(score)),
 });
 
 const stageFields = {
@@ -138,7 +131,6 @@ export const rankPromptSchema = v.strictObject({
 
 export type AddJobs = v.InferOutput<typeof addJobsSchema>;
 export type ListJobs = v.InferOutput<typeof listJobsSchema>;
-export type QualifyJobs = v.InferOutput<typeof qualifyJobsSchema>;
 export type UpdateJob = v.InferOutput<typeof updateJobSchema>;
 export type AddStage = v.InferOutput<typeof addStageSchema>;
 export type UpdateStage = v.InferOutput<typeof updateStageSchema>;

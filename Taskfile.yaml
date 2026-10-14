@@ -1,0 +1,11 @@
+version: '3'
+
+tasks:
+  deploy:
+    desc: Deploy the Worker and refresh CareerMCP tools in ChatGPT
+    preconditions:
+      - sh: command -v mcp-refresh >/dev/null 2>&1
+        msg: Install mcp-refresh and add it to PATH before deploying.
+    cmds:
+      - aube run deploy
+      - mcp-refresh refresh CareerMCP

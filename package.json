@@ -16,7 +16,7 @@
     "db:migrate:remote": "node --env-file-if-exists=.env.deploy node_modules/wrangler/bin/wrangler.js d1 migrations apply careers --remote",
     "types": "wrangler types --env-file .dev.vars.example",
     "typecheck": "tsgo --noEmit",
-    "lint": "oxlint --deny-warnings src tests",
+    "lint": "oxlint --deny-warnings src tests scripts",
     "test": "node --test tests/*.test.ts",
     "check": "aube run typecheck && aube run lint && aube test && aube run build"
   },

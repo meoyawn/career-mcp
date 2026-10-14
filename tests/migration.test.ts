@@ -3,12 +3,13 @@ import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
-describe("User ownership schema and criteria migration", () => {
+describe("User ownership schema and lead migrations", () => {
   test("enforces ownership on parent-child relationships and requires an owner for stored jobs", async () => {
     const db = new DatabaseSync(":memory:");
     try {
       db.exec(await readFile("migrations/0001_initial.sql", "utf8"));
       db.exec(await readFile("migrations/0002_single_criteria.sql", "utf8"));
+      db.exec(await readFile("migrations/0003_qualified_leads.sql", "utf8"));
       db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'now'), ('bob', 'now');
         INSERT INTO jobs (user_id, id, company, title, description, created_at, updated_at)
           VALUES ('alice', 'alice-job', 'Company', 'Engineer', 'Alice description', 'now', 'now'),
@@ -26,6 +27,50 @@ describe("User ownership schema and criteria migration", () => {
       assert.throws(() => db.exec(`INSERT INTO jobs (id, company, title, description, created_at, updated_at)
         VALUES ('unowned-job', 'Company', 'Engineer', 'No owner', 'now', 'now')`), /NOT NULL/u);
       assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("qualified-lead migration preserves existing leads and histories, moves rationale into notes, and removes exclusions", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      db.exec(await readFile("migrations/0001_initial.sql", "utf8"));
+      db.exec(await readFile("migrations/0002_single_criteria.sql", "utf8"));
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created');
+        INSERT INTO criteria (user_id, text, updated_at) VALUES ('alice', 'Remote roles', 'saved');
+        INSERT INTO jobs (user_id, id, company, title, description, qualification, score, qualification_reason, notes, created_at, updated_at)
+          VALUES ('alice', 'qualified', 'Product Co', 'Engineer', 'Remote role', 'qualified', 95, 'Strong fit', 'Recruiter contacted', 'created', 'assessed'),
+            ('alice', 'excluded', 'Office Co', 'Engineer', 'Office role', 'excluded', 0, 'Onsite only', NULL, 'created', 'assessed'),
+            ('bob', 'legacy-lead', 'New Co', 'Engineer', 'Remote role', 'pending', NULL, NULL, NULL, 'created', 'created');
+        INSERT INTO stages (rowid, user_id, id, job_id, name, calendar_event_id, calendar_id, created_at, updated_at)
+          VALUES (7, 'alice', 'interview', 'qualified', 'Screening', 'event-id', 'primary', 'created', 'scheduled'),
+            (8, 'alice', 'excluded-interview', 'excluded', 'Screening', NULL, NULL, 'created', 'created'),
+            (9, 'bob', 'legacy-interview', 'legacy-lead', 'Technical', NULL, NULL, 'created', 'created');
+        INSERT INTO feedback (rowid, user_id, id, stage_id, text, created_at, updated_at)
+          VALUES (11, 'alice', 'reflection', 'interview', 'Ask about product scope', 'created', 'recorded'),
+            (12, 'alice', 'excluded-reflection', 'excluded-interview', 'Old reflection', 'created', 'recorded'),
+            (13, 'bob', 'legacy-reflection', 'legacy-interview', 'Follow up', 'created', 'recorded');`);
+      const criteria = db.prepare("SELECT * FROM criteria").all();
+      const stages = db.prepare("SELECT rowid, * FROM stages WHERE id IS NOT 'excluded-interview' ORDER BY rowid").all();
+      const feedback = db.prepare("SELECT rowid, * FROM feedback WHERE id IS NOT 'excluded-reflection' ORDER BY rowid").all();
+      db.exec("BEGIN");
+      db.exec(await readFile("migrations/0003_qualified_leads.sql", "utf8"));
+      db.exec("COMMIT");
+      assert.deepEqual(db.prepare("SELECT id, score, notes FROM jobs ORDER BY id").all().map((row) => ({ ...row })), [
+        { id: "legacy-lead", score: null, notes: null },
+        { id: "qualified", score: 95, notes: "Recruiter contacted\n\nStrong fit" },
+      ]);
+      assert.deepEqual(db.prepare("SELECT * FROM criteria").all(), criteria);
+      assert.deepEqual(db.prepare("SELECT rowid, * FROM stages ORDER BY rowid").all(), stages);
+      assert.deepEqual(db.prepare("SELECT rowid, * FROM feedback ORDER BY rowid").all(), feedback);
+      db.exec(`INSERT INTO jobs (user_id, id, company, title, description, score, created_at, updated_at)
+        VALUES ('alice', 'new-lead', 'New Co', 'Engineer', 'Remote role', 80, 'new', 'new')`);
+      assert.throws(() => db.prepare("SELECT qualification FROM jobs"), /no such column/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      db.exec("DELETE FROM jobs WHERE id IS 'qualified'");
+      assert.deepEqual(db.prepare("SELECT id FROM stages").all().map((row) => row.id), ["legacy-interview"]);
+      assert.deepEqual(db.prepare("SELECT id FROM feedback").all().map((row) => row.id), ["legacy-reflection"]);
     } finally {
       db.close();
     }

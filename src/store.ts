@@ -1,4 +1,4 @@
-import type { AddFeedback, AddJobs, AddStage, CalendarEvent, ListFeedback, ListJobs, QualifyJobs, Upcoming, UpdateFeedback, UpdateJob, UpdateStage } from "./schemas.ts";
+import type { AddFeedback, AddJobs, AddStage, CalendarEvent, ListFeedback, ListJobs, Upcoming, UpdateFeedback, UpdateJob, UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -24,9 +24,7 @@ interface Job {
   notes: string | null;
   status: string;
   current_stage: string;
-  qualification: string;
   score: number | null;
-  qualification_reason: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -77,13 +75,15 @@ function duplicateError(error: unknown): never {
   throw error;
 }
 
-export async function addJobs({ db, userId }: UserStore, { jobs }: AddJobs) {
+export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
+  const { db, userId } = scope;
+  if (!await getCriteria(scope)) fail("Save your criteria with set_criteria, then evaluate openings before adding qualified leads.");
   const now = new Date().toISOString();
   const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
-    (user_id, id, company, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
+    (user_id, id, company, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
     userId, crypto.randomUUID(), job.company, job.title, job.nickname ?? null, job.description, job.source_url ?? null,
-    job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, now, now,
+    job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null, now, now,
   ));
   try {
     const results = await db.batch<Job>(statements);
@@ -128,15 +128,12 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     bindings.push(pattern, pattern, pattern);
   }
   if (input.status) { where.push("status IS ?"); bindings.push(input.status); }
-  if (input.qualification) { where.push("qualification IS ?"); bindings.push(input.qualification); }
-  const review = "(qualification IS 'pending')";
-  if (input.needs_review !== undefined) where.push(input.needs_review ? review : `NOT ${review}`);
   const columns = input.include_descriptions ? "*" : `id, company, title, nickname, source_url, location,
-    recruiter_name, recruiter_email, notes, status, current_stage, qualification, score, qualification_reason,
+    recruiter_name, recruiter_email, notes, status, current_stage, score,
     created_at, updated_at`;
-  const results = await db.prepare(`SELECT ${columns}, ${review} AS needs_review FROM jobs
+  const results = await db.prepare(`SELECT ${columns} FROM jobs
     WHERE ${where.join(" AND ")} ORDER BY score DESC NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
-    .bind(...bindings, input.limit + 1, input.offset).all<Omit<Job, "description"> & { description?: string; needs_review: number }>();
+    .bind(...bindings, input.limit + 1, input.offset).all<Omit<Job, "description"> & { description?: string }>();
   const hasMore = results.results.length > input.limit;
   return {
     jobs: results.results.slice(0, input.limit),
@@ -144,24 +141,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
   };
 }
 
-export async function qualifyJobs(scope: UserStore, input: QualifyJobs) {
-  const { db, userId } = scope;
-  const criteria = await getCriteria(scope);
-  if (!criteria) fail("Save your criteria with set_criteria before qualifying jobs.");
-  const ids = input.decisions.map((decision) => decision.job_id);
-  if (new Set(ids).size !== ids.length) fail("Each job_id must occur only once in decisions.");
-  const found = await db.prepare(`SELECT id FROM jobs WHERE user_id IS ? AND id IN (${ids.map(() => "?").join(",")})`)
-    .bind(userId, ...ids).all<{ id: string }>();
-  if (found.results.length !== ids.length) fail("One or more job_id values do not exist. No decisions were saved.");
-  const now = new Date().toISOString();
-  const results = await db.batch<Job>(input.decisions.map((decision) => db.prepare(`UPDATE jobs
-    SET qualification = ?, score = ?, qualification_reason = ?, updated_at = ?
-    WHERE user_id IS ? AND id IS ? RETURNING *`).bind(decision.qualification, decision.score, decision.reason,
-    now, userId, decision.job_id)));
-  return { jobs: results.flatMap((result) => result.results) };
-}
-
-function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "feedback", id: string, patch: Record<string, string | null | undefined>) {
+function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "feedback", id: string, patch: Record<string, string | number | null | undefined>) {
   const entries = Object.entries(patch).filter((entry) => entry[1] !== undefined);
   if (entries.length === 0) fail("Provide at least one field to update.");
   return db.prepare(`UPDATE ${table} SET ${entries.map(([key]) => `${key} = ?`).join(", ")}, updated_at = ? WHERE user_id IS ? AND id IS ? RETURNING *`)
@@ -169,22 +149,13 @@ function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "f
 }
 
 export async function updateJob(scope: UserStore, input: UpdateJob) {
-  const { db, userId } = scope;
   await requireJob(scope, input.job_id);
   const { job_id, ...patch } = input;
-  const statement = patchStatement(scope, "jobs", job_id, patch);
-  // Changes to the opening invalidate its earlier assessment against the criteria.
+  // Scores for changed descriptions must come from a new ranking.
   const invalidates = [input.company, input.title, input.description, input.location].some((value) => value !== undefined);
+  if (invalidates && patch.score === undefined) patch.score = null;
   try {
-    if (invalidates) {
-      const results = await db.batch<Job>([
-        statement,
-        db.prepare(`UPDATE jobs SET qualification = 'pending', score = NULL, qualification_reason = NULL
-          WHERE user_id IS ? AND id IS ? RETURNING *`).bind(userId, job_id),
-      ]);
-      return results[1]?.results[0];
-    }
-    return await statement.first<Job>();
+    return await patchStatement(scope, "jobs", job_id, patch).first<Job>();
   } catch (error) {
     duplicateError(error);
   }
