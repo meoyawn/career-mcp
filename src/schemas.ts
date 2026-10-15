@@ -14,11 +14,19 @@ const source = v.picklist(["self", "recruiter", "interviewer"]);
 const limit = v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100)), 25);
 const offset = v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100_000)), 0);
 const salaryAmount = v.pipe(v.number(), v.minValue(0), v.maxValue(Number.MAX_SAFE_INTEGER));
+const salaryCurrency = v.pipe(v.string(), v.regex(/^[A-Z]{3}$/, "Use a three-letter uppercase currency code, such as USD, EUR, or RUB."));
+const salaryPeriod = v.picklist(["hour", "day", "week", "month", "year"]);
 const salaryFields = {
   salary_min: v.optional(v.nullable(salaryAmount)),
   salary_max: v.optional(v.nullable(salaryAmount)),
-  salary_currency: v.optional(v.nullable(v.pipe(v.string(), v.regex(/^[A-Z]{3}$/, "Use a three-letter uppercase currency code, such as USD, EUR, or RUB.")))),
-  salary_period: v.optional(v.nullable(v.picklist(["hour", "day", "week", "month", "year"]))),
+  salary_currency: v.optional(v.nullable(salaryCurrency)),
+  salary_period: v.optional(v.nullable(salaryPeriod)),
+};
+const salaryAskFields = {
+  salary_ask_amount: v.optional(v.nullable(salaryAmount)),
+  salary_ask_currency: v.optional(v.nullable(salaryCurrency)),
+  salary_ask_period: v.optional(v.nullable(salaryPeriod)),
+  salary_ask_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
 };
 
 export const emptySchema = v.strictObject({});
@@ -39,6 +47,7 @@ export const pipelineSchema = v.strictObject({ limit, offset });
 
 export const addJobSchema = v.strictObject({
   ...salaryFields,
+  ...salaryAskFields,
   company: text(200),
   company_url: v.optional(url),
   phase: v.optional(phase, "lead"),
@@ -72,6 +81,7 @@ export const listJobsSchema = v.strictObject({
 
 export const updateJobSchema = v.strictObject({
   ...salaryFields,
+  ...salaryAskFields,
   job_id: id,
   company: v.optional(text(200)),
   company_url: v.optional(v.nullable(url)),

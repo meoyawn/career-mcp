@@ -4,6 +4,36 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("salary ask migration preserves employer budgets, leaves legacy asks unknown, and constrains amount and units", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      for (const migration of ["0001_initial", "0002_single_criteria", "0003_qualified_leads", "0004_application_context_cvs", "0005_employer_leads", "0006_outreach", "0007_reapplication", "0008_applicant_contact", "0009_applicant_profile"]) {
+        db.exec(await readFile(`migrations/${migration}.sql`, "utf8"));
+      }
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, salary_min, salary_max, salary_currency, salary_period, notes, created_at, updated_at)
+          VALUES ('alice', 'application', 'Example employer', 'application', 100000, 120000, 'USD', 'year', 'Preserve salary research notes', 'created', 'updated');`);
+      const original = db.prepare("SELECT * FROM jobs").get();
+      db.exec(await readFile("migrations/0010_salary_ask.sql", "utf8"));
+      const unknown = { salary_ask_amount: null, salary_ask_currency: null, salary_ask_period: null, salary_ask_basis: null };
+      assert.deepEqual({ ...db.prepare("SELECT * FROM jobs").get() }, { ...original, ...unknown });
+      db.exec("UPDATE jobs SET salary_ask_amount = 5500, salary_ask_currency = 'EUR', salary_ask_period = 'month', salary_ask_basis = 'gross'");
+      for (const invalid of [
+        "salary_ask_amount = -1", "salary_ask_amount = 1e100", "salary_ask_amount = 'unknown'", "salary_ask_amount = NULL",
+        "salary_ask_currency = NULL", "salary_ask_currency = 'eur'", "salary_ask_period = NULL", "salary_ask_period = 'unknown'", "salary_ask_basis = 'unknown'",
+      ]) assert.throws(() => db.exec(`UPDATE jobs SET ${invalid}`), /CHECK|cannot store TEXT/u);
+      db.exec("UPDATE jobs SET salary_ask_amount = 45.5, salary_ask_period = 'hour', salary_ask_basis = 'net'");
+      const ask = db.prepare("SELECT salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis FROM jobs").get();
+      assert.deepEqual({ ...ask }, { salary_ask_amount: 45.5, salary_ask_currency: "EUR", salary_ask_period: "hour", salary_ask_basis: "net" });
+      db.exec("UPDATE jobs SET salary_ask_basis = NULL");
+      db.exec("UPDATE jobs SET salary_ask_amount = NULL, salary_ask_currency = NULL, salary_ask_period = NULL, salary_ask_basis = NULL");
+      assert.deepEqual({ ...db.prepare("SELECT * FROM jobs").get() }, { ...original, ...unknown });
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("reapplication migration preserves rejected histories without inventing cooldowns and constrains eligibility deadlines", async () => {
     const db = new DatabaseSync(":memory:");
     try {

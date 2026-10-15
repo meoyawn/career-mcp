@@ -55,6 +55,10 @@ interface Job {
   salary_max: number | null;
   salary_currency: string | null;
   salary_period: "hour" | "day" | "week" | "month" | "year" | null;
+  salary_ask_amount: number | null;
+  salary_ask_currency: string | null;
+  salary_ask_period: "hour" | "day" | "week" | "month" | "year" | null;
+  salary_ask_basis: "gross" | "net" | null;
   created_at: string;
   updated_at: string;
 }
@@ -138,7 +142,7 @@ interface PipelineSummary {
   scheduled_stages: number;
 }
 
-interface PipelineJob extends Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at" | "salary_min" | "salary_max" | "salary_currency" | "salary_period"> {
+interface PipelineJob extends Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at" | "salary_min" | "salary_max" | "salary_currency" | "salary_period" | "salary_ask_amount" | "salary_ask_currency" | "salary_ask_period" | "salary_ask_basis"> {
   current_stage_status: string | null;
   last_outreach_at: string | null;
   last_response_at: string | null;
@@ -235,6 +239,14 @@ function validateSalary(input: Pick<UpdateJob, "salary_min" | "salary_max" | "sa
   if (min != null && max != null && min > max) fail("salary_min must not exceed salary_max.");
 }
 
+function validateSalaryAsk(input: Pick<UpdateJob, "salary_ask_amount" | "salary_ask_currency" | "salary_ask_period" | "salary_ask_basis">) {
+  const { salary_ask_amount: amount, salary_ask_currency: currency, salary_ask_period: period, salary_ask_basis: basis } = input;
+  if ([amount, currency, period, basis].every((value) => value == null)) return;
+  if (amount == null || currency == null || period == null) {
+    fail("Salary ask needs salary_ask_amount, salary_ask_currency, and salary_ask_period. Clear all four salary_ask fields to remove it; leave salary_ask_basis null when gross/net is unknown.");
+  }
+}
+
 export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   if (jobs.length < 1 || jobs.length > maxJobsPerBatch) {
     fail(`Received ${jobs.length} records. Save 1–${maxJobsPerBatch} employers or applications per call; split larger imports into batches. No records were saved.`);
@@ -245,6 +257,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
     try {
       validateOpening(job.phase, job);
       validateSalary(job);
+      validateSalaryAsk(job);
     } catch (error) {
       if (error instanceof Error && error.cause === "user") {
         fail(`Batch rejected: 0 of ${jobs.length} records saved. Record ${index + 1}: ${error.message}`);
@@ -254,12 +267,13 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   }
   const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
     (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
-      salary_min, salary_max, salary_currency, salary_period, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
+      salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
     userId, crypto.randomUUID(), job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "application",
     job.title ?? null, job.nickname ?? null, job.description ?? null, job.source_url ?? null,
     job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null,
-    job.salary_min ?? null, job.salary_max ?? null, job.salary_currency ?? null, job.salary_period ?? null, now, now,
+    job.salary_min ?? null, job.salary_max ?? null, job.salary_currency ?? null, job.salary_period ?? null,
+    job.salary_ask_amount ?? null, job.salary_ask_currency ?? null, job.salary_ask_period ?? null, job.salary_ask_basis ?? null, now, now,
   ));
   try {
     const results = await db.batch<Job>(statements);
@@ -330,6 +344,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
     db.prepare(`WITH pipeline AS (${page}) SELECT j.id, j.company, j.title, j.source_url, j.status,
       j.current_stage, current.status AS current_stage_status, j.recruiter_engaged_at,
       j.salary_min, j.salary_max, j.salary_currency, j.salary_period,
+      j.salary_ask_amount, j.salary_ask_currency, j.salary_ask_period, j.salary_ask_basis,
       (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'outbound') AS last_outreach_at,
       (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'inbound') AS last_response_at
       FROM pipeline j LEFT JOIN stages current ON current.user_id IS j.user_id AND current.id IS (
@@ -381,6 +396,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
   const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, title, nickname, source_url, location,
     recruiter_name, recruiter_email, notes, status, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
     score, salary_min, salary_max, salary_currency, salary_period,
+    salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
     created_at, updated_at`;
   const results = await db.prepare(`WITH opportunities AS (
     SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ?
@@ -418,6 +434,7 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   if (reapplyAfter !== null && reapplyPolicy !== "allowed") fail("reapply_after requires reapply_policy:allowed. Clear the deadline when clearing or denying reapplication.");
   validateOpening(input.phase ?? job.phase, input);
   validateSalary({ ...job, ...patch });
+  validateSalaryAsk({ ...job, ...patch });
   if (input.phase === "lead") {
     patch.title = null;
     patch.description = null;

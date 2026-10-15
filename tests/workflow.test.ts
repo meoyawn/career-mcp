@@ -218,6 +218,58 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(reranked.score, 98);
   });
 
+  test("salary asks persist independently of employer budgets and appear in the active pipeline with explicit units and unknowns", async () => {
+    const askFields = {
+      salary_ask_amount: v.nullable(v.number()), salary_ask_currency: v.nullable(v.string()),
+      salary_ask_period: v.nullable(v.string()), salary_ask_basis: v.nullable(v.string()),
+    };
+    const row = v.object({ ...jobSchema.entries, ...askFields,
+      salary_min: v.nullable(v.number()), salary_max: v.nullable(v.number()),
+      salary_currency: v.nullable(v.string()), salary_period: v.nullable(v.string()),
+    });
+    const ask = { salary_ask_amount: 5_500, salary_ask_currency: "EUR", salary_ask_period: "month", salary_ask_basis: "gross" };
+    const unknown = { salary_ask_amount: null, salary_ask_currency: null, salary_ask_period: null, salary_ask_basis: null };
+    const budget = { salary_min: 100_000, salary_max: 120_000, salary_currency: "USD", salary_period: "year" };
+    const imported = await call("add_jobs", { jobs: [
+      { company: "Salary ask employer", phase: "application", score: 90, ...budget, ...ask },
+      { company: "Salary ask unknown", phase: "application", ...budget },
+    ] }, v.object({ jobs: v.array(row) }));
+    const asked = imported.jobs[0];
+    const unasked = imported.jobs[1];
+    assert.ok(asked && unasked);
+    const projection = v.object(askFields);
+    const pipeline = v.object({ applications: v.array(v.object({ id: v.string(), ...askFields,
+      salary_min: v.nullable(v.number()), salary_max: v.nullable(v.number()),
+      salary_currency: v.nullable(v.string()), salary_period: v.nullable(v.string()),
+    })) });
+    assert.deepEqual(v.parse(projection, asked), ask);
+    assert.deepEqual(v.parse(projection, unasked), unknown);
+    const active = await call("get_pipeline", {}, pipeline);
+    assert.deepEqual(active.applications.find((job) => job.id === asked.id), { id: asked.id, ...budget, ...ask });
+    assert.deepEqual(active.applications.find((job) => job.id === unasked.id), { id: unasked.id, ...budget, ...unknown });
+    assert.deepEqual(v.parse(projection, (await call("get_job", { job_id: asked.id }, v.object({ job: row }))).job), ask);
+    const listed = await call("list_jobs", { query: "Salary ask employer" }, v.object({ jobs: v.array(row) }));
+    assert.deepEqual(v.parse(projection, listed.jobs[0]), ask);
+    for (const invalid of [
+      { salary_ask_amount: -1 }, { salary_ask_amount: null }, { salary_ask_currency: null },
+      { salary_ask_currency: "eur" }, { salary_ask_period: null }, { salary_ask_period: "never" }, { salary_ask_basis: "unknown" },
+    ]) await error("update_job", { job_id: asked.id, ...invalid }, /salary_ask|Salary ask|Invalid/u);
+    assert.deepEqual(v.parse(projection, (await call("get_job", { job_id: asked.id }, v.object({ job: row }))).job), ask);
+    const changed = await call("update_job", { job_id: asked.id, salary_ask_amount: 70_000,
+      salary_ask_currency: "USD", salary_ask_period: "year", salary_ask_basis: "net" }, row);
+    assert.deepEqual(v.parse(projection, changed), { salary_ask_amount: 70_000, salary_ask_currency: "USD", salary_ask_period: "year", salary_ask_basis: "net" });
+    assert.equal(changed.score, asked.score);
+    assert.equal(changed.created_at, asked.created_at);
+    assert.equal(changed.salary_min, budget.salary_min);
+    const unspecifiedBasis = await call("update_job", { job_id: asked.id, salary_ask_basis: null }, row);
+    assert.equal(unspecifiedBasis.salary_ask_basis, null);
+    await call("update_job", { job_id: asked.id, ...unknown }, row);
+    assert.deepEqual(v.parse(projection, (await call("get_pipeline", {}, pipeline)).applications.find((job) => job.id === asked.id)), unknown);
+    await error("add_jobs", { jobs: [{ company: "Salary ask atomic rollback" },
+      { company: "Salary ask invalid", salary_ask_amount: 5_500 }] }, /Salary ask/u);
+    assert.deepEqual((await call("list_jobs", { query: "Salary ask atomic rollback" }, jobsSchema)).jobs, []);
+  });
+
   test("employer leads store salaries and reject opening details until applying, including atomic batches and returns to leads", async () => {
     const detailSchema = v.object({ job: v.object({ ...jobSchema.entries, phase: v.string(), description: v.nullable(v.string()), location: v.nullable(v.string()) }) });
     const lead = await call("add_job", { company: "Employer only", company_url: "https://employer.example/careers",
