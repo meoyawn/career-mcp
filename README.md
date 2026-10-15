@@ -82,7 +82,7 @@ The server's MCP instructions tell the agent to choose context by task. `get_lea
 | `set_application_context` | Save or replace applicant background and application-writing preferences; `text: null` clears it. |
 | `set_cv` | Store or replace one CV URL by language; `url: null` removes that language. |
 | `add_job` | Save one employer lead, or an application with explicit phase; record its UTC import time. |
-| `add_jobs` | Save 1–25 leads atomically without pre-filtering explicit imports. |
+| `add_jobs` | Save 1–100 employers or applications atomically without pre-filtering explicit imports. Split larger imports into batches of up to 100. |
 | `list_jobs` | Search company, application title, or nickname; filter by phase/status and rank by score. |
 | `get_job` | Load employer or application details, salary, stages, calendar details, and feedback. |
 | `update_job` | Edit employer/contact details, salary, phase, status, stage, score, or application opening details. |
@@ -109,6 +109,8 @@ Opening storage is enforced in both the tools and D1: lead records must have nul
 Salary ranges are stored in D1 on both employers and applications as `salary_min`, `salary_max`, `salary_currency`, and `salary_period`. For example, `{"company":"Example Co","salary_min":120000,"salary_max":160000,"salary_currency":"USD","salary_period":"year"}` creates an employer lead with known annual compensation. Either bound can be omitted for a one-sided range. Amounts may include fractions and must be nonnegative, with minimum no greater than maximum. A salary requires at least one bound, a three-letter uppercase currency code, and a period of `hour`, `day`, `week`, `month`, or `year`; currency and period are never inferred. Updates merge with existing values; clear all four fields with null to remove a salary. Salary data stays intact when moving between lead and application phases.
 
 Both lead-import tools automatically record the time added in `created_at` as a UTC timestamp ending in `Z`. Updates preserve this original timestamp and change `updated_at`.
+
+`add_jobs` accepts 1–100 records per call. Split larger imports into batches of up to 100 and account for every supplied employer. The storage layer also enforces this limit before accessing D1. Each batch is atomic: a validation error or duplicate saves none of that batch. Opening and salary validation errors identify the failing record number and confirm that zero records were saved. Correct the error and retry the full failed batch. After a timeout or uncertain result, use `list_jobs` to check what was saved before retrying.
 
 For cover letters and application forms, save the user's factual background and writing preferences with `set_application_context`. This document is independent of `set_criteria`: changing either preserves the other, the CV URLs, and existing jobs. Missing applicant facts must be requested from the user, never inferred from selection criteria or invented.
 

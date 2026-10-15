@@ -10,6 +10,7 @@ import { setTimeout } from "node:timers/promises";
 import { promisify, stripVTControlCharacters } from "node:util";
 import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
 import * as v from "valibot";
+import { addJobs } from "../src/store.ts";
 import { assertion, authorize, browserFor, enroll, exchange } from "./passkey-client.ts";
 
 const execute = promisify(execFile);
@@ -581,6 +582,58 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal((await scoped(bob, "get_lead_context", {}, v.object({ criteria: v.object({ text: v.string() }) }))).criteria.text, "Bob onsite roles");
     } finally {
       await Promise.all([alice.close(), bob.close()]);
+    }
+  });
+
+  test("invalid batch sizes are rejected before accessing D1", async () => {
+    const scope = {
+      userId: crypto.randomUUID(),
+      get db(): never { throw new Error("Invalid batch must not access D1."); },
+    };
+    for (const size of [0, 101]) {
+      await assert.rejects(addJobs(scope, { jobs: Array.from({ length: size }, (_, index) => ({
+        company: `Invalid batch employer ${index}`, phase: "lead",
+      })) }), /1[–-]100/u);
+    }
+  });
+
+  test("bulk imports save 44 and 100 employers atomically and reject oversized batches without writes", async () => {
+    for (const size of [44, 100]) {
+      const jobs = Array.from({ length: size }, (_, index) => ({
+        company: `Bulk ${size} employer ${index}`, nickname: `bulk-${size}-${index}`,
+      }));
+      const imported = await call("add_jobs", { jobs }, jobsSchema);
+      assert.deepEqual(imported.jobs.map((job) => job.company).sort(), jobs.map((job) => job.company).sort());
+      assert.equal(new Set(imported.jobs.map((job) => job.id)).size, size);
+      const saved = await call("list_jobs", { query: `Bulk ${size} employer`, limit: 100 }, jobsSchema);
+      assert.deepEqual(saved.jobs.map((job) => job.id).sort(), imported.jobs.map((job) => job.id).sort());
+      assert.equal(saved.next_offset, null);
+      const conflicting = Array.from({ length: size }, (_, index) => ({
+        company: `Bulk rollback ${size} employer ${index}`,
+        nickname: index === size - 1 ? `BULK-${size}-0` : `bulk-rollback-${size}-${index}`,
+      }));
+      await error("add_jobs", { jobs: conflicting }, /already exists/u);
+      assert.deepEqual((await call("list_jobs", { query: `Bulk rollback ${size} employer`, limit: 100 }, jobsSchema)).jobs, []);
+    }
+    await error("add_jobs", { jobs: [] }, /length|items/u);
+    await error("add_jobs", { jobs: Array.from({ length: 101 }, (_, index) => ({ company: `Oversized bulk employer ${index}` })) }, /100/u);
+    assert.deepEqual((await call("list_jobs", { query: "Oversized bulk employer", limit: 100 }, jobsSchema)).jobs, []);
+    for (const mode of ["legacy", { pin: "2026-07-28" }] as const) {
+      const connection = new Client({ name: "bulk-validation-test", version: "1.0.0" }, { versionNegotiation: { mode } });
+      try {
+        await connection.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+        for (const size of [44, 100, 101]) {
+          const result = await connection.callTool({ name: "add_jobs", arguments: {
+            jobs: Array.from({ length: size }, (_, index) => ({ company: `Protocol bulk employer ${index}`, salary_min: 1 })),
+          } });
+          assert.equal(result.isError, true);
+          assert.ok(result.content[0]?.type === "text");
+          assert.match(result.content[0].text, size > 100 ? /100/u : /Salary needs/u);
+          if (size <= 100) assert.match(result.content[0].text, new RegExp(`0 of ${size} records saved\\. Record 1:`, "u"));
+        }
+      } finally {
+        await connection.close();
+      }
     }
   });
 });

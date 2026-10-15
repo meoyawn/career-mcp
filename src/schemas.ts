@@ -46,8 +46,9 @@ export const addJobSchema = v.strictObject({
   score: v.optional(score),
 });
 
+export const maxJobsPerBatch = 100;
 export const addJobsSchema = v.strictObject({
-  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(25)),
+  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(maxJobsPerBatch, `Save at most ${maxJobsPerBatch} employers or applications per call. Split larger imports into batches of up to ${maxJobsPerBatch}; keep every employer.`)),
 });
 
 export const listJobsSchema = v.strictObject({

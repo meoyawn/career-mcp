@@ -1,4 +1,4 @@
-import type { AddFeedback, AddJobs, AddStage, CalendarEvent, ListFeedback, ListJobs, Upcoming, UpdateFeedback, UpdateJob, UpdateStage } from "./schemas.ts";
+import { maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type ListFeedback, type ListJobs, type Upcoming, type UpdateFeedback, type UpdateJob, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -137,11 +137,21 @@ function validateSalary(input: Pick<UpdateJob, "salary_min" | "salary_max" | "sa
 }
 
 export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
+  if (jobs.length < 1 || jobs.length > maxJobsPerBatch) {
+    fail(`Received ${jobs.length} records. Save 1–${maxJobsPerBatch} employers or applications per call; split larger imports into batches. No records were saved.`);
+  }
   const { db, userId } = scope;
   const now = new Date().toISOString();
-  for (const job of jobs) {
-    validateOpening(job.phase, job);
-    validateSalary(job);
+  for (const [index, job] of jobs.entries()) {
+    try {
+      validateOpening(job.phase, job);
+      validateSalary(job);
+    } catch (error) {
+      if (error instanceof Error && error.cause === "user") {
+        fail(`Batch rejected: 0 of ${jobs.length} records saved. Record ${index + 1}: ${error.message}`);
+      }
+      throw error;
+    }
   }
   const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
     (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
