@@ -4,6 +4,74 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("reapplication migration preserves rejected histories without inventing cooldowns and constrains eligibility deadlines", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      for (const migration of ["0001_initial", "0002_single_criteria", "0003_qualified_leads", "0004_application_context_cvs", "0005_employer_leads", "0006_outreach"]) {
+        db.exec(await readFile(`migrations/${migration}.sql`, "utf8"));
+      }
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, status, current_stage, created_at, updated_at)
+          VALUES ('alice', 'attempt', 'Example employer', 'application', 'rejected', 'System design', 'created', 'updated');
+        INSERT INTO stages (user_id, id, job_id, name, status, created_at, updated_at)
+          VALUES ('alice', 'round', 'attempt', 'System design', 'failed', 'created', 'updated');
+        INSERT INTO feedback (user_id, id, stage_id, text, source, created_at, updated_at)
+          VALUES ('alice', 'feedback', 'round', 'Try again later', 'recruiter', 'created', 'updated');`);
+      const job = db.prepare("SELECT * FROM jobs").get();
+      const stages = db.prepare("SELECT * FROM stages").all();
+      const feedback = db.prepare("SELECT * FROM feedback").all();
+      db.exec(await readFile("migrations/0007_reapplication.sql", "utf8"));
+      assert.deepEqual({ ...db.prepare("SELECT * FROM jobs").get() }, { ...job, reapply_policy: null, reapply_after: null });
+      assert.deepEqual(db.prepare("SELECT * FROM stages").all(), stages);
+      assert.deepEqual(db.prepare("SELECT * FROM feedback").all(), feedback);
+      for (const invalid of ["reapply_policy = 'maybe'", "reapply_after = '2026-08-30T00:00:00.000Z'", "reapply_policy = 'allowed', reapply_after = 'bad-date'"]) {
+        assert.throws(() => db.exec(`UPDATE jobs SET ${invalid}`), /CHECK/u);
+      }
+      db.exec("UPDATE jobs SET reapply_policy = 'allowed', reapply_after = '2026-08-30T00:00:00.000Z'");
+      assert.throws(() => db.exec("UPDATE jobs SET reapply_policy = 'not_allowed'"), /CHECK/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("outreach migration preserves histories and enforces contact, job, timestamp and user boundaries in D1", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      for (const migration of ["0001_initial", "0002_single_criteria", "0003_qualified_leads", "0004_application_context_cvs", "0005_employer_leads"]) {
+        db.exec(await readFile(`migrations/${migration}.sql`, "utf8"));
+      }
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'now'), ('bob', 'now');
+        INSERT INTO jobs (user_id, id, company, created_at, updated_at)
+          VALUES ('alice', 'a', 'Employer A', 'now', 'now'), ('alice', 'b', 'Employer B', 'now', 'now'), ('bob', 'c', 'Employer C', 'now', 'now');
+        INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'stage-a', 'a', 'attempt_referral', 'now', 'now'), ('alice', 'stage-b', 'b', 'Screening', 'now', 'now');`);
+      const stages = db.prepare("SELECT * FROM stages ORDER BY id").all();
+      db.exec(await readFile("migrations/0006_outreach.sql", "utf8"));
+      assert.deepEqual(db.prepare("SELECT * FROM stages ORDER BY id").all(), stages);
+      assert.deepEqual(db.prepare("SELECT * FROM outreach").all(), []);
+      db.exec(`INSERT INTO contacts (user_id, id, job_id, name, relationship, created_at, updated_at)
+        VALUES ('alice', 'friend', 'a', 'Example friend', 'friend', 'now', 'now'), ('bob', 'bob-contact', 'c', 'Bob friend', 'friend', 'now', 'now');`);
+      const insert = db.prepare(`INSERT INTO outreach (user_id, id, job_id, contact_id, stage_id, direction, occurred_at, time_basis, follow_up_status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'outbound', ?, 'reported', 'pending', 'now', 'now')`);
+      insert.run('alice', 'sent', 'a', 'friend', 'stage-a', '2026-09-01T09:00:00.000Z');
+      for (const [user, job, contact, stage] of [
+        ['bob', 'a', 'friend', 'stage-a'], ['alice', 'b', 'friend', 'stage-b'], ['alice', 'a', 'friend', 'stage-b'], ['alice', 'a', 'bob-contact', null],
+      ] as const) assert.throws(() => insert.run(user, crypto.randomUUID(), job, contact, stage, '2026-09-01T09:00:00.000Z'), /FOREIGN KEY/u);
+      assert.throws(() => insert.run('alice', 'invalid', 'a', 'friend', null, 'not-a-timestamp'), /CHECK/u);
+      assert.throws(() => db.exec("UPDATE outreach SET follow_up_at = '2026-08-01T09:00:00.000Z' WHERE id IS 'sent'"), /CHECK/u);
+      assert.throws(() => db.exec("UPDATE outreach SET follow_up_status = NULL WHERE id IS 'sent'"), /CHECK/u);
+      db.exec("UPDATE jobs SET current_stage = 'Screening' WHERE id IS 'a'");
+      assert.equal(db.prepare("SELECT last_outreach_at FROM contact_activity WHERE id IS 'friend'").get()?.last_outreach_at, '2026-09-01T09:00:00.000Z');
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      db.exec("DELETE FROM jobs WHERE id IS 'a'");
+      assert.deepEqual(db.prepare("SELECT * FROM outreach").all(), []);
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM contacts").get()?.n, 1);
+    } finally {
+      db.close();
+    }
+  });
+
   test("employer migration removes lead openings, preserves application histories, and enforces opening and salary storage boundaries", async () => {
     const db = new DatabaseSync(":memory:");
     try {

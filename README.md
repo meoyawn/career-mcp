@@ -70,7 +70,7 @@ WebAuthn requires discoverable credentials and user verification. Challenges are
 
 ## Workflow and tools
 
-The server's MCP instructions tell the agent to choose context by task. `get_lead_context` loads selection criteria and a page of active leads for discovery, sorting, and ranking. Criteria also appear in `list_jobs`, the `careers://criteria` resource, and the `rank_jobs` prompt. These responses exclude applicant context and CV URLs.
+The server's MCP instructions tell the agent to choose context by task. `get_lead_context` loads selection criteria and a page of available opportunities for discovery, sorting, and ranking: active records plus rejected applications now eligible to reapply. Criteria also appear in `list_jobs`, the `careers://criteria` resource, and the `rank_jobs` prompt. These responses exclude applicant context and CV URLs.
 
 `get_application_context` loads a separate natural-language document with the applicant's background, factual answers, and cover-letter or form-filling preferences, plus CV URLs keyed by language. Optional `job_id` adds that employer or application's details, stages, and feedback. It excludes selection criteria and unrelated leads. `get_job` returns the employer or application and its history. The `careers://application-context` resource exposes the same applicant document and CV URLs. Clients need to call a tool or read a resource to put saved data into the model's context. `get_lead_context` replaces the former `get_context` tool.
 
@@ -88,6 +88,10 @@ The server's MCP instructions tell the agent to choose context by task. `get_lea
 | `update_job` | Edit employer/contact details, salary, phase, status, stage, score, or application opening details. |
 | `add_stage` | Add any named stage and optionally its schedule. |
 | `update_stage` | Record an outcome, reschedule, or link a calendar event. |
+| `save_contact` | Save or edit a friend, referrer, recruiter, interviewer, or other employer contact, including profile/Telegram URL. |
+| `record_outreach` | Log an actual outbound reach-out/follow-up or inbound reply, with event time and optional stage and follow-up date. |
+| `update_outreach` | Correct communication details or schedule, resolve, or cancel its follow-up. |
+| `get_follow_ups` | Retrieve waiting contacts directly, prioritizing pre-recruiter outreach, with last contact time, elapsed seconds, and due dates. |
 | `add_feedback` | Append a transcript or feedback text to a stage. |
 | `update_feedback` | Correct a feedback entry. |
 | `list_feedback` | Review feedback across jobs and stage names to improve. |
@@ -120,7 +124,33 @@ Stage names are free text. `add_stage.make_current` defaults to true; `update_st
 
 There is no qualification column, pending review queue, or `qualify_jobs` tool. A stored lead records an opportunity rather than proving eligibility. The Worker validates input and persists imports; criteria are an agent workflow for discovery and ranking, not an intake gate.
 
-`list_jobs`, `list_feedback`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. Read all pages before saving rankings: changing scores reorders results.
+`list_jobs`, `list_feedback`, `get_follow_ups`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. Read all pages before saving rankings: changing scores reorders results.
+
+## Rejection cooldowns and reapplication
+
+A rejection closes one application attempt while future attempts can remain available. `update_job` accepts `reapply_policy: "allowed"` or `"not_allowed"`; null means unknown. Optional `reapply_after` is an absolute timestamp with `Z` or a UTC offset, normalized to UTC, and requires policy `allowed`. Clear both fields together to remove a dated policy. There is no default rejection TTL and existing rejections are never automatically assumed eligible.
+
+For rejected applications, reads derive `reapply_status`: `unknown` without a policy, `not_allowed` for an explicit prohibition, `cooldown` before an allowed deadline, or `eligible` at or after it. Allowed without a deadline means eligibility is already confirmed, including when the user says a cooldown has expired but the exact expiry date is unknown. Other application statuses return `not_applicable`. Expiration is evaluated at read time without a scheduled job, and it never rewrites the rejected outcome, failed interview stages, or feedback.
+
+`get_lead_context` and `rank_jobs` include active records and eligible reapplications. Use `list_jobs` with `available_only: true` to paginate the same opportunities, or filter `reapply_status` directly. A `status: "active"` filter still means exactly active; rejected history remains accessible with `status: "rejected"`. Optional `list_jobs.as_of` previews cooldown eligibility at an explicit timestamp; it does not reconstruct historical application state. Eligibility and priority are separate: keep a user's decision to apply later in notes. When a fresh attempt actually starts, create its own application record and clear the previous attempt's policy and deadline together to consume that next-attempt eligibility and avoid listing both attempts as opportunities. Preserve the older stages and feedback.
+
+Migration `0007_reapplication.sql` adds the policy and deadline without changing existing outcomes or inferring private interview dates. These facts belong in D1 or Git-ignored private exports, not source fixtures.
+
+## Outreach and follow-ups
+
+Communication is stored separately from stage scheduling and audit timestamps. `save_contact` saves a person against an employer/application with a free-text `relationship`, name, optional URL/email, and notes. A friend helping with a referral is a `friend/referrer`, independently of any later recruiter. Supply `contact_id` to edit a contact; duplicate URLs/emails for the same employer are rejected. `get_job` returns contacts and their IDs.
+
+Use `record_outreach` for each actual first reach-out, later follow-up, or received reply. `direction` is `outbound` or `inbound`. An optional `stage_id` ties the communication to a stage of the same job, such as `attempt_referral`. Contacts and outreach remain accessible after the current stage changes. Preparing a message or moving stages does not record a communication.
+
+`occurred_at` is the communication timestamp, normalized from a timestamp with `Z` or a UTC offset. Explicit timestamps default to `time_basis: "reported"`. If the actual time is unknown, omit it: the server records now with `time_basis: "recorded"`, clearly identifying a logging-time fallback. When transferring an older attempt into the outreach log, use its original recorded timestamp with `time_basis: "recorded"`. The separate, immutable `created_at` records when the log entry was inserted; editing notes, contacts, follow-up dates, or stages never resets the outreach clock. Future communication times and impossible dates are rejected.
+
+An outbound record starts a pending wait for that contact. Optional `follow_up_at` schedules a due date; there is no assumed interval. `update_outreach` can set/clear this date, correct the event timestamp, or set `follow_up_status` to `pending`, `done`, or `cancelled`. A newer communication supersedes the older wait: an inbound reply normally ends it, while a new outbound message starts a fresh wait without inheriting an old deadline. For an acknowledgement that needs checking later, explicitly set a date or pending status on the inbound record, such as a friend promising an introduction. This keeps a follow-up without fabricating an outbound message. `awaiting_reply` distinguishes unanswered outreach from these explicitly pending actions; `needs_follow_up` includes both. Backdated records are ordered by event time rather than insertion time. A reply from one contact never clears another contact's wait.
+
+`get_follow_ups` reads pending waits across active/offer employers and applications without loading selection criteria or CVs. It returns the contact's relationship and URL, first and last outreach, last reply, timestamp basis, elapsed seconds, current stage, explicit due date, and whether it is due. Use `job_id`, `reached_out_before`, pagination, or `due_only` to narrow the response. `due_only` includes only explicit due dates at or before `as_of` (default now); waits with no chosen date remain visible in the default response. `as_of` controls due/age calculations, not historical reconstruction.
+
+Early outreach and referral attempts have priority. When actual recruiter dialogue is evidenced, `update_job.recruiter_engaged_at` records that boundary in UTC; clear it with null to correct a mistake. A friend, an unanswered HR message, or a stage name alone does not establish recruiter engagement. `get_follow_ups` puts pre-recruiter waits first, and `pre_recruiter_only` filters to them. Later recruiter/interview/negotiation waits remain accessible with lower default priority. `list_jobs` includes last outreach/reply and the earliest pending follow-up date. No outreach tool sends a message or creates a reminder.
+
+Migration `0006_outreach.sql` adds the contact and communication tables, indexed activity summaries, and the explicit recruiter-engagement boundary. Existing stage timestamps and notes are preserved; the migration does not infer communications from historical stage creation times. User/job/contact/stage ownership is enforced in both the tools and composite D1 foreign keys. Actual contacts and communication logs belong in D1 or Git-ignored private exports, never tracked fixtures or source.
 
 ## Read-only database queries
 

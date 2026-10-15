@@ -7,6 +7,7 @@ const url = v.pipe(v.string(), v.url(), v.regex(/^https?:\/\/[\s\S]*$/, "Use an 
 const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
 const phase = v.picklist(["lead", "application"]);
+const reapplyStatus = v.picklist(["not_applicable", "unknown", "not_allowed", "cooldown", "eligible"]);
 const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
 const source = v.picklist(["self", "recruiter", "interviewer"]);
@@ -55,6 +56,9 @@ export const listJobsSchema = v.strictObject({
   query: v.optional(text(300)),
   status: v.optional(jobStatus),
   phase: v.optional(phase),
+  available_only: v.optional(v.boolean(), false),
+  reapply_status: v.optional(reapplyStatus),
+  as_of: v.optional(timestamp),
   include_descriptions: v.optional(v.boolean(), false),
   limit,
   offset,
@@ -76,6 +80,9 @@ export const updateJobSchema = v.strictObject({
   notes: v.optional(v.nullable(text(20_000))),
   status: v.optional(jobStatus),
   current_stage: v.optional(text(200)),
+  recruiter_engaged_at: v.optional(v.nullable(timestamp)),
+  reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),
+  reapply_after: v.optional(v.nullable(timestamp)),
   score: v.optional(v.nullable(score)),
 });
 
@@ -111,6 +118,47 @@ export const updateStageSchema = v.strictObject({
   stage_id: id,
   ...v.partial(v.strictObject(stageFields)).entries,
   make_current: v.optional(v.boolean(), false),
+});
+
+export const saveContactSchema = v.strictObject({
+  job_id: id,
+  contact_id: v.optional(id),
+  name: text(200),
+  relationship: v.optional(text(200)),
+  url: v.optional(v.nullable(url)),
+  email: v.optional(v.nullable(email)),
+  notes: v.optional(v.nullable(text(20_000))),
+});
+
+const outreachFields = {
+  occurred_at: timestamp,
+  time_basis: v.picklist(["reported", "recorded"]),
+  channel: v.nullable(text(100)),
+  notes: v.nullable(text(20_000)),
+  follow_up_at: v.nullable(timestamp),
+  follow_up_status: v.picklist(["pending", "done", "cancelled"]),
+};
+
+export const recordOutreachSchema = v.strictObject({
+  contact_id: id,
+  stage_id: v.optional(id),
+  direction: v.picklist(["outbound", "inbound"]),
+  ...v.partial(v.strictObject(outreachFields)).entries,
+});
+
+export const updateOutreachSchema = v.strictObject({
+  outreach_id: id,
+  ...v.partial(v.strictObject(outreachFields)).entries,
+});
+
+export const followUpsSchema = v.strictObject({
+  job_id: v.optional(id),
+  as_of: v.optional(timestamp),
+  due_only: v.optional(v.boolean(), false),
+  pre_recruiter_only: v.optional(v.boolean(), false),
+  reached_out_before: v.optional(timestamp),
+  limit,
+  offset,
 });
 
 export const feedbackSchema = v.strictObject({
@@ -156,6 +204,10 @@ export type ListJobs = v.InferOutput<typeof listJobsSchema>;
 export type UpdateJob = v.InferOutput<typeof updateJobSchema>;
 export type AddStage = v.InferOutput<typeof addStageSchema>;
 export type UpdateStage = v.InferOutput<typeof updateStageSchema>;
+export type SaveContact = v.InferOutput<typeof saveContactSchema>;
+export type RecordOutreach = v.InferOutput<typeof recordOutreachSchema>;
+export type UpdateOutreach = v.InferOutput<typeof updateOutreachSchema>;
+export type FollowUps = v.InferOutput<typeof followUpsSchema>;
 export type AddFeedback = v.InferOutput<typeof feedbackSchema>;
 export type UpdateFeedback = v.InferOutput<typeof updateFeedbackSchema>;
 export type ListFeedback = v.InferOutput<typeof listFeedbackSchema>;
