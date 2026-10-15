@@ -1,5 +1,5 @@
 import * as v from "valibot";
-import { eligibleOpeningSchema, maxJobsPerBatch, pipelineStageSchema, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
+import { eligibleOpeningSchema, maxJobsPerBatch, pipelineStageSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -61,6 +61,23 @@ interface Job {
   salary_ask_currency: string | null;
   salary_ask_period: "hour" | "day" | "week" | "month" | "year" | null;
   salary_ask_basis: "gross" | "net" | null;
+  salary_declared_amount: number | null;
+  salary_declared_currency: string | null;
+  salary_declared_period: "hour" | "day" | "week" | "month" | "year" | null;
+  salary_declared_basis: "gross" | "net" | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface PrepNote {
+  id: string;
+  job_id: string;
+  kind: "question" | "reminder" | "correction" | "context";
+  text: string;
+  stage_name: string | null;
+  status: "pending" | "resolved" | "cancelled";
+  resolution: string | null;
+  closed_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -144,7 +161,7 @@ interface PipelineSummary {
   scheduled_stages: number;
 }
 
-interface PipelineJob extends Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at" | "salary_min" | "salary_max" | "salary_currency" | "salary_period" | "salary_ask_amount" | "salary_ask_currency" | "salary_ask_period" | "salary_ask_basis"> {
+interface PipelineJob extends Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at" | "salary_min" | "salary_max" | "salary_currency" | "salary_period" | "salary_ask_amount" | "salary_ask_currency" | "salary_ask_period" | "salary_ask_basis" | "salary_declared_amount" | "salary_declared_currency" | "salary_declared_period" | "salary_declared_basis"> {
   current_stage_status: string | null;
   last_outreach_at: string | null;
   last_response_at: string | null;
@@ -265,6 +282,14 @@ function validateSalaryAsk(input: Pick<UpdateJob, "salary_ask_amount" | "salary_
   }
 }
 
+function validateDeclaredSalary(input: Pick<UpdateJob, "salary_declared_amount" | "salary_declared_currency" | "salary_declared_period" | "salary_declared_basis">) {
+  const { salary_declared_amount: amount, salary_declared_currency: currency, salary_declared_period: period, salary_declared_basis: basis } = input;
+  if ([amount, currency, period, basis].every((value) => value == null)) return;
+  if (amount == null || currency == null || period == null) {
+    fail("Declared salary needs salary_declared_amount, salary_declared_currency, and salary_declared_period. Clear all four salary_declared fields to remove it; leave salary_declared_basis null when gross/net is unknown.");
+  }
+}
+
 export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   if (jobs.length < 1 || jobs.length > maxJobsPerBatch) {
     fail(`Received ${jobs.length} records. Save 1–${maxJobsPerBatch} employers or applications per call; split larger imports into batches. No records were saved.`);
@@ -277,6 +302,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
       validateOpening(job.phase, job);
       validateSalary(job);
       validateSalaryAsk(job);
+      validateDeclaredSalary(job);
       job.eligible_opening = validateEligibleOpening(job.eligible_opening, criteria);
     } catch (error) {
       if (error instanceof Error && error.cause === "user") {
@@ -287,13 +313,15 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   }
   const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
     (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
-      salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis, created_at, updated_at, eligible_opening)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
+      salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
+      salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis, created_at, updated_at, eligible_opening)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
     userId, crypto.randomUUID(), job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "applied",
     job.title ?? null, job.nickname ?? null, job.description ?? null, job.source_url ?? null,
     job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null,
     job.salary_min ?? null, job.salary_max ?? null, job.salary_currency ?? null, job.salary_period ?? null,
-    job.salary_ask_amount ?? null, job.salary_ask_currency ?? null, job.salary_ask_period ?? null, job.salary_ask_basis ?? null, now, now,
+    job.salary_ask_amount ?? null, job.salary_ask_currency ?? null, job.salary_ask_period ?? null, job.salary_ask_basis ?? null,
+    job.salary_declared_amount ?? null, job.salary_declared_currency ?? null, job.salary_declared_period ?? null, job.salary_declared_basis ?? null, now, now,
     job.eligible_opening ? JSON.stringify(job.eligible_opening) : null,
   ));
   try {
@@ -327,7 +355,7 @@ async function requireStage({ db, userId }: UserStore, id: string) {
 export async function getJob(scope: UserStore, id: string) {
   const { db, userId } = scope;
   const job = await requireJob(scope, id);
-  const [stages, feedback, contacts, outreach] = await Promise.all([
+  const [stages, feedback, contacts, outreach, prepNotes] = await Promise.all([
     db.prepare("SELECT * FROM stages WHERE user_id IS ? AND job_id IS ? ORDER BY created_at, rowid").bind(userId, id).all<Stage>(),
     db.prepare(`SELECT f.*, s.name AS stage_name FROM feedback f JOIN stages s ON s.id IS f.stage_id AND s.user_id IS f.user_id
       WHERE f.user_id IS ? AND s.job_id IS ? ORDER BY f.created_at, f.rowid`).bind(userId, id).all<Feedback & { stage_name: string }>(),
@@ -335,12 +363,68 @@ export async function getJob(scope: UserStore, id: string) {
       .bind(userId, id).all<ContactActivity>(),
     db.prepare("SELECT * FROM outreach WHERE user_id IS ? AND job_id IS ? ORDER BY occurred_at, created_at, rowid")
       .bind(userId, id).all<Outreach>(),
+    db.prepare("SELECT id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at FROM prep_notes WHERE user_id IS ? AND job_id IS ? ORDER BY created_at, rowid")
+      .bind(userId, id).all<PrepNote>(),
   ]);
   return {
     job: withEligibleOpening(job), stages: stages.results, feedback: feedback.results, contacts: contacts.results, outreach: outreach.results,
+    prep_notes: prepNotes.results,
     last_outreach_at: outreach.results.filter((entry) => entry.direction === "outbound").at(-1)?.occurred_at ?? null,
     last_response_at: outreach.results.filter((entry) => entry.direction === "inbound").at(-1)?.occurred_at ?? null,
   };
+}
+
+export async function getInterviewPrep(scope: UserStore, input: InterviewPrep) {
+  const { db, userId } = scope;
+  const asOf = new Date().toISOString();
+  let stage: Stage | null;
+  if (input.stage_id) {
+    stage = await requireStage(scope, input.stage_id);
+    if (input.job_id && stage.job_id !== input.job_id) fail("Stage does not belong to this job.");
+    if (input.stage_name && stage.name !== input.stage_name) fail("Stage does not match stage_name.");
+  } else {
+    stage = await db.prepare(`SELECT s.* FROM stages s JOIN jobs j ON j.user_id IS s.user_id AND j.id IS s.job_id
+      WHERE s.user_id IS ? AND j.phase IS 'application' AND j.status IN ('active', 'offer')
+        AND (? IS NULL OR s.job_id IS ?) AND (? IS NULL OR s.name IS ?)
+        AND s.status IN ('planned', 'in_progress') AND s.starts_at IS NOT NULL
+        AND (s.starts_at >= ? OR s.ends_at > ? OR (s.status IS 'in_progress' AND s.ends_at IS NULL))
+      ORDER BY s.starts_at, s.id LIMIT 1`)
+      .bind(userId, input.job_id ?? null, input.job_id ?? null, input.stage_name ?? null, input.stage_name ?? null, asOf, asOf).first<Stage>();
+  }
+  const jobId = input.job_id ?? stage?.job_id;
+  if (!jobId) fail("No upcoming interview found. Supply job_id and optionally stage_name to prepare for an unscheduled call.");
+  const { job, stages, feedback, contacts, prep_notes } = await getJob(scope, jobId);
+  const stageName = input.stage_name ?? stage?.name ?? null;
+  return {
+    as_of: asOf, job, stage, stage_name: stageName,
+    pending_prep_notes: prep_notes.filter((note) => note.status === "pending" && (note.stage_name === null || stageName === null || note.stage_name === stageName)),
+    stages, feedback, contacts,
+  };
+}
+
+export async function addPrepNote(scope: UserStore, input: AddPrepNote) {
+  const { db, userId } = scope;
+  await requireJob(scope, input.job_id);
+  const now = new Date().toISOString();
+  return db.prepare(`INSERT INTO prep_notes (user_id, id, job_id, kind, text, stage_name, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at`)
+    .bind(userId, crypto.randomUUID(), input.job_id, input.kind, input.text, input.stage_name ?? null, now, now).first<PrepNote>();
+}
+
+export async function updatePrepNote({ db, userId }: UserStore, input: UpdatePrepNote) {
+  const note = await db.prepare("SELECT * FROM prep_notes WHERE user_id IS ? AND id IS ?")
+    .bind(userId, input.prep_note_id).first<PrepNote>();
+  if (!note) fail("Prep note not found. Use get_job to load prep_note_id values.");
+  if (input.kind === undefined && input.text === undefined && input.stage_name === undefined && input.status === undefined && input.resolution === undefined) fail("Provide at least one field to update.");
+  const status = input.status ?? note.status;
+  if (status === "pending" && input.resolution != null) fail("A resolution requires resolved or cancelled status. Reopening clears the previous resolution.");
+  const now = new Date().toISOString();
+  const resolution = status === "pending" ? null : input.resolution === undefined ? note.resolution : input.resolution;
+  const closedAt = status === "pending" ? null : status === note.status ? note.closed_at : now;
+  return db.prepare(`UPDATE prep_notes SET kind = ?, text = ?, stage_name = ?, status = ?, resolution = ?, closed_at = ?, updated_at = ?
+    WHERE user_id IS ? AND id IS ? RETURNING id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at`)
+    .bind(input.kind ?? note.kind, input.text ?? note.text, input.stage_name === undefined ? note.stage_name : input.stage_name,
+      status, resolution, closedAt, now, userId, input.prep_note_id).first<PrepNote>();
 }
 
 const searchPattern = (query: string) => `%${query.replace(/[\\%_]/gu, "\\$&")}%`;
@@ -351,7 +435,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
   const page = `${scope} ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`;
   const scheduled = `s.status IN ('planned', 'in_progress') AND s.starts_at IS NOT NULL
     AND (s.starts_at >= ? OR s.ends_at > ? OR (s.status IS 'in_progress' AND s.ends_at IS NULL))`;
-  const [summary, jobs, contacts, stages] = await db.batch([
+  const [summary, jobs, contacts, stages, prepNotes] = await db.batch([
     db.prepare(`WITH pipeline AS (${scope}) SELECT COUNT(*) AS applications,
       COUNT(CASE WHEN j.status IS 'active' THEN 1 END) AS active,
       COUNT(CASE WHEN j.status IS 'offer' THEN 1 END) AS offers,
@@ -366,6 +450,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
       j.current_stage, current.status AS current_stage_status, j.recruiter_engaged_at,
       j.salary_min, j.salary_max, j.salary_currency, j.salary_period,
       j.salary_ask_amount, j.salary_ask_currency, j.salary_ask_period, j.salary_ask_basis,
+      j.salary_declared_amount, j.salary_declared_currency, j.salary_declared_period, j.salary_declared_basis,
       (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'outbound') AS last_outreach_at,
       (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'inbound') AS last_response_at
       FROM pipeline j LEFT JOIN stages current ON current.user_id IS j.user_id AND current.id IS (
@@ -385,12 +470,16 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
       FROM stages s JOIN pipeline j ON j.user_id IS s.user_id AND j.id IS s.job_id WHERE ${scheduled})
       SELECT id, job_id, name, status, starts_at, ends_at, timezone FROM scheduled WHERE position IS 1`)
       .bind(userId, input.limit, input.offset, asOf, asOf),
-  ]) as [D1Result<PipelineSummary>, D1Result<PipelineJob>, D1Result<PipelineContact>, D1Result<PipelineStage>];
+    db.prepare(`WITH pipeline AS (${page}) SELECT t.id, t.job_id, t.kind, t.text, t.stage_name
+      FROM prep_notes t JOIN pipeline j ON j.user_id IS t.user_id AND j.id IS t.job_id
+      WHERE t.status IS 'pending' ORDER BY t.created_at, t.rowid`).bind(userId, input.limit, input.offset),
+  ]) as [D1Result<PipelineSummary>, D1Result<PipelineJob>, D1Result<PipelineContact>, D1Result<PipelineStage>, D1Result<Pick<PrepNote, "id" | "job_id" | "kind" | "text" | "stage_name">>];
   return {
     as_of: asOf,
     summary: summary.results[0],
     applications: jobs.results.slice(0, input.limit).map((job) => ({
       ...job,
+      pending_prep_notes: prepNotes.results.filter((note) => note.job_id === job.id).map(({ id, kind, text, stage_name }) => ({ id, kind, text, stage_name })),
       pending_contacts: contacts.results.filter((contact) => contact.job_id === job.id).map(({ job_id: _jobId, ...contact }) => ({
         ...contact,
         awaiting_reply: contact.awaiting_reply === 1,
@@ -418,6 +507,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     recruiter_name, recruiter_email, notes, status, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
     score, salary_min, salary_max, salary_currency, salary_period,
     salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
+    salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis,
     created_at, updated_at`;
   const results = await db.prepare(`WITH opportunities AS (
     SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ?
@@ -460,6 +550,7 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   validateOpening(input.phase ?? job.phase, input);
   validateSalary({ ...job, ...patch });
   validateSalaryAsk({ ...job, ...patch });
+  validateDeclaredSalary({ ...job, ...patch });
   if (input.phase === "lead") {
     patch.title = null;
     patch.description = null;

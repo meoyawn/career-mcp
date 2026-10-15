@@ -4,6 +4,56 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("interview prep migration preserves asks and history, leaves declared salary unknown, and enforces note ownership and lifecycle", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      for (const migration of (await readdir("migrations")).filter((name) => name < "0011" && name.endsWith(".sql")).sort()) {
+        db.exec(await readFile(`migrations/${migration}`, "utf8"));
+      }
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, salary_ask_amount, salary_ask_currency, salary_ask_period, notes, created_at, updated_at)
+          VALUES ('alice', 'application', 'Example employer', 'application', 6400, 'EUR', 'month', 'Preserve general notes', 'created', 'updated');
+        INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'round', 'application', 'technical_interview', 'created', 'updated');
+        INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)
+          VALUES ('alice', 'feedback', 'round', 'Preserve interview feedback', 'created', 'updated');`);
+      for (const name of ["0011_eligible_openings", "0012_all_job_openings", "0013_pipeline_milestones"]) {
+        db.exec(await readFile(`migrations/${name}.sql`, "utf8"));
+      }
+      const original = db.prepare("SELECT * FROM jobs").get();
+      const stages = db.prepare("SELECT * FROM stages").all();
+      const feedback = db.prepare("SELECT * FROM feedback").all();
+      db.exec(await readFile("migrations/0014_interview_prep.sql", "utf8"));
+      const unknown = { salary_declared_amount: null, salary_declared_currency: null, salary_declared_period: null, salary_declared_basis: null };
+      assert.deepEqual({ ...db.prepare("SELECT * FROM jobs").get() }, { ...original, ...unknown });
+      assert.deepEqual(db.prepare("SELECT * FROM prep_notes").all(), []);
+      assert.deepEqual(db.prepare("SELECT * FROM stages").all(), stages);
+      assert.deepEqual(db.prepare("SELECT * FROM feedback").all(), feedback);
+      db.exec("UPDATE jobs SET salary_declared_amount = 4200, salary_declared_currency = 'USD', salary_declared_period = 'month'");
+      for (const invalid of [
+        "salary_declared_amount = -1", "salary_declared_amount = 1e100", "salary_declared_amount = 'unknown'", "salary_declared_amount = NULL",
+        "salary_declared_currency = NULL", "salary_declared_currency = 'usd'", "salary_declared_period = NULL", "salary_declared_period = 'unknown'", "salary_declared_basis = 'unknown'",
+      ]) assert.throws(() => db.exec(`UPDATE jobs SET ${invalid}`), /CHECK|cannot store TEXT/u);
+      const insert = db.prepare("INSERT INTO prep_notes (user_id, id, job_id, kind, text, stage_name, created_at, updated_at) VALUES (?, 'note', ?, ?, ?, ?, 'created', 'updated')");
+      assert.throws(() => insert.run("bob", "application", "question", "Ask about the team", null), /FOREIGN KEY/u);
+      assert.throws(() => insert.run("alice", "missing", "question", "Ask about the team", null), /FOREIGN KEY/u);
+      assert.throws(() => insert.run("alice", "application", "unknown", "Ask about the team", null), /CHECK/u);
+      assert.throws(() => insert.run("alice", "application", "question", " ", null), /CHECK/u);
+      assert.throws(() => insert.run("alice", "application", "question", "Ask about the team", "arbitrary"), /CHECK/u);
+      insert.run("alice", "application", "question", "Ask about the team", "hiring_manager");
+      assert.throws(() => db.exec("UPDATE prep_notes SET status = 'resolved'"), /CHECK/u);
+      assert.throws(() => db.exec("UPDATE prep_notes SET resolution = 'Premature resolution'"), /CHECK/u);
+      db.exec("UPDATE prep_notes SET status = 'resolved', resolution = 'Discussed', closed_at = 'closed'");
+      assert.throws(() => db.exec("UPDATE prep_notes SET status = 'pending'"), /CHECK/u);
+      db.exec("UPDATE prep_notes SET status = 'pending', resolution = NULL, closed_at = NULL");
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      db.exec("DELETE FROM jobs");
+      assert.deepEqual(db.prepare("SELECT * FROM prep_notes").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("pipeline milestone guards reject arbitrary database writes without rewriting legacy histories", async () => {
     const db = new DatabaseSync(":memory:");
     try {

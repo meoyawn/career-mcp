@@ -33,6 +33,12 @@ const salaryAskFields = {
   salary_ask_period: v.optional(v.nullable(salaryPeriod)),
   salary_ask_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
 };
+const salaryDeclaredFields = {
+  salary_declared_amount: v.optional(v.nullable(salaryAmount)),
+  salary_declared_currency: v.optional(v.nullable(salaryCurrency)),
+  salary_declared_period: v.optional(v.nullable(salaryPeriod)),
+  salary_declared_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
+};
 
 export const emptySchema = v.strictObject({});
 export const criteriaSchema = v.strictObject({ text: text(20_000) });
@@ -49,6 +55,11 @@ export const cvSchema = v.strictObject({
 });
 export const jobIdSchema = v.strictObject({ job_id: id });
 export const pipelineSchema = v.strictObject({ limit, offset });
+export const interviewPrepSchema = v.strictObject({
+  job_id: v.optional(id),
+  stage_id: v.optional(id),
+  stage_name: v.optional(pipelineStageSchema),
+});
 
 export const eligibleOpeningSchema = v.strictObject({
   title: text(300),
@@ -65,6 +76,7 @@ export const eligibleOpeningSchema = v.strictObject({
 export const addJobSchema = v.strictObject({
   ...salaryFields,
   ...salaryAskFields,
+  ...salaryDeclaredFields,
   company: text(200),
   company_url: v.optional(url),
   phase: v.optional(phase, "lead"),
@@ -100,6 +112,7 @@ export const listJobsSchema = v.strictObject({
 export const updateJobSchema = v.strictObject({
   ...salaryFields,
   ...salaryAskFields,
+  ...salaryDeclaredFields,
   job_id: id,
   company: v.optional(text(200)),
   company_url: v.optional(v.nullable(url)),
@@ -119,6 +132,22 @@ export const updateJobSchema = v.strictObject({
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),
   reapply_after: v.optional(v.nullable(timestamp)),
   score: v.optional(v.nullable(score)),
+});
+
+export const addPrepNoteSchema = v.strictObject({
+  job_id: id,
+  kind: v.picklist(["question", "reminder", "correction", "context"]),
+  text: text(5_000),
+  stage_name: v.optional(v.nullable(pipelineStageSchema)),
+});
+
+export const updatePrepNoteSchema = v.strictObject({
+  prep_note_id: id,
+  kind: v.optional(v.picklist(["question", "reminder", "correction", "context"])),
+  text: v.optional(text(5_000)),
+  stage_name: v.optional(v.nullable(pipelineStageSchema)),
+  status: v.optional(v.picklist(["pending", "resolved", "cancelled"])),
+  resolution: v.optional(v.nullable(text(5_000))),
 });
 
 const stageFields = {
@@ -243,8 +272,11 @@ export type AddJobs = v.InferOutput<typeof addJobsSchema>;
 export type EligibleOpening = v.InferOutput<typeof eligibleOpeningSchema>;
 export type ListJobs = v.InferOutput<typeof listJobsSchema>;
 export type Pipeline = v.InferOutput<typeof pipelineSchema>;
+export type InterviewPrep = v.InferOutput<typeof interviewPrepSchema>;
 export type SetApplicantContact = v.InferOutput<typeof applicantContactSchema>;
 export type UpdateJob = v.InferOutput<typeof updateJobSchema>;
+export type AddPrepNote = v.InferOutput<typeof addPrepNoteSchema>;
+export type UpdatePrepNote = v.InferOutput<typeof updatePrepNoteSchema>;
 export type AddStage = v.InferOutput<typeof addStageSchema>;
 export type UpdateStage = v.InferOutput<typeof updateStageSchema>;
 export type UpdateContact = v.InferOutput<typeof updateContactSchema>;
