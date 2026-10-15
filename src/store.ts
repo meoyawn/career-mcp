@@ -1,4 +1,4 @@
-import { maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type FollowUps, type ListFeedback, type ListJobs, type RecordOutreach, type SaveContact, type Upcoming, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
+import { maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type FollowUps, type ListFeedback, type ListJobs, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -13,6 +13,17 @@ interface Criteria {
 
 interface ApplicationContext {
   text: string;
+  updated_at: string;
+}
+
+interface ApplicantContact {
+  email: string | null;
+  phone: string | null;
+  updated_at: string;
+}
+
+interface ApplicantProfile {
+  gender: string;
   updated_at: string;
 }
 
@@ -131,11 +142,35 @@ export function setCriteria({ db, userId }: UserStore, text: string) {
 }
 
 export async function getApplicationContext({ db, userId }: UserStore) {
-  const [applicationContext, cvs] = await Promise.all([
+  const [applicationContext, applicantContact, applicantProfile, cvs] = await Promise.all([
     db.prepare("SELECT text, updated_at FROM application_context WHERE user_id IS ?").bind(userId).first<ApplicationContext>(),
+    db.prepare("SELECT email, phone, updated_at FROM applicant_contact WHERE user_id IS ?").bind(userId).first<ApplicantContact>(),
+    db.prepare("SELECT gender, updated_at FROM applicant_profile WHERE user_id IS ?").bind(userId).first<ApplicantProfile>(),
     db.prepare("SELECT language, url FROM cvs WHERE user_id IS ? ORDER BY language").bind(userId).all<CV>(),
   ]);
-  return { application_context: applicationContext, cvs: Object.fromEntries(cvs.results.map((cv) => [cv.language, cv.url])) };
+  return { application_context: applicationContext, applicant_contact: applicantContact, applicant_profile: applicantProfile, cvs: Object.fromEntries(cvs.results.map((cv) => [cv.language, cv.url])) };
+}
+
+export async function setApplicantProfile({ db, userId }: UserStore, gender: string | null) {
+  if (gender === null) {
+    await db.prepare("DELETE FROM applicant_profile WHERE user_id IS ?").bind(userId).run();
+    return null;
+  }
+  return db.prepare(`INSERT INTO applicant_profile (user_id, gender, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET gender = excluded.gender, updated_at = excluded.updated_at
+    RETURNING gender, updated_at`).bind(userId, gender, new Date().toISOString()).first<ApplicantProfile>();
+}
+
+export function setApplicantContact({ db, userId }: UserStore, input: SetApplicantContact) {
+  if (input.email === undefined && input.phone === undefined) fail("Supply email or phone; use null to clear a field.");
+  return db.prepare(`INSERT INTO applicant_contact (user_id, email, phone, updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      email = CASE WHEN ? THEN excluded.email ELSE applicant_contact.email END,
+      phone = CASE WHEN ? THEN excluded.phone ELSE applicant_contact.phone END,
+      updated_at = excluded.updated_at
+    RETURNING email, phone, updated_at`)
+    .bind(userId, input.email ?? null, input.phone ?? null, new Date().toISOString(),
+      Number(input.email !== undefined), Number(input.phone !== undefined)).first<ApplicantContact>();
 }
 
 export async function setApplicationContext({ db, userId }: UserStore, text: string | null) {
@@ -410,24 +445,19 @@ async function requireOutreach({ db, userId }: UserStore, id: string) {
   return outreach;
 }
 
-export async function saveContact(scope: UserStore, input: SaveContact) {
+export async function updateContact(scope: UserStore, input: UpdateContact) {
   const { db, userId } = scope;
-  await requireJob(scope, input.job_id);
   const { contact_id, job_id, ...patch } = input;
-  if (contact_id) {
-    const contact = await requireContact(scope, contact_id);
-    if (contact.job_id !== job_id) fail("Contact does not belong to this job.");
-  }
+  const contact = await requireContact(scope, contact_id);
+  if (contact.job_id !== job_id) fail("Contact does not belong to this job.");
+  const communication = await db.prepare("SELECT id FROM outreach WHERE user_id IS ? AND contact_id IS ? LIMIT 1")
+    .bind(userId, contact_id).first<{ id: string }>();
+  if (!communication) fail("Contacts require actual communication. Record the real interaction with record_outreach first.");
   try {
-    if (contact_id) return await patchStatement(scope, "contacts", contact_id, patch).first<Contact>();
-    const now = new Date().toISOString();
-    return await db.prepare(`INSERT INTO contacts (user_id, id, job_id, name, relationship, url, email, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`)
-      .bind(userId, crypto.randomUUID(), job_id, input.name, input.relationship ?? "other", input.url ?? null,
-        input.email ?? null, input.notes ?? null, now, now).first<Contact>();
+    return await patchStatement(scope, "contacts", contact_id, patch).first<Contact>();
   } catch (error) {
     if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
-      fail("A contact with this URL or email already exists for this job. Use get_job, then save_contact with its contact_id.");
+      fail("A contact with this URL or email already exists for this job. Use get_job to find its contact_id.");
     }
     throw error;
   }
@@ -440,10 +470,16 @@ function validateOutreach(entry: Pick<Outreach, "direction" | "occurred_at" | "f
 
 export async function recordOutreach(scope: UserStore, input: RecordOutreach) {
   const { db, userId } = scope;
-  const contact = await requireContact(scope, input.contact_id);
+  if ((input.contact_id === undefined) === (input.contact === undefined)) {
+    fail("Provide exactly one of contact_id for an existing contact or contact with job_id and name for the actual first communication.");
+  }
+  const existing = input.contact_id ? await requireContact(scope, input.contact_id) : undefined;
+  const jobId = existing?.job_id ?? input.contact?.job_id;
+  if (!jobId) fail("A job is required for the actual first communication.");
+  if (!existing) await requireJob(scope, jobId);
   if (input.stage_id) {
     const stage = await requireStage(scope, input.stage_id);
-    if (stage.job_id !== contact.job_id) fail("Stage and contact must belong to the same job.");
+    if (stage.job_id !== jobId) fail("Stage and contact must belong to the same job.");
   }
   if (input.time_basis === "reported" && !input.occurred_at) fail("Reported event times require occurred_at; omit both to record the logging time.");
   const now = new Date().toISOString();
@@ -451,12 +487,29 @@ export async function recordOutreach(scope: UserStore, input: RecordOutreach) {
   const followUpAt = input.follow_up_at ? normalizeTimestamp(input.follow_up_at) : null;
   const followUpStatus = input.follow_up_status ?? (input.direction === "outbound" || followUpAt !== null ? "pending" : null);
   validateOutreach({ direction: input.direction, occurred_at: occurredAt, follow_up_at: followUpAt, follow_up_status: followUpStatus });
-  return db.prepare(`INSERT INTO outreach (user_id, id, job_id, contact_id, stage_id, direction, occurred_at,
+  const contactId = existing?.id ?? crypto.randomUUID();
+  const outreachId = crypto.randomUUID();
+  const statements: D1PreparedStatement[] = [];
+  if (input.contact) {
+    statements.push(db.prepare(`INSERT INTO contacts (user_id, id, job_id, name, relationship, url, email, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(userId, contactId, jobId, input.contact.name,
+      input.contact.relationship ?? "other", input.contact.url ?? null, input.contact.email ?? null, input.contact.notes ?? null, now, now));
+  }
+  statements.push(db.prepare(`INSERT INTO outreach (user_id, id, job_id, contact_id, stage_id, direction, occurred_at,
     time_basis, channel, notes, follow_up_at, follow_up_status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`)
-    .bind(userId, crypto.randomUUID(), contact.job_id, contact.id, input.stage_id ?? null, input.direction, occurredAt,
+    .bind(userId, outreachId, jobId, contactId, input.stage_id ?? null, input.direction, occurredAt,
       input.time_basis ?? (input.occurred_at ? "reported" : "recorded"), input.channel ?? null, input.notes ?? null,
-      followUpAt, followUpStatus, now, now).first<Outreach>();
+      followUpAt, followUpStatus, now, now));
+  try {
+    const results = await db.batch<Outreach>(statements);
+    return results.at(-1)?.results[0];
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
+      fail("A contact with this URL or email already exists for this job. Use get_job, then record_outreach with its contact_id.");
+    }
+    throw error;
+  }
 }
 
 export async function updateOutreach(scope: UserStore, input: UpdateOutreach) {

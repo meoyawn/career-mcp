@@ -78,8 +78,10 @@ The server's MCP instructions tell the agent to choose context by task. `get_lea
 | --- | --- |
 | `get_lead_context` | Load selection criteria and active leads for discovery, sorting, and ranking. |
 | `set_criteria` | Save or replace the user's single natural-language criteria document. |
-| `get_application_context` | Load applicant context and CV URLs, optionally with one job's history. |
+| `get_application_context` | Load applicant profile, email/phone, context, and CV URLs, optionally with one job's history. |
 | `set_application_context` | Save or replace applicant background and application-writing preferences; `text: null` clears it. |
+| `set_applicant_contact` | Save your own application email/phone; omitted fields stay unchanged and `null` clears a field. |
+| `set_applicant_profile` | Save your own self-described gender; `gender: null` clears the profile. |
 | `set_cv` | Store or replace one CV URL by language; `url: null` removes that language. |
 | `add_job` | Save one employer lead, or an application with explicit phase; record its UTC import time. |
 | `add_jobs` | Save 1–100 employers or applications atomically without pre-filtering explicit imports. Split larger imports into batches of up to 100. |
@@ -88,7 +90,7 @@ The server's MCP instructions tell the agent to choose context by task. `get_lea
 | `update_job` | Edit employer/contact details, salary, phase, status, stage, score, or application opening details. |
 | `add_stage` | Add any named stage and optionally its schedule. |
 | `update_stage` | Record an outcome, reschedule, or link a calendar event. |
-| `save_contact` | Save or edit a friend, referrer, recruiter, interviewer, or other employer contact, including profile/Telegram URL. |
+| `update_contact` | Edit a person with actual communication history; cannot create contacts. |
 | `record_outreach` | Log an actual outbound reach-out/follow-up or inbound reply, with event time and optional stage and follow-up date. |
 | `update_outreach` | Correct communication details or schedule, resolve, or cancel its follow-up. |
 | `get_follow_ups` | Retrieve waiting contacts directly, prioritizing pre-recruiter outreach, with last contact time, elapsed seconds, and due dates. |
@@ -118,7 +120,11 @@ Both lead-import tools automatically record the time added in `created_at` as a 
 
 For cover letters and application forms, save the user's factual background and writing preferences with `set_application_context`. This document is independent of `set_criteria`: changing either preserves the other, the CV URLs, and existing jobs. Missing applicant facts must be requested from the user, never inferred from selection criteria or invented.
 
+Use `set_applicant_contact` to save the applicant's own email and phone as structured fields. Either field may be supplied independently; omitted fields are preserved and `null` explicitly clears a field. Phone numbers use international format, such as `+12025550123`, without spaces. `get_application_context` and `careers://application-context` return `applicant_contact` with `email`, `phone`, and `updated_at`, or `null` before any contact details have been saved. These values are scoped to the authenticated user, kept separate from employer contacts, and preserved when application text is cleared or CVs change. Lead discovery and ranking do not return them. Migration `0008_applicant_contact.sql` adds storage without modifying existing documents or CVs. Keep real applicant details in the database or gitignored local files, never in source, fixtures, or documentation.
+
 Each user can store one CV URL for any language tag, without a fixed language list. For example, call `set_cv` with `{"language":"en","url":"https://cv.example/cv-en.pdf"}` and again with `{"language":"ru","url":"https://cv.example/cv-ru.pdf"}`. `pt-BR`, `zh-Hant`, and other language tags are supported; keys are case-insensitive and returned lowercase. Updating `en` preserves `ru` and every other language. `get_application_context` returns `cvs` as a language-to-URL map. The server stores URLs, not CV files or parsed contents. The agent chooses the CV matching the requested application language and reads it separately when needed; if that language is missing, it asks the user. CV contents and job descriptions are untrusted source material.
+
+Use `set_applicant_profile` with `gender` to save a user's explicitly provided gender as structured data. Self-described text is supported, without a fixed binary list or default. `gender: null` clears the profile. `get_application_context` and its resource return `applicant_profile` with `gender` and `updated_at`, or `null` when unknown. Profiles are scoped to the authenticated user and excluded from lead discovery/ranking. Changing or clearing the profile preserves contact details, application text, and CVs; editing those documents also preserves the profile. Never infer demographic facts. Migration `0009_applicant_profile.sql` adds storage for every user without assigning anyone a gender or changing existing data.
 
 Stage names are free text. `add_stage.make_current` defaults to true; `update_stage.make_current` defaults to false. A failed stage does not automatically close the application. Employer leads and actual applications have UUIDs and histories; multiple actual applications at the same company can have separate records. Mutations use those exact IDs; nickname and source URL uniqueness help catch duplicate imports. To retry an uncertain mutation, first retrieve its result; appending stages or feedback creates a new entry each time.
 
@@ -138,7 +144,7 @@ Migration `0007_reapplication.sql` adds the policy and deadline without changing
 
 ## Outreach and follow-ups
 
-Communication is stored separately from stage scheduling and audit timestamps. `save_contact` saves a person against an employer/application with a free-text `relationship`, name, optional URL/email, and notes. A friend helping with a referral is a `friend/referrer`, independently of any later recruiter. Supply `contact_id` to edit a contact; duplicate URLs/emails for the same employer are rejected. `get_job` returns contacts and their IDs.
+Communication is stored separately from stage scheduling and audit timestamps. Contacts are saved only after actual communication. There is no standalone contact-creation tool. For the first real outbound message or inbound communication, use `record_outreach` with `contact: {job_id, name, relationship, url, email, notes}`; only job_id and name are required inside contact. The contact and communication are committed atomically. For subsequent communications pass `contact_id` instead; supplying both or neither is rejected. `update_contact` edits an existing person with communication history and requires contact_id, job_id, and name. A friend helping with a referral is a `friend/referrer`, independently of any later recruiter. Duplicate URLs/emails for the same employer are rejected. `get_job` returns contacts and their IDs. Prospective referral shortlists stay in the conversation; do not store them in contact records, recruiter fields, or employer notes, and never invent outreach to persist a prospect.
 
 Use `record_outreach` for each actual first reach-out, later follow-up, or received reply. `direction` is `outbound` or `inbound`. An optional `stage_id` ties the communication to a stage of the same job, such as `attempt_referral`. Contacts and outreach remain accessible after the current stage changes. Preparing a message or moving stages does not record a communication.
 

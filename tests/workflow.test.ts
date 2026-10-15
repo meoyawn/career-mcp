@@ -490,7 +490,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal((await exchange(browser.origin, { ...refreshRequest, refresh_token: tokens.refresh_token })).status, 400);
   });
 
-  test("two users have separate lead and application contexts, multilingual CVs, and isolated pipelines in one D1", async () => {
+  test("two users have separate lead and application contexts, applicant profiles and contacts, multilingual CVs, and isolated pipelines in one D1", async () => {
     const aliceBrowser = browserFor(endpoint);
     const bobBrowser = browserFor(endpoint);
     await enroll(aliceBrowser);
@@ -508,11 +508,25 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped(alice, "set_criteria", { text: "Alice remote roles" }, v.unknown());
       await scoped(alice, "set_criteria", { text: "Alice remote product roles" }, v.unknown());
       await scoped(bob, "set_criteria", { text: "Bob onsite roles" }, v.unknown());
+      const applicantContactOutput = v.strictObject({ email: v.nullable(v.string()), phone: v.nullable(v.string()), updated_at: v.string() });
+      const applicantProfileOutput = v.strictObject({ gender: v.string(), updated_at: v.string() });
       const applicationOutput = v.strictObject({
         application_context: v.nullable(v.strictObject({ text: v.string(), updated_at: v.string() })),
+        applicant_contact: v.nullable(applicantContactOutput),
+        applicant_profile: v.nullable(applicantProfileOutput),
         cvs: v.record(v.string(), v.string()),
       });
-      assert.deepEqual(await scoped(alice, "get_application_context", {}, applicationOutput), { application_context: null, cvs: {} });
+      assert.deepEqual(await scoped(alice, "get_application_context", {}, applicationOutput), { application_context: null, applicant_contact: null, applicant_profile: null, cvs: {} });
+      await scoped(alice, "set_applicant_profile", { gender: "male" }, applicantProfileOutput);
+      assert.equal((await scoped(bob, "get_application_context", {}, applicationOutput)).applicant_profile, null);
+      const aliceProfile = await scoped(alice, "set_applicant_profile", { gender: "non-binary" }, applicantProfileOutput);
+      assert.equal(aliceProfile.gender, "non-binary");
+      const bobProfile = await scoped(bob, "set_applicant_profile", { gender: "female" }, applicantProfileOutput);
+      await scoped(alice, "set_applicant_contact", { email: "alice@example.com" }, applicantContactOutput);
+      const aliceContactDetails = await scoped(alice, "set_applicant_contact", { phone: "+12025550123" }, applicantContactOutput);
+      assert.equal(aliceContactDetails.email, "alice@example.com");
+      assert.equal(aliceContactDetails.phone, "+12025550123");
+      const bobContactDetails = await scoped(bob, "set_applicant_contact", { email: "bob@example.com", phone: "+12025550124" }, applicantContactOutput);
       const applicationText = "\nAlice applicant background.\r\nUse concise cover letters.\nОпыт работы.\n";
       await scoped(alice, "set_application_context", { text: applicationText }, v.unknown());
       await scoped(bob, "set_application_context", { text: "Bob applicant background" }, v.unknown());
@@ -524,13 +538,27 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       ] as const) await scoped(owner, "set_cv", { language, url }, v.unknown());
       const aliceApplication = await scoped(alice, "get_application_context", {}, applicationOutput);
       assert.equal(aliceApplication.application_context?.text, applicationText);
+      assert.deepEqual(aliceApplication.applicant_contact, aliceContactDetails);
+      assert.deepEqual(aliceApplication.applicant_profile, aliceProfile);
       assert.deepEqual(aliceApplication.cvs, {
         en: "https://cv.example/alice-en.pdf", ru: "https://cv.example/alice-ru.pdf", "pt-br": "https://cv.example/alice-pt-br.pdf",
       });
       const bobApplication = await scoped(bob, "get_application_context", {}, applicationOutput);
       assert.equal(bobApplication.application_context?.text, "Bob applicant background");
+      assert.deepEqual(bobApplication.applicant_contact, bobContactDetails);
+      assert.deepEqual(bobApplication.applicant_profile, bobProfile);
       assert.deepEqual(bobApplication.cvs, { en: "https://cv.example/bob-en.pdf" });
       for (const [name, args] of [
+        ["set_applicant_profile", {}],
+        ["set_applicant_profile", { gender: " \t\n" }],
+        ["set_applicant_profile", { gender: "x".repeat(201) }],
+        ["set_applicant_profile", { gender: "male", user_id: "bob" }],
+        ["set_applicant_contact", {}],
+        ["set_applicant_contact", { email: "invalid" }],
+        ["set_applicant_contact", { phone: "+1 202 555 0123" }],
+        ["set_applicant_contact", { phone: "+0123456" }],
+        ["set_applicant_contact", { phone: "+1234567890123456" }],
+        ["set_applicant_contact", { email: null, user_id: "bob" }],
         ["set_application_context", { text: " \t\n" }],
         ["set_application_context", { text: "x".repeat(30_001) }],
         ["set_cv", { language: "", url: "https://cv.example/invalid.pdf" }],
@@ -550,10 +578,10 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const bobStage = await scoped(bob, "add_stage", { job_id: bobJob.id, name: "Bob interview", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
       await scoped(alice, "add_feedback", { stage_id: aliceStage.id, text: "Alice private feedback" }, feedbackOutput);
       const bobFeedback = await scoped(bob, "add_feedback", { stage_id: bobStage.id, text: "Bob private feedback" }, feedbackOutput);
-      const aliceContact = await scoped(alice, "save_contact", { job_id: aliceJob.id, name: "Alice referrer", relationship: "friend", url: "https://t.me/example_referrer" }, contactOutput);
-      const bobContact = await scoped(bob, "save_contact", { job_id: bobJob.id, name: "Bob referrer", relationship: "friend", url: "https://t.me/example_referrer" }, contactOutput);
-      const aliceOutreach = await scoped(alice, "record_outreach", { contact_id: aliceContact.id, direction: "outbound" }, outreachOutput);
-      const bobOutreach = await scoped(bob, "record_outreach", { contact_id: bobContact.id, direction: "outbound" }, outreachOutput);
+      const aliceOutreach = await scoped(alice, "record_outreach", { contact: { job_id: aliceJob.id, name: "Alice referrer", relationship: "friend", url: "https://t.me/example_referrer" }, direction: "outbound" }, outreachOutput);
+      const bobOutreach = await scoped(bob, "record_outreach", { contact: { job_id: bobJob.id, name: "Bob referrer", relationship: "friend", url: "https://t.me/example_referrer" }, direction: "outbound" }, outreachOutput);
+      const aliceContact = { id: aliceOutreach.contact_id };
+      const bobContact = { id: bobOutreach.contact_id };
       await scoped(alice, "update_job", { job_id: aliceJob.id, score: 90, notes: "Alice assessment" }, jobSchema);
       await scoped(bob, "update_job", { job_id: bobJob.id, score: 80, notes: "Bob assessment" }, jobSchema);
       for (const [owner, ownJob, ownStage, criteria] of [[alice, aliceJob, aliceStage, "Alice remote product roles"], [bob, bobJob, bobStage, "Bob onsite roles"]] as const) {
@@ -576,7 +604,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         assert.equal(application.job.id, ownJob.id);
         assert.deepEqual(application.stages, detail.stages);
         assert.deepEqual(application.feedback, detail.feedback);
-        assert.deepEqual({ application_context: application.application_context, cvs: application.cvs }, owner === alice ? aliceApplication : bobApplication);
+        assert.deepEqual({ application_context: application.application_context, applicant_contact: application.applicant_contact, applicant_profile: application.applicant_profile, cvs: application.cvs }, owner === alice ? aliceApplication : bobApplication);
         const resource = await owner.readResource({ uri: "careers://criteria" });
         const first = resource.contents[0];
         assert.ok(first && "text" in first);
@@ -590,8 +618,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         ["add_stage", { job_id: bobJob.id, name: "Foreign stage" }], ["update_stage", { stage_id: bobStage.id, name: "Foreign round", make_current: true }],
         ["add_feedback", { stage_id: bobStage.id, text: "Foreign feedback" }], ["update_feedback", { feedback_id: bobFeedback.id, text: "Foreign edit" }],
         ["get_calendar_event", { stage_id: bobStage.id }],
-        ["save_contact", { job_id: bobJob.id, name: "Foreign contact" }],
-        ["save_contact", { job_id: aliceJob.id, contact_id: bobContact.id, name: "Stolen contact" }],
+        ["record_outreach", { contact: { job_id: bobJob.id, name: "Foreign contact" }, direction: "outbound" }],
+        ["update_contact", { job_id: aliceJob.id, contact_id: bobContact.id, name: "Stolen contact" }],
         ["record_outreach", { contact_id: bobContact.id, direction: "outbound" }],
         ["record_outreach", { contact_id: aliceContact.id, stage_id: bobStage.id, direction: "outbound" }],
         ["update_outreach", { outreach_id: bobOutreach.id, follow_up_status: "done" }],
@@ -625,7 +653,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.match(prompt.messages[0].content.text, new RegExp(lead.id, "u"));
       assert.match(prompt.messages[0].content.text, new RegExp(aliceJob.id, "u"));
       assert.doesNotMatch(prompt.messages[0].content.text, new RegExp(bobJob.id, "u"));
-      assert.doesNotMatch(prompt.messages[0].content.text, /applicant background|cv\.example/u);
+      assert.doesNotMatch(prompt.messages[0].content.text, /applicant background|applicant_profile|non-binary|cv\.example|alice@example\.com|12025550123/u);
       await scoped(bob, "update_job", { job_id: bobJob.id, status: "rejected", reapply_policy: "allowed" }, jobSchema);
       assert.deepEqual((await scoped(alice, "list_jobs", { available_only: true, reapply_status: "eligible" }, jobsSchema)).jobs, []);
       assert.deepEqual((await scoped(bob, "list_jobs", { available_only: true, reapply_status: "eligible" }, jobsSchema)).jobs.map((job) => job.id), [bobJob.id]);
@@ -634,12 +662,29 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped(alice, "set_application_context", { text: "Alice updated applicant background" }, v.unknown());
       const updatedApplication = await scoped(alice, "get_application_context", {}, applicationOutput);
       assert.equal(updatedApplication.application_context?.text, "Alice updated applicant background");
+      assert.deepEqual(updatedApplication.applicant_contact, aliceContactDetails);
+      assert.deepEqual(updatedApplication.applicant_profile, aliceProfile);
       assert.deepEqual(updatedApplication.cvs, { en: "https://cv.example/alice-new-en.pdf", ru: "https://cv.example/alice-ru.pdf" });
       assert.equal((await scoped(alice, "get_lead_context", {}, v.object({ criteria: v.object({ text: v.string() }) }))).criteria.text, "Alice changed again");
       await scoped(alice, "set_application_context", { text: null }, v.null());
       const cleared = await scoped(alice, "get_application_context", {}, applicationOutput);
       assert.equal(cleared.application_context, null);
+      assert.deepEqual(cleared.applicant_contact, aliceContactDetails);
+      assert.deepEqual(cleared.applicant_profile, aliceProfile);
       assert.deepEqual(cleared.cvs, updatedApplication.cvs);
+      const withoutEmail = await scoped(alice, "set_applicant_contact", { email: null }, applicantContactOutput);
+      assert.equal(withoutEmail.email, null);
+      assert.equal(withoutEmail.phone, "+12025550123");
+      await scoped(alice, "set_applicant_contact", { phone: null }, applicantContactOutput);
+      const clearedContact = (await scoped(alice, "get_application_context", {}, applicationOutput)).applicant_contact;
+      assert.equal(clearedContact?.email, null);
+      assert.equal(clearedContact?.phone, null);
+      await scoped(alice, "set_applicant_profile", { gender: null }, v.null());
+      const clearedProfile = await scoped(alice, "get_application_context", {}, applicationOutput);
+      assert.equal(clearedProfile.applicant_profile, null);
+      assert.equal(clearedProfile.application_context, null);
+      assert.deepEqual(clearedProfile.applicant_contact, clearedContact);
+      assert.deepEqual(clearedProfile.cvs, updatedApplication.cvs);
       assert.deepEqual(await scoped(bob, "get_application_context", {}, applicationOutput), bobApplication);
       const spoofed = await alice.callTool({ name: "get_lead_context", arguments: { user_id: "another-user" } });
       assert.equal(spoofed.isError, true);
@@ -651,10 +696,34 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
+  test("prospective contacts cannot be saved before communication", async () => {
+    const employer = await call("add_job", { company: "Uncontacted prospect example" }, jobSchema);
+    await assert.rejects(client.callTool({ name: "save_contact", arguments: { job_id: employer.id, name: "Uncontacted prospect" } }), /not found/u);
+    await error("update_contact", { job_id: employer.id, name: "Uncontacted prospect" }, /contact_id/u);
+    await error("record_outreach", { direction: "outbound" }, /exactly one/u);
+    await error("record_outreach", { contact: { job_id: employer.id, name: "Uncontacted prospect" } }, /direction/u);
+    await error("record_outreach", { contact: { job_id: employer.id, name: "Future prospect" }, direction: "outbound", occurred_at: "2099-01-01T00:00:00Z" }, /future/u);
+    const other = await call("add_job", { company: "Other prospect employer" }, jobSchema);
+    const foreignStage = await call("add_stage", { job_id: other.id, name: "Different employer stage" }, stageSchema);
+    await error("record_outreach", { contact: { job_id: employer.id, name: "Wrong stage prospect" }, direction: "outbound", stage_id: foreignStage.id }, /same job/u);
+    const history = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
+    assert.deepEqual(history.contacts, []);
+    assert.deepEqual(history.outreach, []);
+    const incoming = await call("record_outreach", {
+      contact: { job_id: employer.id, name: "Recruiter who contacted me", relationship: "recruiter" }, direction: "inbound",
+      occurred_at: "2026-09-01T09:00:00Z", notes: "Received an introduction from the recruiter.",
+    }, outreachOutput);
+    const received = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
+    assert.equal(received.contacts.length, 1);
+    assert.equal(received.contacts[0]?.id, incoming.contact_id);
+    assert.deepEqual(received.outreach, [incoming]);
+    assert.equal(received.last_outreach_at, null);
+    assert.equal(received.last_response_at, incoming.occurred_at);
+    await error("record_outreach", { contact_id: incoming.contact_id, contact: { job_id: employer.id, name: "Ambiguous contact" }, direction: "outbound" }, /exactly one/u);
+  });
+
   test("referral contacts keep an event-time outreach clock across stage changes and surface actionable follow-ups", async () => {
     const employer = await call("add_job", { company: "Referral Example" }, jobSchema);
-    const friend = await call("save_contact", { job_id: employer.id, name: "Example friend", relationship: "friend/referrer", url: "https://t.me/referrer_example" }, contactOutput);
-    const hr = await call("save_contact", { job_id: employer.id, name: "Example HR", relationship: "recruiter" }, contactOutput);
     const activity = v.object({
       id: v.string(), company: v.string(), relationship: v.string(), current_stage: v.string(),
       first_outreach_at: v.string(), last_outreach_at: v.string(), last_interaction_time_basis: v.string(),
@@ -663,9 +732,11 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const followUps = v.object({ follow_ups: v.array(activity), next_offset: v.nullable(v.number()) });
     const referral = await call("add_stage", { job_id: employer.id, name: "attempt_referral", status: "in_progress" }, stageSchema);
     const first = await call("record_outreach", {
-      contact_id: friend.id, stage_id: referral.id, direction: "outbound", channel: "telegram",
+      contact: { job_id: employer.id, name: "Example friend", relationship: "friend/referrer", url: "https://t.me/referrer_example" },
+      stage_id: referral.id, direction: "outbound", channel: "telegram",
       occurred_at: "2026-09-01T12:00:00+03:00", follow_up_at: "2026-09-04T12:00:00+03:00",
     }, outreachOutput);
+    const friend = { id: first.contact_id };
     assert.equal(first.occurred_at, "2026-09-01T09:00:00.000Z");
     assert.equal(first.time_basis, "reported");
     assert.notEqual(first.created_at, first.occurred_at);
@@ -688,7 +759,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(touched.occurred_at, first.occurred_at);
 
     // A reply to one person must not clear another person's wait, even at a later stage.
-    await call("record_outreach", { contact_id: hr.id, stage_id: screening.id, direction: "outbound", occurred_at: "2026-09-02T09:00:00Z" }, outreachOutput);
+    const hrOutreach = await call("record_outreach", { contact: { job_id: employer.id, name: "Example HR", relationship: "recruiter" }, stage_id: screening.id, direction: "outbound", occurred_at: "2026-09-02T09:00:00Z" }, outreachOutput);
+    const hr = { id: hrOutreach.contact_id };
     await call("record_outreach", { contact_id: friend.id, direction: "inbound", occurred_at: "2026-09-04T10:00:00Z" }, outreachOutput);
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups.map((entry) => entry.id), [hr.id]);
     const second = await call("record_outreach", { contact_id: friend.id, direction: "outbound", occurred_at: "2026-09-05T09:00:00Z" }, outreachOutput);
@@ -711,24 +783,27 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const logged = await call("record_outreach", { contact_id: friend.id, direction: "outbound" }, outreachOutput);
     assert.equal(logged.time_basis, "recorded");
     assert.ok(Date.parse(logged.occurred_at) >= loggingStartedAt && Date.parse(logged.occurred_at) <= Date.now());
-    await call("save_contact", { job_id: employer.id, contact_id: friend.id, name: "Renamed friend", relationship: "referrer" }, contactOutput);
+    await call("update_contact", { job_id: employer.id, contact_id: friend.id, name: "Renamed friend", relationship: "referrer" }, contactOutput);
     const persisted = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
     assert.equal(persisted.contacts.find((contact) => contact.id === friend.id)?.url, "https://t.me/referrer_example");
     assert.equal(persisted.last_outreach_at, logged.occurred_at);
     assert.equal(persisted.outreach.length, 6);
     for (const [name, args, message] of [
-      ["save_contact", { job_id: employer.id, name: "Duplicate", url: "https://t.me/referrer_example" }, /already exists/u],
+      ["record_outreach", { contact: { job_id: employer.id, name: "Duplicate", url: "https://t.me/referrer_example" }, direction: "outbound" }, /already exists/u],
       ["record_outreach", { contact_id: friend.id, direction: "outbound", time_basis: "reported" }, /require occurred_at/u],
       ["record_outreach", { contact_id: friend.id, direction: "outbound", occurred_at: "2099-01-01T00:00:00Z" }, /future/u],
       ["update_outreach", { outreach_id: first.id, follow_up_at: "2026-08-01T00:00:00Z" }, /earlier/u],
       ["record_outreach", { contact_id: friend.id, direction: "outbound", occurred_at: "2026-02-30T00:00:00Z" }, /impossible/u],
     ] as const) await error(name, args, message);
+    const unchanged = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
+    assert.equal(unchanged.contacts.length, 2);
+    assert.equal(unchanged.outreach.length, persisted.outreach.length);
     const other = await call("add_job", { company: "Different employer" }, jobSchema);
     const otherStage = await call("add_stage", { job_id: other.id, name: "Other round" }, stageSchema);
     await error("record_outreach", { contact_id: friend.id, stage_id: otherStage.id, direction: "outbound" }, /same job/u);
-    await error("save_contact", { job_id: other.id, contact_id: friend.id, name: "Wrong employer" }, /does not belong/u);
-    const otherContact = await call("save_contact", { job_id: other.id, name: "Recruiter", relationship: "recruiter" }, contactOutput);
-    await call("record_outreach", { contact_id: otherContact.id, direction: "outbound", occurred_at: "2026-08-01T09:00:00Z" }, outreachOutput);
+    await error("update_contact", { job_id: other.id, contact_id: friend.id, name: "Wrong employer" }, /does not belong/u);
+    const otherOutreach = await call("record_outreach", { contact: { job_id: other.id, name: "Recruiter", relationship: "recruiter" }, direction: "outbound", occurred_at: "2026-08-01T09:00:00Z" }, outreachOutput);
+    const otherContact = { id: otherOutreach.contact_id };
     await call("update_job", { job_id: other.id, recruiter_engaged_at: "2026-08-01T12:00:00+03:00" }, jobSchema);
     assert.deepEqual((await call("get_follow_ups", { job_id: other.id, pre_recruiter_only: true }, followUps)).follow_ups, []);
     assert.deepEqual((await call("get_follow_ups", { job_id: other.id }, followUps)).follow_ups.map((contact) => contact.id), [otherContact.id]);

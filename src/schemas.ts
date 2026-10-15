@@ -24,6 +24,11 @@ const salaryFields = {
 export const emptySchema = v.strictObject({});
 export const criteriaSchema = v.strictObject({ text: text(20_000) });
 export const applicationContextSchema = v.strictObject({ text: v.nullable(text(30_000)) });
+export const applicantProfileSchema = v.strictObject({ gender: v.nullable(text(200)) });
+export const applicantContactSchema = v.strictObject({
+  email: v.optional(v.nullable(email)),
+  phone: v.optional(v.nullable(v.pipe(v.string(), v.regex(/^\+[1-9]\d{1,14}$/, "Use an international phone number such as +12025550123, without spaces.")))),
+});
 export const getApplicationContextSchema = v.strictObject({ job_id: v.optional(id) });
 export const cvSchema = v.strictObject({
   language: v.pipe(v.string(), v.maxLength(100), v.regex(/^[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*$/, "Use a language tag such as en, ru, or pt-BR.")),
@@ -120,14 +125,18 @@ export const updateStageSchema = v.strictObject({
   make_current: v.optional(v.boolean(), false),
 });
 
-export const saveContactSchema = v.strictObject({
-  job_id: id,
-  contact_id: v.optional(id),
+const contactFields = {
   name: text(200),
   relationship: v.optional(text(200)),
   url: v.optional(v.nullable(url)),
   email: v.optional(v.nullable(email)),
   notes: v.optional(v.nullable(text(20_000))),
+};
+
+export const updateContactSchema = v.strictObject({
+  job_id: id,
+  contact_id: id,
+  ...contactFields,
 });
 
 const outreachFields = {
@@ -140,7 +149,8 @@ const outreachFields = {
 };
 
 export const recordOutreachSchema = v.strictObject({
-  contact_id: id,
+  contact_id: v.optional(id),
+  contact: v.optional(v.strictObject({ job_id: id, ...contactFields })),
   stage_id: v.optional(id),
   direction: v.picklist(["outbound", "inbound"]),
   ...v.partial(v.strictObject(outreachFields)).entries,
@@ -201,10 +211,11 @@ export const rankPromptSchema = v.strictObject({
 
 export type AddJobs = v.InferOutput<typeof addJobsSchema>;
 export type ListJobs = v.InferOutput<typeof listJobsSchema>;
+export type SetApplicantContact = v.InferOutput<typeof applicantContactSchema>;
 export type UpdateJob = v.InferOutput<typeof updateJobSchema>;
 export type AddStage = v.InferOutput<typeof addStageSchema>;
 export type UpdateStage = v.InferOutput<typeof updateStageSchema>;
-export type SaveContact = v.InferOutput<typeof saveContactSchema>;
+export type UpdateContact = v.InferOutput<typeof updateContactSchema>;
 export type RecordOutreach = v.InferOutput<typeof recordOutreachSchema>;
 export type UpdateOutreach = v.InferOutput<typeof updateOutreachSchema>;
 export type FollowUps = v.InferOutput<typeof followUpsSchema>;
