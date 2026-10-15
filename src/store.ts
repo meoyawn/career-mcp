@@ -1,4 +1,5 @@
-import { maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type FollowUps, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
+import * as v from "valibot";
+import { eligibleOpeningSchema, maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -37,6 +38,7 @@ interface Job {
   company: string;
   company_url: string | null;
   phase: "lead" | "application";
+  eligible_opening: string | null;
   title: string | null;
   nickname: string | null;
   description: string | null;
@@ -226,8 +228,24 @@ function duplicateError(error: unknown): never {
 
 function validateOpening(phase: Job["phase"], input: Pick<UpdateJob, "title" | "description" | "source_url" | "location">) {
   if (phase === "lead" && [input.title, input.description, input.source_url, input.location].some((value) => value != null)) {
-    fail("Opening details can only be stored during an application. Save the employer alone as a lead; set phase to application only when the user starts applying.");
+    fail("Top-level opening details require an application. For a lead, put the verified role in eligible_opening; set phase to application only when the user starts applying.");
   }
+}
+
+function validateEligibleOpening(input: unknown, criteria: Criteria | null) {
+  const result = v.safeParse(eligibleOpeningSchema, input);
+  if (!result.success) fail("Every new job record requires a verified eligible opening: title, description, source_url, location, status:open, eligibility:eligible, checked_at, criteria_updated_at, and eligibility_reason. Excluded, closed, unknown, and employer-only records cannot be saved; phase:application does not bypass this check.");
+  if (!criteria) fail("Save selection criteria before adding jobs, then verify an open role against those criteria.");
+  const opening = result.output;
+  if (normalizeTimestamp(opening.criteria_updated_at) !== criteria.updated_at) fail("Opening eligibility uses outdated criteria. Load get_lead_context and reassess against the current criteria.");
+  const checkedAt = normalizeTimestamp(opening.checked_at);
+  const age = Date.now() - Date.parse(checkedAt);
+  if (age < 0 || age > 24 * 60 * 60 * 1_000) fail("Verify the opening is still open within the last 24 hours; checked_at cannot be in the future.");
+  return { ...opening, checked_at: checkedAt, criteria_updated_at: criteria.updated_at };
+}
+
+function withEligibleOpening<T extends Pick<Job, "eligible_opening">>(job: T) {
+  return { ...job, eligible_opening: job.eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(job.eligible_opening)) };
 }
 
 function validateSalary(input: Pick<UpdateJob, "salary_min" | "salary_max" | "salary_currency" | "salary_period">) {
@@ -253,11 +271,13 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   }
   const { db, userId } = scope;
   const now = new Date().toISOString();
+  const criteria = await getCriteria(scope);
   for (const [index, job] of jobs.entries()) {
     try {
       validateOpening(job.phase, job);
       validateSalary(job);
       validateSalaryAsk(job);
+      job.eligible_opening = validateEligibleOpening(job.eligible_opening, criteria);
     } catch (error) {
       if (error instanceof Error && error.cause === "user") {
         fail(`Batch rejected: 0 of ${jobs.length} records saved. Record ${index + 1}: ${error.message}`);
@@ -267,17 +287,18 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   }
   const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
     (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
-      salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
+      salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis, created_at, updated_at, eligible_opening)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
     userId, crypto.randomUUID(), job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "application",
     job.title ?? null, job.nickname ?? null, job.description ?? null, job.source_url ?? null,
     job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null,
     job.salary_min ?? null, job.salary_max ?? null, job.salary_currency ?? null, job.salary_period ?? null,
     job.salary_ask_amount ?? null, job.salary_ask_currency ?? null, job.salary_ask_period ?? null, job.salary_ask_basis ?? null, now, now,
+    job.eligible_opening ? JSON.stringify(job.eligible_opening) : null,
   ));
   try {
     const results = await db.batch<Job>(statements);
-    return { jobs: results.flatMap((result) => result.results) };
+    return { jobs: results.flatMap((result) => result.results).map(withEligibleOpening) };
   } catch (error) {
     duplicateError(error);
   }
@@ -316,7 +337,7 @@ export async function getJob(scope: UserStore, id: string) {
       .bind(userId, id).all<Outreach>(),
   ]);
   return {
-    job, stages: stages.results, feedback: feedback.results, contacts: contacts.results, outreach: outreach.results,
+    job: withEligibleOpening(job), stages: stages.results, feedback: feedback.results, contacts: contacts.results, outreach: outreach.results,
     last_outreach_at: outreach.results.filter((entry) => entry.direction === "outbound").at(-1)?.occurred_at ?? null,
     last_response_at: outreach.results.filter((entry) => entry.direction === "inbound").at(-1)?.occurred_at ?? null,
   };
@@ -393,7 +414,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
   if (input.phase) { where.push("phase IS ?"); bindings.push(input.phase); }
   if (input.available_only) where.push("(status IS 'active' OR reapply_status IS 'eligible')");
   if (input.reapply_status) { where.push("reapply_status IS ?"); bindings.push(input.reapply_status); }
-  const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, title, nickname, source_url, location,
+  const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, eligible_opening, title, nickname, source_url, location,
     recruiter_name, recruiter_email, notes, status, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
     score, salary_min, salary_max, salary_currency, salary_period,
     salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
@@ -409,7 +430,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     .bind(...bindings, input.limit + 1, input.offset).all<Omit<Job, "description"> & { description?: string }>();
   const hasMore = results.results.length > input.limit;
   return {
-    jobs: results.results.slice(0, input.limit),
+    jobs: results.results.slice(0, input.limit).map(withEligibleOpening),
     next_offset: hasMore ? input.offset + input.limit : null,
   };
 }
@@ -423,7 +444,11 @@ function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "f
 
 export async function updateJob(scope: UserStore, input: UpdateJob) {
   const job = await requireJob(scope, input.job_id);
-  const { job_id, ...patch } = input;
+  const { job_id, eligible_opening, ...patch } = input;
+  const needsOpening = input.phase !== undefined || input.company !== undefined || input.company_url !== undefined ||
+    ((input.phase ?? job.phase) === "lead" && (input.status === "active" || input.status === "offer"));
+  let opening: EligibleOpening | undefined;
+  if (needsOpening || eligible_opening !== undefined) opening = validateEligibleOpening(eligible_opening, await getCriteria(scope));
   if (patch.recruiter_engaged_at) {
     patch.recruiter_engaged_at = normalizeTimestamp(patch.recruiter_engaged_at);
     if (Date.parse(patch.recruiter_engaged_at) > Date.now()) fail("recruiter_engaged_at records actual recruiter contact and cannot be in the future.");
@@ -445,11 +470,11 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
     patch.current_stage = "application";
   }
   // Scores for changed descriptions must come from a new ranking.
-  const invalidates = [input.company, input.title, input.description, input.location].some((value) => value !== undefined);
+  const invalidates = [input.company, input.title, input.description, input.location, opening].some((value) => value !== undefined);
   if (invalidates && patch.score === undefined) patch.score = null;
   try {
-    await patchStatement(scope, "jobs", job_id, patch).run();
-    return await requireJob(scope, job_id);
+    await patchStatement(scope, "jobs", job_id, { ...patch, eligible_opening: opening ? JSON.stringify(opening) : undefined }).run();
+    return withEligibleOpening(await requireJob(scope, job_id));
   } catch (error) {
     duplicateError(error);
   }

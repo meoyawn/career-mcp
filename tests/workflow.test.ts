@@ -59,6 +59,17 @@ async function error(name: string, args: Record<string, unknown>, message: RegEx
   assert.match(result.content[0].text, message);
 }
 
+async function verifiedOpening(company: string, owner: Client = client) {
+  const { criteria } = parseTool(await owner.callTool({ name: "get_lead_context", arguments: {} }),
+    v.object({ criteria: v.nullable(v.object({ updated_at: v.string() })) }));
+  return {
+    title: "TypeScript product engineer", description: "Build TypeScript developer tools for EMEA customers.",
+    source_url: `https://jobs.example/${encodeURIComponent(company)}`, location: "Remote EMEA",
+    status: "open", eligibility: "eligible", checked_at: new Date().toISOString(),
+    criteria_updated_at: criteria?.updated_at ?? new Date().toISOString(), eligibility_reason: "Live EMEA product engineering role passes the current hard exclusions.",
+  };
+}
+
 describe("Careers MCP through a real local Worker and D1", { concurrency: false }, () => {
   before(async () => {
     directory = await mkdtemp(join(tmpdir(), "careers-mcp-"));
@@ -125,15 +136,17 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
-  test("application imports need no criteria, conflicting filters preserve records, and ranking stays independent", async () => {
+  test("all job imports require current criteria and opening evidence, while criteria edits preserve histories and ranking", async () => {
     const criteriaOutput = v.strictObject({ user_id: v.string(), text: v.string(), updated_at: v.string() });
-    const opening = { phase: "application", company: "Google", title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work", source_url: "https://jobs.example/google" };
-    const importStartedAt = Date.now();
-    const google = await call("add_job", { ...opening, score: 95 }, jobSchema);
-    const firstBatch = await call("add_jobs", { jobs: [
-      { phase: "application", company: "Google", title: "Backend engineer", nickname: "google-backend", description: "Remote backend work", score: 70, source_url: "http://jobs.example/google-backend" },
-    ] }, jobsSchema);
+    const opening = { phase: "application", company: "Google", eligible_opening: await verifiedOpening("Google"), title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work", source_url: "https://jobs.example/google" };
     assert.equal((await call("get_lead_context", {}, v.object({ criteria: v.null() }))).criteria, null);
+    await error("add_job", { ...opening, eligible_opening: await verifiedOpening("Google") }, /criteria/u);
+    await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, criteriaOutput);
+    const importStartedAt = Date.now();
+    const google = await call("add_job", { ...opening, eligible_opening: await verifiedOpening("Google"), score: 95 }, jobSchema);
+    const firstBatch = await call("add_jobs", { jobs: [
+      { phase: "application", company: "Google", eligible_opening: await verifiedOpening("Google"), title: "Backend engineer", nickname: "google-backend", description: "Remote backend work", score: 70, source_url: "http://jobs.example/google-backend" },
+    ] }, jobsSchema);
     assert.equal((await call("list_jobs", {}, jobsSchema)).jobs.length, 2);
     const text = "\n# Job selection criteria\r\n\r\n- Remote TypeScript roles.\r\n- Exclude onsite-only work.\r\n\r\n## Ranking\nPrefer product teams; score stack fit from 0–100.\nПродуктовые команды в приоритете.\n ";
     const { tools } = await client.listTools();
@@ -174,7 +187,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(google.score, 95);
     assert.equal(google.source_url, opening.source_url);
     const imported = await call("add_jobs", { jobs: [
-      { phase: "application", company: "New Co", title: "Onsite engineer", description: "Onsite-only product work explicitly supplied by the user" },
+      { phase: "application", company: "New Co", eligible_opening: await verifiedOpening("New Co"), title: "Onsite engineer", description: "Onsite-only product work explicitly supplied by the user" },
     ] }, jobsSchema);
     assert.equal(imported.jobs.length, 1);
     const backend = firstBatch.jobs.find((job) => job.title === "Backend engineer");
@@ -231,8 +244,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const unknown = { salary_ask_amount: null, salary_ask_currency: null, salary_ask_period: null, salary_ask_basis: null };
     const budget = { salary_min: 100_000, salary_max: 120_000, salary_currency: "USD", salary_period: "year" };
     const imported = await call("add_jobs", { jobs: [
-      { company: "Salary ask employer", phase: "application", score: 90, ...budget, ...ask },
-      { company: "Salary ask unknown", phase: "application", ...budget },
+      { company: "Salary ask employer", phase: "application", eligible_opening: await verifiedOpening("Salary ask employer"), score: 90, ...budget, ...ask },
+      { company: "Salary ask unknown", phase: "application", eligible_opening: await verifiedOpening("Salary ask unknown"), ...budget },
     ] }, v.object({ jobs: v.array(row) }));
     const asked = imported.jobs[0];
     const unasked = imported.jobs[1];
@@ -265,14 +278,35 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(unspecifiedBasis.salary_ask_basis, null);
     await call("update_job", { job_id: asked.id, ...unknown }, row);
     assert.deepEqual(v.parse(projection, (await call("get_pipeline", {}, pipeline)).applications.find((job) => job.id === asked.id)), unknown);
-    await error("add_jobs", { jobs: [{ company: "Salary ask atomic rollback" },
-      { company: "Salary ask invalid", salary_ask_amount: 5_500 }] }, /Salary ask/u);
+    await error("add_jobs", { jobs: [{ company: "Salary ask atomic rollback", phase: "application", eligible_opening: await verifiedOpening("Salary ask atomic rollback") },
+      { company: "Salary ask invalid", phase: "application", eligible_opening: await verifiedOpening("Salary ask invalid"), salary_ask_amount: 5_500 }] }, /Salary ask/u);
     assert.deepEqual((await call("list_jobs", { query: "Salary ask atomic rollback" }, jobsSchema)).jobs, []);
   });
 
-  test("employer leads store salaries and reject opening details until applying, including atomic batches and returns to leads", async () => {
+  test("lead intake rejects missing, closed, excluded, unverified and stale openings atomically", async () => {
+    const opening = await verifiedOpening("No opening");
+    await error("add_job", { company: "No opening employer" }, /eligible opening/u);
+    await error("add_job", { company: "No opening application", phase: "application" }, /eligible opening/u);
+    await error("add_jobs", { jobs: [{ company: "No opening batch" }] }, /eligible opening/u);
+    for (const invalid of [
+      { status: "closed" }, { status: "unknown" }, { eligibility: "excluded" }, { eligibility: "unknown" },
+      { source_url: "" }, { description: "" }, { location: " " }, { eligibility_reason: " " },
+      { criteria_updated_at: "2000-01-01T00:00:00.000Z" },
+      { checked_at: new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString() },
+      { checked_at: "2099-01-01T00:00:00.000Z" },
+    ]) await error("add_job", { company: "No opening invalid", eligible_opening: { ...opening, ...invalid } }, /Invalid|length|characters|non-blank|criteria|24 hours/u);
+    await error("add_jobs", { jobs: [
+      { company: "No opening rollback", eligible_opening: opening }, { company: "No opening invalid" },
+    ] }, /0 of 2 records saved.*Record 2:.*eligible opening/u);
+    assert.deepEqual((await call("list_jobs", { query: "No opening" }, jobsSchema)).jobs, []);
+    await call("set_criteria", { text: "Updated remote TypeScript product roles, exclude onsite work." }, v.unknown());
+    await error("add_job", { company: "No opening stale criteria", eligible_opening: opening }, /outdated criteria/u);
+  });
+
+  test("eligible leads retain proof and salary, and employer changes, reactivation and returns to leads require fresh proof", async () => {
     const detailSchema = v.object({ job: v.object({ ...jobSchema.entries, phase: v.string(), description: v.nullable(v.string()), location: v.nullable(v.string()) }) });
-    const lead = await call("add_job", { company: "Employer only", company_url: "https://employer.example/careers",
+    const eligibleOpening = await verifiedOpening("Employer only");
+    const lead = await call("add_job", { company: "Employer only", eligible_opening: eligibleOpening, company_url: "https://employer.example/careers",
       salary_min: 120_000, salary_max: 160_000, salary_currency: "USD", salary_period: "year" }, jobSchema);
     assert.equal(lead.title, null);
     const salarySchema = v.object({ job: v.object({ salary_min: v.nullable(v.number()), salary_max: v.nullable(v.number()), salary_currency: v.nullable(v.string()), salary_period: v.nullable(v.string()) }) });
@@ -287,15 +321,23 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await error("add_job", { company: `Forbidden ${key}`, [key]: value }, /application/u);
       await error("update_job", { job_id: lead.id, [key]: value }, /application/u);
     }
-    await error("add_jobs", { jobs: [{ company: "Lead batch rollback" }, { company: "Forbidden batch", title: "Engineer" }] }, /application/u);
+    await error("add_jobs", { jobs: [{ company: "Lead batch rollback", eligible_opening: await verifiedOpening("Lead batch rollback") }, { company: "Forbidden batch", title: "Engineer" }] }, /application/u);
     assert.deepEqual((await call("list_jobs", { query: "Lead batch rollback" }, jobsSchema)).jobs, []);
     await call("update_job", { job_id: lead.id, current_stage: "shortlisted" }, jobSchema);
     await error("update_job", { job_id: lead.id, ...fields }, /application/u);
-    await call("update_job", { job_id: lead.id, phase: "application", ...fields }, jobSchema);
+    await call("update_job", { job_id: lead.id, phase: "application", eligible_opening: eligibleOpening, ...fields }, jobSchema);
     const application = await call("get_job", { job_id: lead.id }, detailSchema);
     assert.equal(application.job.phase, "application");
     assert.equal(application.job.description, fields.description);
-    await call("update_job", { job_id: lead.id, phase: "lead" }, jobSchema);
+    await error("update_job", { job_id: lead.id, phase: "lead" }, /eligible opening/u);
+    await call("update_job", { job_id: lead.id, phase: "lead", eligible_opening: eligibleOpening }, jobSchema);
+    await error("update_job", { job_id: lead.id, company: "Different employer" }, /eligible opening/u);
+    await call("update_job", { job_id: lead.id, status: "withdrawn" }, jobSchema);
+    await error("update_job", { job_id: lead.id, status: "active" }, /eligible opening/u);
+    await call("update_job", { job_id: lead.id, status: "active", eligible_opening: eligibleOpening }, jobSchema);
+    const proof = v.object({ eligible_opening: v.record(v.string(), v.unknown()) });
+    assert.deepEqual((await call("get_job", { job_id: lead.id }, v.object({ job: proof }))).job.eligible_opening, eligibleOpening);
+    assert.deepEqual((await call("list_jobs", { query: "Employer only" }, v.object({ jobs: v.array(proof) }))).jobs[0]?.eligible_opening, eligibleOpening);
     const returned = await call("get_job", { job_id: lead.id }, detailSchema);
     assert.equal(returned.job.phase, "lead");
     assert.equal(returned.job.current_stage, "lead");
@@ -311,8 +353,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
 
   test("concurrent applications keep independent stages, failures, optional feedback, and corrected voice transcriptions", async () => {
     const imported = await call("add_jobs", { jobs: [
-      { phase: "application", company: "Track A", title: "Engineer", description: "Role A" },
-      { phase: "application", company: "Track B", title: "Engineer", description: "Role B" },
+      { phase: "application", company: "Track A", eligible_opening: await verifiedOpening("Track A"), title: "Engineer", description: "Role A" },
+      { phase: "application", company: "Track B", eligible_opening: await verifiedOpening("Track B"), title: "Engineer", description: "Role B" },
     ] }, jobsSchema);
     assert.ok(imported.jobs[0] && imported.jobs[1]);
     const [screening, technical] = await Promise.all([
@@ -339,7 +381,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   });
 
   test("expired rejections return to available opportunities without reopening the failed application", async () => {
-    const application = await call("add_job", { company: "Reapplication Co", phase: "application" }, jobSchema);
+    const application = await call("add_job", { company: "Reapplication Co", phase: "application", eligible_opening: await verifiedOpening("Reapplication Co") }, jobSchema);
     const stage = await call("add_stage", { job_id: application.id, name: "System design", status: "failed" }, stageSchema);
     const feedback = await call("add_feedback", { stage_id: stage.id, source: "recruiter", text: "Please return after the cooldown." }, feedbackOutput);
     const eligibility = v.object({ ...jobSchema.entries, reapply_policy: v.nullable(v.string()), reapply_after: v.nullable(v.string()), reapply_status: v.string() });
@@ -378,7 +420,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   });
 
   test("UTC scheduling produces Google Calendar arguments and retains event IDs for rescheduling and cancellation", async () => {
-    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Calendar Co", title: "Engineer", description: "Remote", notes: "Private salary target" }] }, jobsSchema);
+    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Calendar Co", eligible_opening: await verifiedOpening("Calendar Co"), title: "Engineer", description: "Remote", notes: "Private salary target" }] }, jobsSchema);
     assert.ok(imported.jobs[0]);
     const stage = await call("add_stage", {
       job_id: imported.jobs[0].id, name: "Technical interview",
@@ -428,11 +470,11 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   test("invalid input and duplicate imports leave D1 unchanged; incomplete calendar details are reported", async () => {
     await error("add_jobs", { jobs: [{ phase: "application", company: " ", title: "Engineer", description: "Role" }] }, /non-blank/u);
     await error("add_jobs", { jobs: [{ phase: "application", company: "Unknown-key Co", title: "Engineer", description: "Role", ignored_typo: true }] }, /ignored_typo|Invalid key/u);
-    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Validation Co", title: "Engineer", description: "Role", nickname: "unique-role" }] }, jobsSchema);
+    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Validation Co", eligible_opening: await verifiedOpening("Validation Co"), title: "Engineer", description: "Role", nickname: "unique-role" }] }, jobsSchema);
     assert.ok(imported.jobs[0]);
     await error("add_jobs", { jobs: [
-      { phase: "application", company: "Atomic rollback", title: "Engineer", description: "Role" },
-      { phase: "application", company: "Duplicate", title: "Engineer", description: "Role", nickname: "UNIQUE-ROLE" },
+      { phase: "application", company: "Atomic rollback", eligible_opening: await verifiedOpening("Atomic rollback"), title: "Engineer", description: "Role" },
+      { phase: "application", company: "Duplicate", eligible_opening: await verifiedOpening("Duplicate"), title: "Engineer", description: "Role", nickname: "UNIQUE-ROLE" },
     ] }, /already exists/u);
     assert.deepEqual((await call("list_jobs", { query: "Atomic rollback" }, jobsSchema)).jobs, []);
     await error("add_stage", { job_id: imported.jobs[0].id, name: "Invalid time", starts_at: "2026-11-02T10:00:00" }, /timestamp/u);
@@ -622,8 +664,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       ] as const) assert.equal((await alice.callTool({ name, arguments: args })).isError, true, name);
       assert.deepEqual(await scoped(alice, "get_application_context", {}, applicationOutput), aliceApplication);
       const opening = { phase: "application", company: "Shared company", title: "Engineer", nickname: "shared-role", source_url: "https://jobs.example/shared", description: "A role both users can track" };
-      const aliceJob = (await scoped(alice, "add_jobs", { jobs: [opening] }, jobsSchema)).jobs[0];
-      const bobJob = (await scoped(bob, "add_jobs", { jobs: [opening] }, jobsSchema)).jobs[0];
+      const aliceJob = (await scoped(alice, "add_jobs", { jobs: [{ ...opening, eligible_opening: await verifiedOpening("Shared company", alice) }] }, jobsSchema)).jobs[0];
+      const bobJob = (await scoped(bob, "add_jobs", { jobs: [{ ...opening, eligible_opening: await verifiedOpening("Shared company", bob) }] }, jobsSchema)).jobs[0];
       assert.ok(aliceJob && bobJob);
       assert.notEqual(aliceJob.id, bobJob.id);
       const aliceStage = await scoped(alice, "add_stage", { job_id: aliceJob.id, name: "Alice interview", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
@@ -710,7 +752,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped(alice, "set_criteria", { text: "Alice changed again" }, v.unknown());
       assert.deepEqual((await scoped(alice, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [aliceJob.id]);
       assert.deepEqual((await scoped(bob, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [bobJob.id]);
-      const lead = await scoped(alice, "add_job", { company: "Alice lead" }, jobSchema);
+      const lead = await scoped(alice, "add_job", { company: "Alice lead", eligible_opening: await verifiedOpening("Alice lead", alice) }, jobSchema);
       const prompt = await alice.getPrompt({ name: "rank_jobs", arguments: { limit: "25", offset: "0" } });
       assert.ok(prompt.messages[0]?.content.type === "text");
       assert.match(prompt.messages[0].content.text, new RegExp(lead.id, "u"));
@@ -760,13 +802,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   });
 
   test("prospective contacts cannot be saved before communication", async () => {
-    const employer = await call("add_job", { company: "Uncontacted prospect example" }, jobSchema);
+    const employer = await call("add_job", { company: "Uncontacted prospect example", eligible_opening: await verifiedOpening("Uncontacted prospect example") }, jobSchema);
     await assert.rejects(client.callTool({ name: "save_contact", arguments: { job_id: employer.id, name: "Uncontacted prospect" } }), /not found/u);
     await error("update_contact", { job_id: employer.id, name: "Uncontacted prospect" }, /contact_id/u);
     await error("record_outreach", { direction: "outbound" }, /exactly one/u);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Uncontacted prospect" } }, /direction/u);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Future prospect" }, direction: "outbound", occurred_at: "2099-01-01T00:00:00Z" }, /future/u);
-    const other = await call("add_job", { company: "Other prospect employer" }, jobSchema);
+    const other = await call("add_job", { company: "Other prospect employer", eligible_opening: await verifiedOpening("Other prospect employer") }, jobSchema);
     const foreignStage = await call("add_stage", { job_id: other.id, name: "Different employer stage" }, stageSchema);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Wrong stage prospect" }, direction: "outbound", stage_id: foreignStage.id }, /same job/u);
     const history = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
@@ -786,7 +828,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   });
 
   test("referral contacts keep an event-time outreach clock across stage changes and surface actionable follow-ups", async () => {
-    const employer = await call("add_job", { company: "Referral Example" }, jobSchema);
+    const employer = await call("add_job", { company: "Referral Example", eligible_opening: await verifiedOpening("Referral Example") }, jobSchema);
     const activity = v.object({
       id: v.string(), company: v.string(), relationship: v.string(), current_stage: v.string(),
       first_outreach_at: v.string(), last_outreach_at: v.string(), last_interaction_time_basis: v.string(),
@@ -861,7 +903,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const unchanged = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
     assert.equal(unchanged.contacts.length, 2);
     assert.equal(unchanged.outreach.length, persisted.outreach.length);
-    const other = await call("add_job", { company: "Different employer" }, jobSchema);
+    const other = await call("add_job", { company: "Different employer", eligible_opening: await verifiedOpening("Different employer") }, jobSchema);
     const otherStage = await call("add_stage", { job_id: other.id, name: "Other round" }, stageSchema);
     await error("record_outreach", { contact_id: friend.id, stage_id: otherStage.id, direction: "outbound" }, /same job/u);
     await error("update_contact", { job_id: other.id, contact_id: friend.id, name: "Wrong employer" }, /does not belong/u);
@@ -918,14 +960,15 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.deepEqual(empty.summary, { applications: 0, active: 0, offers: 0, awaiting_reply: 0, follow_ups_due: 0, scheduled_stages: 0 });
       assert.deepEqual(empty.applications, []);
       assert.equal(empty.next_offset, null);
+      await scoped("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
       const imported = await scoped("add_jobs", { jobs: [
-        { company: "Pipeline submitted", phase: "application", title: "Engineer", notes: "Private application notes", description: "Long opening description" },
-        { company: "Pipeline referral", phase: "application" },
-        { company: "Pipeline offer", phase: "application" },
-        { company: "Pipeline rejected", phase: "application" },
-        { company: "Pipeline withdrawn", phase: "application" },
-        { company: "Pipeline accepted", phase: "application" },
-        { company: "Pipeline lead" },
+        { company: "Pipeline submitted", phase: "application", eligible_opening: await verifiedOpening("Pipeline submitted", owner), title: "Engineer", notes: "Private application notes", description: "Long opening description" },
+        { company: "Pipeline referral", phase: "application", eligible_opening: await verifiedOpening("Pipeline referral", owner) },
+        { company: "Pipeline offer", phase: "application", eligible_opening: await verifiedOpening("Pipeline offer", owner) },
+        { company: "Pipeline rejected", phase: "application", eligible_opening: await verifiedOpening("Pipeline rejected", owner) },
+        { company: "Pipeline withdrawn", phase: "application", eligible_opening: await verifiedOpening("Pipeline withdrawn", owner) },
+        { company: "Pipeline accepted", phase: "application", eligible_opening: await verifiedOpening("Pipeline accepted", owner) },
+        { company: "Pipeline lead", eligible_opening: await verifiedOpening("Pipeline lead", owner) },
       ] }, jobsSchema);
       const [submitted, referral, offer, rejected, withdrawn, accepted, lead] = imported.jobs;
       assert.ok(submitted && referral && offer && rejected && withdrawn && accepted && lead);
@@ -1012,8 +1055,10 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
 
   test("bulk imports save 44 and 100 employers atomically and reject oversized batches without writes", async () => {
     for (const size of [44, 100]) {
+      const opening = await verifiedOpening(`Bulk ${size}`);
       const jobs = Array.from({ length: size }, (_, index) => ({
         company: `Bulk ${size} employer ${index}`, nickname: `bulk-${size}-${index}`,
+        eligible_opening: { ...opening, source_url: `https://jobs.example/bulk-${size}-${index}` },
       }));
       const imported = await call("add_jobs", { jobs }, jobsSchema);
       assert.deepEqual(imported.jobs.map((job) => job.company).sort(), jobs.map((job) => job.company).sort());
@@ -1023,6 +1068,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal(saved.next_offset, null);
       const conflicting = Array.from({ length: size }, (_, index) => ({
         company: `Bulk rollback ${size} employer ${index}`,
+        eligible_opening: { ...opening, source_url: `https://jobs.example/rollback-${size}-${index}` },
         nickname: index === size - 1 ? `BULK-${size}-0` : `bulk-rollback-${size}-${index}`,
       }));
       await error("add_jobs", { jobs: conflicting }, /already exists/u);

@@ -1,9 +1,66 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("opening migrations preserve history and block unqualified inserts in either phase and employer transitions directly in D1", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      for (const migration of (await readdir("migrations")).filter((name) => name < "0011" && name.endsWith(".sql")).sort()) {
+        db.exec(await readFile(`migrations/${migration}`, "utf8"));
+      }
+      const now = new Date().toISOString();
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, created_at, updated_at)
+          VALUES ('alice', 'legacy', 'Legacy employer', 'lead', 'created', 'updated'),
+            ('alice', 'application', 'Applied employer', 'application', 'created', 'updated');
+        INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'round', 'application', 'Screening', 'created', 'updated');
+        INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)
+          VALUES ('alice', 'feedback', 'round', 'Keep this history', 'created', 'updated');`);
+      const original = db.prepare("SELECT * FROM jobs ORDER BY id").all();
+      const stages = db.prepare("SELECT * FROM stages").all();
+      const feedback = db.prepare("SELECT * FROM feedback").all();
+      db.exec(await readFile("migrations/0011_eligible_openings.sql", "utf8"));
+      db.exec(await readFile("migrations/0012_all_job_openings.sql", "utf8"));
+      assert.deepEqual(db.prepare("SELECT * FROM jobs ORDER BY id").all().map((row) => ({ ...row })), original.map((row) => ({ ...row, eligible_opening: null })));
+      assert.deepEqual(db.prepare("SELECT * FROM stages").all(), stages);
+      assert.deepEqual(db.prepare("SELECT * FROM feedback").all(), feedback);
+      db.prepare("INSERT INTO criteria (user_id, text, updated_at) VALUES ('alice', 'Remote EMEA engineering', ?)").run(now);
+      const proof = {
+        title: "Engineer", description: "Build TypeScript developer tools", source_url: "https://jobs.example/eligible", location: "Remote EMEA",
+        status: "open", eligibility: "eligible", checked_at: now, criteria_updated_at: now, eligibility_reason: "Passes all exclusions",
+      };
+      const insert = db.prepare("INSERT INTO jobs (user_id, id, company, eligible_opening, created_at, updated_at) VALUES (?, ?, 'New employer', ?, 'created', 'updated')");
+      assert.throws(() => insert.run("alice", "invalid", null), /eligible opening/u);
+      assert.throws(() => db.exec("INSERT INTO jobs (user_id, id, company, phase, created_at, updated_at) VALUES ('alice', 'bypass', 'Unqualified application', 'application', 'created', 'updated')"), /eligible opening/u);
+      assert.throws(() => db.exec("UPDATE jobs SET company = 'New application employer' WHERE id IS 'application'"), /eligible opening/u);
+      assert.throws(() => insert.run("bob", "invalid", JSON.stringify(proof)), /current saved criteria/u);
+      for (const invalid of [
+        { status: "closed" }, { eligibility: "excluded" }, { eligibility: "unknown" }, { title: " " },
+        { source_url: "" }, { description: "" }, { location: "" }, { eligibility_reason: "" },
+        { checked_at: "2000-01-01T00:00:00Z" }, { checked_at: "2099-01-01T00:00:00Z" },
+        { criteria_updated_at: "2000-01-01T00:00:00Z" },
+      ]) assert.throws(() => insert.run("alice", "invalid", JSON.stringify({ ...proof, ...invalid })), /CHECK|24 hours|current saved criteria/u);
+      assert.throws(() => db.exec("UPDATE jobs SET phase = 'lead' WHERE id IS 'application'"), /eligible opening/u);
+      assert.throws(() => db.exec("UPDATE jobs SET company = 'Different employer' WHERE id IS 'legacy'"), /eligible opening/u);
+      db.exec("UPDATE jobs SET status = 'withdrawn' WHERE id IS 'legacy'");
+      assert.throws(() => db.exec("UPDATE jobs SET status = 'active' WHERE id IS 'legacy'"), /eligible opening/u);
+      insert.run("alice", "qualified", JSON.stringify(proof));
+      assert.throws(() => insert.run("alice", "duplicate", JSON.stringify(proof)), /UNIQUE/u);
+      db.prepare("UPDATE jobs SET eligible_opening = ?, phase = 'lead' WHERE id IS 'application'")
+        .run(JSON.stringify({ ...proof, source_url: "https://jobs.example/converted" }));
+      db.prepare("UPDATE criteria SET updated_at = ? WHERE user_id IS 'alice'").run(new Date(Date.parse(now) + 1).toISOString());
+      assert.throws(() => insert.run("alice", "stale", JSON.stringify({ ...proof, source_url: "https://jobs.example/stale" })), /current saved criteria/u);
+      assert.deepEqual(db.prepare("SELECT * FROM stages").all(), stages);
+      assert.deepEqual(db.prepare("SELECT * FROM feedback").all(), feedback);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("salary ask migration preserves employer budgets, leaves legacy asks unknown, and constrains amount and units", async () => {
     const db = new DatabaseSync(":memory:");
     try {
