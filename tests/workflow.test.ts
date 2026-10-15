@@ -193,7 +193,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const prompt = await client.getPrompt({ name: "rank_jobs" });
     assert.ok(prompt.messages[0]?.content.type === "text");
     assert.match(prompt.messages[0].content.text, /Remote TypeScript platform work/u);
-    const ranked = await call("list_jobs", { limit: 1 }, jobsSchema);
+    const ranked = await call("list_jobs", { limit: 1 }, v.strictObject(jobsSchema.entries));
     assert.equal(ranked.jobs[0]?.id, google.id);
     assert.equal(ranked.jobs[0]?.created_at, google.created_at);
     assert.equal(ranked.next_offset, 1);
@@ -598,6 +598,17 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         assert.deepEqual(detail.contacts.map((contact) => contact.id), [ownContact.id]);
         assert.deepEqual(detail.outreach.map((outreach) => outreach.id), [owner === alice ? aliceOutreach.id : bobOutreach.id]);
         assert.deepEqual((await scoped(owner, "get_follow_ups", {}, v.object({ follow_ups: v.array(contactOutput) }))).follow_ups.map((contact) => contact.id), [ownContact.id]);
+        const pipeline = await scoped(owner, "get_pipeline", {}, v.object({
+          summary: v.object({ applications: v.number(), awaiting_reply: v.number() }),
+          applications: v.array(v.object({
+            id: v.string(), pending_contacts: v.array(v.object({ id: v.string() })), next_stage: v.object({ id: v.string() }),
+          })),
+        }));
+        assert.equal(pipeline.summary.applications, 1);
+        assert.equal(pipeline.summary.awaiting_reply, 1);
+        assert.deepEqual(pipeline.applications.map((job) => job.id), [ownJob.id]);
+        assert.deepEqual(pipeline.applications[0]?.pending_contacts.map((contact) => contact.id), [ownContact.id]);
+        assert.equal(pipeline.applications[0]?.next_stage.id, ownStage.id);
         const application = await scoped(owner, "get_application_context", { job_id: ownJob.id }, v.strictObject({
           ...applicationOutput.entries, job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput), ...outreachHistory,
         }));
@@ -823,6 +834,116 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups.map((contact) => contact.id), [friend.id]);
     await call("update_job", { job_id: employer.id, status: "withdrawn" }, jobSchema);
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups, []);
+  });
+
+  test("one pipeline read summarizes active applications and offers with compact paginated stages and pending contacts", async () => {
+    const browser = browserFor(endpoint);
+    await enroll(browser);
+    const connection = await authorize(browser);
+    const owner = new Client({ name: "pipeline-test", version: "1" });
+    async function scoped<Schema extends v.GenericSchema>(name: string, args: Record<string, unknown>, schema: Schema) {
+      return parseTool(await owner.callTool({ name, arguments: args }), schema);
+    }
+    const summarySchema = v.strictObject({
+      applications: v.number(), active: v.number(), offers: v.number(), awaiting_reply: v.number(),
+      follow_ups_due: v.number(), scheduled_stages: v.number(),
+    });
+    const pipelineSchema = v.strictObject({
+      as_of: v.pipe(v.string(), v.isoTimestamp()), summary: summarySchema,
+      applications: v.array(v.object({
+        id: v.string(), company: v.string(), current_stage: v.string(), current_stage_status: v.nullable(v.string()),
+        pending_contacts: v.array(v.object({
+          id: v.string(), name: v.string(), relationship: v.string(), url: v.nullable(v.string()),
+          awaiting_reply: v.boolean(), due: v.boolean(), follow_up_at: v.nullable(v.string()),
+          last_interaction_time_basis: v.string(), last_outreach_at: v.nullable(v.string()), last_response_at: v.nullable(v.string()),
+        })),
+        next_stage: v.nullable(v.object({ id: v.string(), name: v.string(), starts_at: v.string() })),
+      })), next_offset: v.nullable(v.number()),
+    });
+    try {
+      await owner.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${connection.token}` } } }));
+      const empty = await scoped("get_pipeline", {}, pipelineSchema);
+      assert.deepEqual(empty.summary, { applications: 0, active: 0, offers: 0, awaiting_reply: 0, follow_ups_due: 0, scheduled_stages: 0 });
+      assert.deepEqual(empty.applications, []);
+      assert.equal(empty.next_offset, null);
+      const imported = await scoped("add_jobs", { jobs: [
+        { company: "Pipeline submitted", phase: "application", title: "Engineer", notes: "Private application notes", description: "Long opening description" },
+        { company: "Pipeline referral", phase: "application" },
+        { company: "Pipeline offer", phase: "application" },
+        { company: "Pipeline rejected", phase: "application" },
+        { company: "Pipeline withdrawn", phase: "application" },
+        { company: "Pipeline accepted", phase: "application" },
+        { company: "Pipeline lead" },
+      ] }, jobsSchema);
+      const [submitted, referral, offer, rejected, withdrawn, accepted, lead] = imported.jobs;
+      assert.ok(submitted && referral && offer && rejected && withdrawn && accepted && lead);
+      for (const [job, status] of [[offer, "offer"], [rejected, "rejected"], [withdrawn, "withdrawn"], [accepted, "accepted"]] as const) {
+        await scoped("update_job", { job_id: job.id, status }, jobSchema);
+      }
+      await scoped("update_job", { job_id: rejected.id, reapply_policy: "allowed" }, jobSchema);
+      await scoped("set_criteria", { text: "Private selection criteria" }, v.unknown());
+      await scoped("set_application_context", { text: "Private applicant document" }, v.unknown());
+      await scoped("set_applicant_profile", { gender: "self-described" }, v.unknown());
+      await scoped("add_stage", { job_id: submitted.id, name: "Application sent", status: "completed" }, stageSchema);
+      await scoped("add_stage", { job_id: submitted.id, name: "Application sent", status: "planned" }, stageSchema);
+      const latest = await scoped("add_stage", { job_id: submitted.id, name: "Application sent", status: "completed" }, stageSchema);
+      const yesterday = new Date(Date.now() - 86_400_000).toISOString();
+      const pastDue = new Date(Date.now() - 3_600_000).toISOString();
+      const tomorrow = new Date(Date.now() + 86_400_000).toISOString();
+      const later = new Date(Date.now() + 2 * 86_400_000).toISOString();
+      for (const job of [lead, rejected, withdrawn, accepted]) {
+        await scoped("record_outreach", { contact: { job_id: job.id, name: "Outside pipeline" }, direction: "outbound", occurred_at: yesterday, follow_up_at: pastDue }, outreachOutput);
+        await scoped("add_stage", { job_id: job.id, name: "Outside pipeline", starts_at: tomorrow }, stageSchema);
+      }
+      const friend = await scoped("record_outreach", {
+        contact: { job_id: referral.id, name: "Example referrer", relationship: "friend/referrer", url: "https://t.me/pipeline_example" },
+        direction: "outbound", occurred_at: yesterday, follow_up_at: pastDue,
+      }, outreachOutput);
+      const hr = await scoped("record_outreach", { contact: { job_id: referral.id, name: "Example HR" }, direction: "outbound", occurred_at: yesterday }, outreachOutput);
+      await scoped("record_outreach", { contact_id: hr.contact_id, direction: "inbound", occurred_at: pastDue }, outreachOutput);
+      const acknowledgement = await scoped("record_outreach", {
+        contact: { job_id: offer.id, name: "Example recruiter" }, direction: "inbound", occurred_at: yesterday, follow_up_at: pastDue,
+      }, outreachOutput);
+      await scoped("add_stage", { job_id: offer.id, name: "Cancelled", starts_at: tomorrow, status: "cancelled", make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: offer.id, name: "Finished", starts_at: yesterday, status: "completed", make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: offer.id, name: "Unscheduled", make_current: false }, stageSchema);
+      const ongoing = await scoped("add_stage", { job_id: offer.id, name: "Ongoing", starts_at: yesterday, status: "in_progress", make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: offer.id, name: "Later interview", starts_at: later, make_current: false }, stageSchema);
+      const soon = await scoped("add_stage", { job_id: referral.id, name: "Screening", starts_at: tomorrow, make_current: false }, stageSchema);
+      const response = await owner.callTool({ name: "get_pipeline", arguments: {} });
+      const pipeline = parseTool(response, pipelineSchema);
+      assert.deepEqual(pipeline.summary, { applications: 3, active: 2, offers: 1, awaiting_reply: 1, follow_ups_due: 2, scheduled_stages: 3 });
+      assert.deepEqual(new Set(pipeline.applications.map((job) => job.id)), new Set([submitted.id, referral.id, offer.id]));
+      const submittedRow = pipeline.applications.find((job) => job.id === submitted.id);
+      assert.ok(submittedRow);
+      assert.equal(submittedRow?.current_stage, latest.name);
+      assert.equal(submittedRow?.current_stage_status, "completed");
+      assert.equal(submittedRow.next_stage, null);
+      const referralRow = pipeline.applications.find((job) => job.id === referral.id);
+      assert.deepEqual(referralRow?.pending_contacts.map((contact) => contact.id), [friend.contact_id]);
+      assert.equal(referralRow?.pending_contacts[0]?.awaiting_reply, true);
+      assert.equal(referralRow?.pending_contacts[0]?.due, true);
+      assert.equal(referralRow?.pending_contacts[0]?.last_interaction_time_basis, "reported");
+      assert.equal(referralRow?.next_stage?.id, soon.id);
+      const offerRow = pipeline.applications.find((job) => job.id === offer.id);
+      assert.equal(offerRow?.pending_contacts[0]?.id, acknowledgement.contact_id);
+      assert.equal(offerRow?.pending_contacts[0]?.awaiting_reply, false);
+      assert.equal(offerRow?.next_stage?.id, ongoing.id);
+      assert.ok(response.content[0]?.type === "text");
+      assert.doesNotMatch(response.content[0].text, /Private |Long opening|"criteria"|"notes"|"description"|"applicant_profile"|"cvs"/u);
+      const page = await scoped("get_pipeline", { limit: 1 }, pipelineSchema);
+      assert.deepEqual(page.summary, pipeline.summary);
+      assert.equal(page.next_offset, 1);
+      const second = await scoped("get_pipeline", { limit: 1, offset: 1 }, pipelineSchema);
+      const third = await scoped("get_pipeline", { limit: 1, offset: 2 }, pipelineSchema);
+      assert.deepEqual([page, second, third].flatMap((part) => part.applications), pipeline.applications);
+      assert.equal(third.next_offset, null);
+      const emptyPage = await scoped("get_pipeline", { offset: 3 }, pipelineSchema);
+      assert.deepEqual(emptyPage.applications, []);
+      assert.deepEqual(emptyPage.summary, pipeline.summary);
+    } finally {
+      await owner.close();
+    }
   });
 
   test("invalid batch sizes are rejected before accessing D1", async () => {

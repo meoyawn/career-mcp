@@ -1,4 +1,4 @@
-import { maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type FollowUps, type ListFeedback, type ListJobs, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
+import { maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type FollowUps, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -128,6 +128,24 @@ interface ContactActivity extends Contact {
   needs_follow_up: number;
   follow_up_at: string | null;
 }
+
+interface PipelineSummary {
+  applications: number;
+  active: number;
+  offers: number;
+  awaiting_reply: number;
+  follow_ups_due: number;
+  scheduled_stages: number;
+}
+
+interface PipelineJob extends Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at" | "salary_min" | "salary_max" | "salary_currency" | "salary_period"> {
+  current_stage_status: string | null;
+  last_outreach_at: string | null;
+  last_response_at: string | null;
+}
+
+type PipelineContact = Pick<ContactActivity, "id" | "job_id" | "name" | "relationship" | "url" | "email" | "awaiting_reply" | "follow_up_at" | "last_interaction_at" | "last_interaction_time_basis" | "last_outreach_at" | "last_response_at">;
+type PipelineStage = Pick<Stage, "id" | "job_id" | "name" | "status" | "starts_at" | "ends_at" | "timezone">;
 
 function fail(message: string): never {
   throw new Error(message, { cause: "user" });
@@ -291,6 +309,62 @@ export async function getJob(scope: UserStore, id: string) {
 }
 
 const searchPattern = (query: string) => `%${query.replace(/[\\%_]/gu, "\\$&")}%`;
+
+export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
+  const asOf = new Date().toISOString();
+  const scope = "SELECT * FROM jobs WHERE user_id IS ? AND phase IS 'application' AND status IN ('active', 'offer')";
+  const page = `${scope} ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`;
+  const scheduled = `s.status IN ('planned', 'in_progress') AND s.starts_at IS NOT NULL
+    AND (s.starts_at >= ? OR s.ends_at > ? OR (s.status IS 'in_progress' AND s.ends_at IS NULL))`;
+  const [summary, jobs, contacts, stages] = await db.batch([
+    db.prepare(`WITH pipeline AS (${scope}) SELECT COUNT(*) AS applications,
+      COUNT(CASE WHEN j.status IS 'active' THEN 1 END) AS active,
+      COUNT(CASE WHEN j.status IS 'offer' THEN 1 END) AS offers,
+      COUNT(CASE WHEN EXISTS (SELECT 1 FROM contact_activity c
+        WHERE c.user_id IS j.user_id AND c.job_id IS j.id AND c.awaiting_reply IS 1) THEN 1 END) AS awaiting_reply,
+      (SELECT COUNT(*) FROM contact_activity c JOIN pipeline p ON p.user_id IS c.user_id AND p.id IS c.job_id
+        WHERE c.needs_follow_up IS 1 AND c.follow_up_at <= ?) AS follow_ups_due,
+      (SELECT COUNT(*) FROM stages s JOIN pipeline p ON p.user_id IS s.user_id AND p.id IS s.job_id
+        WHERE ${scheduled}) AS scheduled_stages
+      FROM pipeline j`).bind(userId, asOf, asOf, asOf),
+    db.prepare(`WITH pipeline AS (${page}) SELECT j.id, j.company, j.title, j.source_url, j.status,
+      j.current_stage, current.status AS current_stage_status, j.recruiter_engaged_at,
+      j.salary_min, j.salary_max, j.salary_currency, j.salary_period,
+      (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'outbound') AS last_outreach_at,
+      (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'inbound') AS last_response_at
+      FROM pipeline j LEFT JOIN stages current ON current.user_id IS j.user_id AND current.id IS (
+        SELECT s.id FROM stages s WHERE s.user_id IS j.user_id AND s.job_id IS j.id AND s.name IS j.current_stage
+        ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1)
+      ORDER BY j.updated_at DESC, j.id`).bind(userId, input.limit + 1, input.offset),
+    db.prepare(`WITH pipeline AS (${page}) SELECT c.id, c.job_id, c.name, c.relationship, c.url, c.email,
+      c.awaiting_reply, c.follow_up_at, c.last_interaction_at, c.last_interaction_time_basis,
+      c.last_outreach_at, c.last_response_at
+      FROM contact_activity c JOIN pipeline j ON j.user_id IS c.user_id AND j.id IS c.job_id
+      WHERE c.needs_follow_up IS 1
+      ORDER BY (j.recruiter_engaged_at IS NOT NULL), c.follow_up_at ASC NULLS LAST, c.last_outreach_at, c.id`)
+      .bind(userId, input.limit, input.offset),
+    db.prepare(`WITH pipeline AS (${page}), scheduled AS (
+      SELECT s.id, s.job_id, s.name, s.status, s.starts_at, s.ends_at, s.timezone,
+        ROW_NUMBER() OVER (PARTITION BY s.job_id ORDER BY s.starts_at, s.id) AS position
+      FROM stages s JOIN pipeline j ON j.user_id IS s.user_id AND j.id IS s.job_id WHERE ${scheduled})
+      SELECT id, job_id, name, status, starts_at, ends_at, timezone FROM scheduled WHERE position IS 1`)
+      .bind(userId, input.limit, input.offset, asOf, asOf),
+  ]) as [D1Result<PipelineSummary>, D1Result<PipelineJob>, D1Result<PipelineContact>, D1Result<PipelineStage>];
+  return {
+    as_of: asOf,
+    summary: summary.results[0],
+    applications: jobs.results.slice(0, input.limit).map((job) => ({
+      ...job,
+      pending_contacts: contacts.results.filter((contact) => contact.job_id === job.id).map(({ job_id: _jobId, ...contact }) => ({
+        ...contact,
+        awaiting_reply: contact.awaiting_reply === 1,
+        due: contact.follow_up_at !== null && contact.follow_up_at <= asOf,
+      })),
+      next_stage: stages.results.find((stage) => stage.job_id === job.id) ?? null,
+    })),
+    next_offset: jobs.results.length > input.limit ? input.offset + input.limit : null,
+  };
+}
 
 export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
   const where: string[] = [];

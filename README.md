@@ -70,12 +70,15 @@ WebAuthn requires discoverable credentials and user verification. Challenges are
 
 ## Workflow and tools
 
-The server's MCP instructions tell the agent to choose context by task. `get_lead_context` loads selection criteria and a page of available opportunities for discovery, sorting, and ranking: active records plus rejected applications now eligible to reapply. Criteria also appear in `list_jobs`, the `careers://criteria` resource, and the `rank_jobs` prompt. These responses exclude applicant context and CV URLs.
+The server's MCP instructions tell the agent to choose context by task. `get_pipeline` answers current/active pipeline and progress questions in one compact read: full counts, active/offer applications, current stage outcomes, pending contacts and follow-up dates, and the next scheduled stage per application. It excludes untouched leads, closed applications (including eligible reapplications), long notes, selection criteria, and applicant documents. `as_of` supplies server time. Defaults to 25 applications ordered by last update; `limit`/`offset` paginate application rows while counts always cover the whole active application pipeline. `awaiting_reply` counts applications with an unanswered contact; `follow_ups_due` counts due contacts, including explicitly pending actions after an inbound reply. `scheduled_stages` counts future or ongoing planned/in-progress stages; each row includes only the next one. Stage names remain free text; the server does not infer a submitted application or interview from a label. Use `get_job` for history, `get_follow_ups` for targeted waits, and `get_upcoming` for a complete schedule.
+
+`get_lead_context` loads selection criteria and a page of available opportunities for discovery, sorting, and ranking: active records plus rejected applications now eligible to reapply. Criteria also appear in the `careers://criteria` resource and the `rank_jobs` prompt. `list_jobs` returns jobs and pagination only, avoiding repeated criteria on ordinary searches and subsequent pages. These responses exclude applicant context and CV URLs.
 
 `get_application_context` loads a separate natural-language document with the applicant's background, factual answers, and cover-letter or form-filling preferences, plus CV URLs keyed by language. Optional `job_id` adds that employer or application's details, stages, and feedback. It excludes selection criteria and unrelated leads. `get_job` returns the employer or application and its history. The `careers://application-context` resource exposes the same applicant document and CV URLs. Clients need to call a tool or read a resource to put saved data into the model's context. `get_lead_context` replaces the former `get_context` tool.
 
 | Tool | Purpose |
 | --- | --- |
+| `get_pipeline` | Answer active pipeline/progress questions in one compact read, with counts, stage outcomes, waiting contacts, and next scheduled stages. |
 | `get_lead_context` | Load selection criteria and active leads for discovery, sorting, and ranking. |
 | `set_criteria` | Save or replace the user's single natural-language criteria document. |
 | `get_application_context` | Load applicant profile, email/phone, context, and CV URLs, optionally with one job's history. |
@@ -130,7 +133,7 @@ Stage names are free text. `add_stage.make_current` defaults to true; `update_st
 
 There is no qualification column, pending review queue, or `qualify_jobs` tool. A stored lead records an opportunity rather than proving eligibility. The Worker validates input and persists imports; criteria are an agent workflow for discovery and ranking, not an intake gate.
 
-`list_jobs`, `list_feedback`, `get_follow_ups`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. Read all pages before saving rankings: changing scores reorders results.
+`get_pipeline`, `list_jobs`, `list_feedback`, `get_follow_ups`, and `get_upcoming` return `next_offset` when another page exists. Pass it as `offset` with the same filters. Pipeline counts cover all active/offer applications regardless of the page. The ranking prompt accepts string `limit` (1–25) and `offset` arguments. Read all pages before saving rankings: changing scores reorders results.
 
 ## Rejection cooldowns and reapplication
 

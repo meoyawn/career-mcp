@@ -35,6 +35,7 @@ export const cvSchema = v.strictObject({
   url: v.nullable(url),
 });
 export const jobIdSchema = v.strictObject({ job_id: id });
+export const pipelineSchema = v.strictObject({ limit, offset });
 
 export const addJobSchema = v.strictObject({
   ...salaryFields,
@@ -211,6 +212,7 @@ export const rankPromptSchema = v.strictObject({
 
 export type AddJobs = v.InferOutput<typeof addJobsSchema>;
 export type ListJobs = v.InferOutput<typeof listJobsSchema>;
+export type Pipeline = v.InferOutput<typeof pipelineSchema>;
 export type SetApplicantContact = v.InferOutput<typeof applicantContactSchema>;
 export type UpdateJob = v.InferOutput<typeof updateJobSchema>;
 export type AddStage = v.InferOutput<typeof addStageSchema>;
