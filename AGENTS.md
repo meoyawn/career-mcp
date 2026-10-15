@@ -1,4 +1,8 @@
 # Rules
 
-- ensure private info and secrets are gitignored
+- **Never put secrets or private information in Git.** This includes active deployment URLs/hostnames, Cloudflare account and resource IDs, personal authentication profile names, credentials/tokens, applicant details, CV links, contacts, job-search records, and database/query exports. Treat deployment addresses and IDs as private even if a provider calls them public configuration.
+- Keep the active deployment in Git-ignored `wrangler.deploy.jsonc`; keep credentials in Git-ignored `.env.deploy` or Wrangler's user configuration. Save private notes, imports, exports, and reports only under ignored `private/` or `backups/`. Confirm a private path is ignored with `git check-ignore` before writing it. Never force-add ignored files.
+- Tracked `wrangler.jsonc` is local-only configuration with synthetic IDs. Documentation, examples, fixtures, generated types, and scripts must contain only placeholders or synthetic data; use localhost or reserved example domains for URLs. Never copy an active address or ID into this file, even to document what must remain secret.
+- Deployments and remote database commands must explicitly use `wrangler.deploy.jsonc` and fail if it is missing. Local development, checks, tests, builds, and type generation must use the sanitized configuration and must not load deployment credentials.
+- Before committing or pushing, inspect the complete staged diff and scan tracked content for secrets and private deployment/user data. Check generated files too. Do not print private values in shared logs, commit messages, PRs, or command arguments. Removing a value from current files does not erase Git history; check historical commits and report any remaining exposure.
 - Deploy with `task deploy` (server deployment plus CareerMCP tool refresh), then create a new Codex thread to verify the refreshed tools; existing threads retain cached tool schemas.

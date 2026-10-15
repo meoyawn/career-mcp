@@ -9,6 +9,10 @@ dist/
 !.env.deploy.example
 # Deployment credentials stay local, including when the example is copied.
 .env.deploy
+# Active deployment configuration and local overrides are private.
+wrangler.deploy.*
+wrangler.local.*
+.DS_Store
 *.log
 *.db
 *.db-shm

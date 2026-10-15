@@ -28,8 +28,8 @@ async function main() {
   const deployEnv = new URL("../.env.deploy", import.meta.url);
   if (existsSync(deployEnv)) process.loadEnvFile(deployEnv);
   // A subquery only accepts a read, including when the input starts with WITH.
-  const { stdout } = await execute(process.execPath, [wrangler, "d1", "execute", "careers", "--remote",
-    "--config", fileURLToPath(new URL("../wrangler.jsonc", import.meta.url)),
+  const { stdout } = await execute(process.execPath, [wrangler, "d1", "execute", "DB", "--remote",
+    "--config", fileURLToPath(new URL("../wrangler.deploy.jsonc", import.meta.url)),
     "--command", `SELECT * FROM (\n${sql}\n)`, "--json"], {
     cwd: root,
     env: { ...process.env, WRANGLER_SEND_METRICS: "false" },

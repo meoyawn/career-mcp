@@ -36,9 +36,18 @@ The account page lets you add another passkey, sign out, or disconnect all MCP c
 
 ## Deploy
 
-The checked-in configuration targets the maintainer's personal Cloudflare account (`00000000000000000000000000000000`), Worker `example-worker`, and D1 database `careers`. Keep account and database IDs in ignored local configuration. Forks should replace both IDs with their own before deploying.
+The tracked `wrangler.jsonc` is for local development only. It has a synthetic database ID, no Cloudflare account ID, and disabled public deployment URLs. Active deployment hostnames, Worker names, account/database IDs, personal auth profiles, credentials, and user data are private: keep them out of Git, documentation, examples, fixtures, and generated files.
 
-For this checkout, Wrangler's existing `example-profile` OAuth profile is bound to the repository directory. Its credentials and directory binding live in Wrangler's user configuration outside Git. To authenticate a new checkout, create and activate your own profile:
+Create a private deployment configuration locally:
+
+```fish
+cp wrangler.jsonc wrangler.deploy.jsonc
+chmod 600 wrangler.deploy.jsonc
+```
+
+Edit only the ignored `wrangler.deploy.jsonc`: set your Worker name, `account_id`, and D1 `database_name`/`database_id`; enable `workers_dev` or configure your own routes as needed. Keep `binding: "DB"`. The file lives beside the tracked config, so source and migration paths stay the same. Never put active settings back into `wrangler.jsonc`.
+
+Authenticate using your own local Wrangler profile:
 
 ```fish
 aube install --frozen-lockfile
@@ -46,21 +55,23 @@ aube exec -- wrangler auth create example-profile --scopes user:read account:rea
 aube exec -- wrangler auth activate example-profile
 ```
 
-Select your intended account in the browser. To refresh an expired profile, run `wrangler auth create` with the same name and scopes again. The extra `--` after `aube exec` forwards flags to Wrangler.
+Choose your account in the browser and use your own profile name locally. Wrangler stores credentials and directory bindings outside Git. To refresh an expired profile, repeat `wrangler auth create` with the same name and scopes. The extra `--` after `aube exec` forwards flags to Wrangler.
 
-For API-token authentication instead, copy `.env.deploy.example` to `.env.deploy`, restrict it with `chmod 600 .env.deploy`, and enter your token locally. Scope it to the intended account with Workers Scripts:Edit and D1:Edit; Account Settings:Read supports account discovery. `.env.deploy` and other `.env.*` files are Git-ignored; only the placeholder example is tracked. The remote migration and publish commands load `.env.deploy` through Node, so deploy credentials are not loaded by local development, type generation, or bundled into the Worker. CI can supply `CLOUDFLARE_API_TOKEN` as an encrypted secret environment variable instead; existing environment variables take precedence over the file. Never put tokens in Wrangler config, command arguments, or committed files.
+For API-token authentication instead, copy `.env.deploy.example` to `.env.deploy`, restrict it with `chmod 600 .env.deploy`, and enter your token locally. Scope it to the intended account with Workers Scripts:Edit and D1:Edit; Account Settings:Read supports account discovery. Only the placeholder example is tracked. Remote migration and publish commands load `.env.deploy` through Node; local development, type generation, and builds do not load it. CI can supply `CLOUDFLARE_API_TOKEN` as an encrypted secret environment variable instead; existing environment variables take precedence over the file. Never put tokens in Wrangler config, command arguments, or committed files.
 
-Once authenticated, every deployment uses the Taskfile workflow:
+Once configured and authenticated, every deployment uses the Taskfile workflow:
 
 ```fish
 task deploy
 ```
 
-This runs type checking, lint, integration tests, and a bundle dry run before applying pending remote D1 migrations and publishing the Worker, then refreshes CareerMCP tools with `mcp-refresh refresh CareerMCP`. Create a new Codex thread afterward to verify through the refreshed tools; existing threads retain their cached schemas. A failed step stops the workflow. Already-applied migrations are skipped on subsequent runs. Migrations and publishing are separate operations: if publishing fails after a migration succeeds, fix the failure and rerun; future schema changes should remain compatible with the currently deployed Worker.
+The task requires the ignored deployment config. It runs type checking, lint, integration tests, and a bundle dry run with the sanitized local config before applying remote D1 migrations and publishing with explicit `--config wrangler.deploy.jsonc`, then refreshes CareerMCP tools with `mcp-refresh refresh CareerMCP`. Remote commands fail if the private config is missing. Create a new Codex thread afterward to verify through the refreshed tools; existing threads retain their cached schemas.
 
-For a new account, create the database once with `aube exec -- wrangler d1 create careers --update-config=false`, set its `database_id` in `wrangler.jsonc`, and run `aube run types` before deploying. Local and remote D1 storage are separate.
+A failed step stops the workflow. Already-applied migrations are skipped on subsequent runs. Migrations and publishing are separate operations: if publishing fails after a migration succeeds, fix the failure and rerun; future schema changes should remain compatible with the currently deployed Worker.
 
-The maintainer's deployment is [mcp.example.com](https://mcp.example.com/). Connect your MCP client to `https://mcp.example.com/mcp` and sign in with a passkey. Forks should use the hostname printed by their deployment. Users, credential public keys, challenges, sessions, clients, and OAuth grants all use this same D1 database; no extra database, KV namespace, or identity provider is needed. Verify a deployment with `curl --fail https://mcp.example.com/health` (returns `{"ok":true}`).
+For a new account, create the database once with `aube exec -- wrangler d1 create example-database --config wrangler.deploy.jsonc --update-config=false`, then set the returned name and ID only in `wrangler.deploy.jsonc`. Local and remote D1 storage are separate. Generate types with `aube run types`, which explicitly uses the sanitized local config and placeholder environment file.
+
+Use the address from your private deployment settings to connect an MCP client at `/mcp` and check `/health` (returns `{"ok":true}`). For example, a placeholder endpoint is `https://mcp.example.com/mcp`. Keep the real address and deployment output only in ignored local notes under `private/`. Users, credential public keys, challenges, sessions, clients, and OAuth grants use the same private D1 database; no extra database, KV namespace, or identity provider is needed.
 
 The deploy command applies `0001_initial.sql` before the first publication. It creates the complete user-scoped CRM and passkey/OAuth schema in one migration.
 
@@ -165,7 +176,7 @@ Migration `0006_outreach.sql` adds the contact and communication tables, indexed
 
 ## Read-only database queries
 
-`scripts/d1.ts` uses this checkout's Wrangler authentication and remote `careers` database. It also loads `.env.deploy` when present. It accepts one `SELECT` or read-only CTE, wraps it in a subquery so SQL writes cannot execute, and checks that D1 reports no writes.
+`scripts/d1.ts` uses this checkout's Wrangler authentication and the remote `DB` binding in the ignored `wrangler.deploy.jsonc`; it fails if that config is missing. It also loads `.env.deploy` when present. It accepts one `SELECT` or read-only CTE, wraps it in a subquery so SQL writes cannot execute, and checks that D1 reports no writes.
 
 ```fish
 node scripts/d1.ts 'SELECT COUNT(*) AS count FROM jobs'

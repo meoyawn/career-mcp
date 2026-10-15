@@ -4,6 +4,8 @@ tasks:
   deploy:
     desc: Deploy the Worker and refresh CareerMCP tools in ChatGPT
     preconditions:
+      - sh: test -f wrangler.deploy.jsonc
+        msg: Create the ignored wrangler.deploy.jsonc with your private deployment settings before deploying.
       - sh: command -v mcp-refresh >/dev/null 2>&1
         msg: Install mcp-refresh and add it to PATH before deploying.
     cmds:
