@@ -6,11 +6,19 @@ const email = v.pipe(v.string(), v.email(), v.maxLength(320));
 const url = v.pipe(v.string(), v.url(), v.regex(/^https?:\/\/[\s\S]*$/, "Use an HTTP or HTTPS URL."), v.maxLength(2_000));
 const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
+const phase = v.picklist(["lead", "application"]);
 const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
 const source = v.picklist(["self", "recruiter", "interviewer"]);
 const limit = v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100)), 25);
 const offset = v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100_000)), 0);
+const salaryAmount = v.pipe(v.number(), v.minValue(0), v.maxValue(Number.MAX_SAFE_INTEGER));
+const salaryFields = {
+  salary_min: v.optional(v.nullable(salaryAmount)),
+  salary_max: v.optional(v.nullable(salaryAmount)),
+  salary_currency: v.optional(v.nullable(v.pipe(v.string(), v.regex(/^[A-Z]{3}$/, "Use a three-letter uppercase currency code, such as USD, EUR, or RUB.")))),
+  salary_period: v.optional(v.nullable(v.picklist(["hour", "day", "week", "month", "year"]))),
+};
 
 export const emptySchema = v.strictObject({});
 export const criteriaSchema = v.strictObject({ text: text(20_000) });
@@ -23,10 +31,13 @@ export const cvSchema = v.strictObject({
 export const jobIdSchema = v.strictObject({ job_id: id });
 
 export const addJobSchema = v.strictObject({
+  ...salaryFields,
   company: text(200),
-  title: text(300),
+  company_url: v.optional(url),
+  phase: v.optional(phase, "lead"),
+  title: v.optional(text(300)),
   nickname: v.optional(text(200)),
-  description: text(30_000),
+  description: v.optional(text(30_000)),
   source_url: v.optional(url),
   location: v.optional(text(500)),
   recruiter_name: v.optional(text(200)),
@@ -42,17 +53,21 @@ export const addJobsSchema = v.strictObject({
 export const listJobsSchema = v.strictObject({
   query: v.optional(text(300)),
   status: v.optional(jobStatus),
+  phase: v.optional(phase),
   include_descriptions: v.optional(v.boolean(), false),
   limit,
   offset,
 });
 
 export const updateJobSchema = v.strictObject({
+  ...salaryFields,
   job_id: id,
   company: v.optional(text(200)),
-  title: v.optional(text(300)),
+  company_url: v.optional(v.nullable(url)),
+  phase: v.optional(phase),
+  title: v.optional(v.nullable(text(300))),
   nickname: v.optional(v.nullable(text(200))),
-  description: v.optional(text(30_000)),
+  description: v.optional(v.nullable(text(30_000))),
   source_url: v.optional(v.nullable(url)),
   location: v.optional(v.nullable(text(500))),
   recruiter_name: v.optional(v.nullable(text(200))),

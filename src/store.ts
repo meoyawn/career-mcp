@@ -24,9 +24,11 @@ interface CV {
 interface Job {
   id: string;
   company: string;
-  title: string;
+  company_url: string | null;
+  phase: "lead" | "application";
+  title: string | null;
   nickname: string | null;
-  description: string;
+  description: string | null;
   source_url: string | null;
   location: string | null;
   recruiter_name: string | null;
@@ -35,6 +37,10 @@ interface Job {
   status: string;
   current_stage: string;
   score: number | null;
+  salary_min: number | null;
+  salary_max: number | null;
+  salary_currency: string | null;
+  salary_period: "hour" | "day" | "week" | "month" | "year" | null;
   created_at: string;
   updated_at: string;
 }
@@ -115,14 +121,36 @@ function duplicateError(error: unknown): never {
   throw error;
 }
 
+function validateOpening(phase: Job["phase"], input: Pick<UpdateJob, "title" | "description" | "source_url" | "location">) {
+  if (phase === "lead" && [input.title, input.description, input.source_url, input.location].some((value) => value != null)) {
+    fail("Opening details can only be stored during an application. Save the employer alone as a lead; set phase to application only when the user starts applying.");
+  }
+}
+
+function validateSalary(input: Pick<UpdateJob, "salary_min" | "salary_max" | "salary_currency" | "salary_period">) {
+  const { salary_min: min, salary_max: max, salary_currency: currency, salary_period: period } = input;
+  if ([min, max, currency, period].every((value) => value == null)) return;
+  if ((min == null && max == null) || currency == null || period == null) {
+    fail("Salary needs at least one amount, a currency, and a pay period. Clear all four salary fields to remove it.");
+  }
+  if (min != null && max != null && min > max) fail("salary_min must not exceed salary_max.");
+}
+
 export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   const { db, userId } = scope;
   const now = new Date().toISOString();
+  for (const job of jobs) {
+    validateOpening(job.phase, job);
+    validateSalary(job);
+  }
   const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
-    (user_id, id, company, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
-    userId, crypto.randomUUID(), job.company, job.title, job.nickname ?? null, job.description, job.source_url ?? null,
-    job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null, now, now,
+    (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
+      salary_min, salary_max, salary_currency, salary_period, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
+    userId, crypto.randomUUID(), job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "application",
+    job.title ?? null, job.nickname ?? null, job.description ?? null, job.source_url ?? null,
+    job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null,
+    job.salary_min ?? null, job.salary_max ?? null, job.salary_currency ?? null, job.salary_period ?? null, now, now,
   ));
   try {
     const results = await db.batch<Job>(statements);
@@ -166,8 +194,9 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     bindings.push(pattern, pattern, pattern);
   }
   if (input.status) { where.push("status IS ?"); bindings.push(input.status); }
-  const columns = input.include_descriptions ? "*" : `id, company, title, nickname, source_url, location,
-    recruiter_name, recruiter_email, notes, status, current_stage, score,
+  if (input.phase) { where.push("phase IS ?"); bindings.push(input.phase); }
+  const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, title, nickname, source_url, location,
+    recruiter_name, recruiter_email, notes, status, current_stage, score, salary_min, salary_max, salary_currency, salary_period,
     created_at, updated_at`;
   const results = await db.prepare(`SELECT ${columns} FROM jobs
     WHERE ${where.join(" AND ")} ORDER BY score DESC NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
@@ -187,8 +216,19 @@ function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "f
 }
 
 export async function updateJob(scope: UserStore, input: UpdateJob) {
-  await requireJob(scope, input.job_id);
+  const job = await requireJob(scope, input.job_id);
   const { job_id, ...patch } = input;
+  validateOpening(input.phase ?? job.phase, input);
+  validateSalary({ ...job, ...patch });
+  if (input.phase === "lead") {
+    patch.title = null;
+    patch.description = null;
+    patch.source_url = null;
+    patch.location = null;
+    patch.current_stage = "lead";
+  } else if (input.phase === "application" && job.phase === "lead" && patch.current_stage === undefined) {
+    patch.current_stage = "application";
+  }
   // Scores for changed descriptions must come from a new ranking.
   const invalidates = [input.company, input.title, input.description, input.location].some((value) => value !== undefined);
   if (invalidates && patch.score === undefined) patch.score = null;
@@ -321,11 +361,11 @@ export async function getCalendarEvent(scope: UserStore, input: CalendarEvent) {
   ];
   const event = {
     calendar_id: calendarId,
-    title: `${job.company} — ${stage.name} (${job.title})`,
+    title: `${job.company} — ${stage.name}${job.title ? ` (${job.title})` : ""}`,
     start_time: stage.starts_at,
     end_time: stage.ends_at,
     timezone_str: "UTC",
-    description: `Company: ${job.company}\nRole: ${job.title}\nStage: ${stage.name}${job.source_url ? `\nOpening: ${job.source_url}` : ""}\nCareers MCP stage: ${stage.id}`,
+    description: `Company: ${job.company}${job.title ? `\nRole: ${job.title}` : ""}\nStage: ${stage.name}${job.source_url ? `\nOpening: ${job.source_url}` : ""}\nCareers MCP stage: ${stage.id}`,
     location: stage.location,
   };
   return {
