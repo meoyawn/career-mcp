@@ -10,6 +10,11 @@ const phase = v.picklist(["lead", "application"]);
 const reapplyStatus = v.picklist(["not_applicable", "unknown", "not_allowed", "cooldown", "eligible"]);
 const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
+export const pipelineStageSchema = v.picklist([
+  "applied", "outreach", "recruiter_screen", "assessment", "technical_interview",
+  "system_design", "hiring_manager", "final_interview", "reference_check", "offer",
+], "Choose a predefined pipeline milestone. Prepared forms, drafts, and browser handoffs are not pipeline stages.");
+const currentStage = v.picklist(["lead", ...pipelineStageSchema.options]);
 const source = v.picklist(["self", "recruiter", "interviewer"]);
 const limit = v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100)), 25);
 const offset = v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100_000)), 0);
@@ -109,7 +114,7 @@ export const updateJobSchema = v.strictObject({
   recruiter_email: v.optional(v.nullable(email)),
   notes: v.optional(v.nullable(text(20_000))),
   status: v.optional(jobStatus),
-  current_stage: v.optional(text(200)),
+  current_stage: v.optional(currentStage),
   recruiter_engaged_at: v.optional(v.nullable(timestamp)),
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),
   reapply_after: v.optional(v.nullable(timestamp)),
@@ -117,7 +122,7 @@ export const updateJobSchema = v.strictObject({
 });
 
 const stageFields = {
-  name: text(200),
+  name: pipelineStageSchema,
   status: stageStatus,
   starts_at: v.nullable(timestamp),
   ends_at: v.nullable(timestamp),

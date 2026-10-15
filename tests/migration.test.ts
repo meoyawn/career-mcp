@@ -4,6 +4,57 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("pipeline milestone guards reject arbitrary database writes without rewriting legacy histories", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      for (const migration of (await readdir("migrations")).filter((name) => name < "0011" && name.endsWith(".sql")).sort()) {
+        db.exec(await readFile(`migrations/${migration}`, "utf8"));
+      }
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, current_stage, created_at, updated_at)
+          VALUES ('alice', 'legacy', 'Example employer', 'application', 'Prepared — awaiting human submission', 'created', 'updated');
+        INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'legacy-round', 'legacy', 'Custom historical round', 'created', 'updated');
+        INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)
+          VALUES ('alice', 'reflection', 'legacy-round', 'Preserve this feedback', 'created', 'updated');`);
+      db.exec(await readFile("migrations/0011_eligible_openings.sql", "utf8"));
+      db.exec(await readFile("migrations/0012_all_job_openings.sql", "utf8"));
+      const jobs = db.prepare("SELECT * FROM jobs").all();
+      const stages = db.prepare("SELECT * FROM stages").all();
+      const feedback = db.prepare("SELECT * FROM feedback").all();
+      db.exec(await readFile("migrations/0013_pipeline_milestones.sql", "utf8"));
+      assert.deepEqual(db.prepare("SELECT * FROM jobs").all(), jobs);
+      assert.deepEqual(db.prepare("SELECT * FROM stages").all(), stages);
+      assert.deepEqual(db.prepare("SELECT * FROM feedback").all(), feedback);
+      db.exec("UPDATE jobs SET notes = 'Historical label needs review' WHERE id IS 'legacy'");
+      db.exec("UPDATE stages SET status = 'completed' WHERE id IS 'legacy-round'");
+      const now = new Date().toISOString();
+      db.prepare("INSERT INTO criteria (user_id, text, updated_at) VALUES ('alice', 'Remote engineering', ?)").run(now);
+      const proof = JSON.stringify({
+        title: "Engineer", description: "Build developer tools", source_url: "https://jobs.example/fixed-milestones", location: "Remote",
+        status: "open", eligibility: "eligible", checked_at: now, criteria_updated_at: now, eligibility_reason: "Passes all exclusions",
+      });
+      const insertJob = db.prepare("INSERT INTO jobs (user_id, id, company, current_stage, eligible_opening, created_at, updated_at) VALUES ('alice', 'new', 'New employer', ?, ?, 'created', 'updated')");
+      const insertStage = db.prepare("INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at) VALUES ('alice', 'new-round', 'legacy', ?, 'created', 'updated')");
+      for (const invalid of ["prepared", "Prepared — awaiting human submission", "draft", "arbitrary milestone"]) {
+        assert.throws(() => insertJob.run(invalid, proof), /predefined pipeline milestone/u);
+        assert.throws(() => db.prepare("UPDATE jobs SET current_stage = ? WHERE id IS 'legacy'").run(invalid), /predefined pipeline milestone/u);
+        assert.throws(() => insertStage.run(invalid), /predefined pipeline milestone/u);
+        assert.throws(() => db.prepare("UPDATE stages SET name = ? WHERE id IS 'legacy-round'").run(invalid), /predefined pipeline milestone/u);
+      }
+      insertJob.run("lead", proof);
+      insertStage.run("applied");
+      db.exec("UPDATE stages SET name = 'recruiter_screen' WHERE id IS 'new-round'");
+      db.exec("UPDATE jobs SET current_stage = 'recruiter_screen' WHERE id IS 'legacy'");
+      assert.equal(db.prepare("SELECT current_stage FROM jobs WHERE id IS 'legacy'").get()?.current_stage, "recruiter_screen");
+      assert.equal(db.prepare("SELECT name FROM stages WHERE id IS 'new-round'").get()?.name, "recruiter_screen");
+      assert.deepEqual(db.prepare("SELECT * FROM feedback").all(), feedback);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("opening migrations preserve history and block unqualified inserts in either phase and employer transitions directly in D1", async () => {
     const db = new DatabaseSync(":memory:");
     try {

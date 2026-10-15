@@ -183,7 +183,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(criteria.text, text);
     await error("set_criteria", { text: " \t\r\n" }, /non-blank/u);
     await error("set_criteria", { text: "x".repeat(20_001) }, /length|characters/u);
-    assert.equal(google.current_stage, "application");
+    assert.equal(google.current_stage, "applied");
     assert.equal(google.score, 95);
     assert.equal(google.source_url, opening.source_url);
     const imported = await call("add_jobs", { jobs: [
@@ -323,7 +323,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
     await error("add_jobs", { jobs: [{ company: "Lead batch rollback", eligible_opening: await verifiedOpening("Lead batch rollback") }, { company: "Forbidden batch", title: "Engineer" }] }, /application/u);
     assert.deepEqual((await call("list_jobs", { query: "Lead batch rollback" }, jobsSchema)).jobs, []);
-    await call("update_job", { job_id: lead.id, current_stage: "shortlisted" }, jobSchema);
+    await call("update_job", { job_id: lead.id, current_stage: "outreach" }, jobSchema);
     await error("update_job", { job_id: lead.id, ...fields }, /application/u);
     await call("update_job", { job_id: lead.id, phase: "application", eligible_opening: eligibleOpening, ...fields }, jobSchema);
     const application = await call("get_job", { job_id: lead.id }, detailSchema);
@@ -351,6 +351,37 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       { salary_min: null, salary_max: null, salary_currency: null, salary_period: null });
   });
 
+  test("pipeline writes reject prepared and arbitrary states through every MCP mutation", async () => {
+    const application = await call("add_job", { phase: "application", company: "Fixed milestones", eligible_opening: await verifiedOpening("Fixed milestones") }, jobSchema);
+    for (const current_stage of ["prepared", "Prepared — awaiting human submission", "draft", "arbitrary milestone"]) {
+      await error("update_job", { job_id: application.id, current_stage }, /current_stage/u);
+      await error("add_stage", { job_id: application.id, name: current_stage }, /name/u);
+    }
+    assert.equal(application.current_stage, "applied");
+    const stage = await call("add_stage", { job_id: application.id, name: "recruiter_screen" }, stageSchema);
+    await error("update_stage", { stage_id: stage.id, name: "prepared", make_current: true }, /name/u);
+    await error("update_stage", { stage_id: stage.id, status: "prepared" }, /status/u);
+    await error("update_job", { job_id: application.id, status: "prepared" }, /status/u);
+    const unchanged = await call("get_job", { job_id: application.id }, v.object({ job: jobSchema, stages: v.array(stageSchema) }));
+    assert.equal(unchanged.job.current_stage, "recruiter_screen");
+    assert.deepEqual(unchanged.stages, [stage]);
+    const { tools } = await client.listTools();
+    for (const [name, field] of [["update_job", "current_stage"], ["add_stage", "name"], ["update_stage", "name"]]) {
+      const tool = tools.find((entry) => entry.name === name);
+      assert.ok(tool);
+      const { properties } = v.parse(v.object({ properties: v.record(v.string(), v.unknown()) }), tool.inputSchema);
+      const { enum: allowed } = v.parse(v.object({ enum: v.array(v.string()) }), properties[field ?? ""]);
+      assert.ok(allowed.includes("applied"));
+      assert.ok(!allowed.includes("prepared"));
+    }
+    for (const name of ["applied", "outreach", "recruiter_screen", "assessment", "technical_interview", "system_design", "hiring_manager", "final_interview", "reference_check", "offer"]) {
+      const round = await call("add_stage", { job_id: application.id, name, status: "completed" }, stageSchema);
+      const detail = await call("get_job", { job_id: application.id }, v.object({ job: jobSchema }));
+      assert.equal(round.name, name);
+      assert.equal(detail.job.current_stage, name);
+    }
+  });
+
   test("concurrent applications keep independent stages, failures, optional feedback, and corrected voice transcriptions", async () => {
     const imported = await call("add_jobs", { jobs: [
       { phase: "application", company: "Track A", eligible_opening: await verifiedOpening("Track A"), title: "Engineer", description: "Role A" },
@@ -358,8 +389,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     ] }, jobsSchema);
     assert.ok(imported.jobs[0] && imported.jobs[1]);
     const [screening, technical] = await Promise.all([
-      call("add_stage", { job_id: imported.jobs[0].id, name: "HR screening", status: "completed" }, stageSchema),
-      call("add_stage", { job_id: imported.jobs[1].id, name: "System design", status: "in_progress" }, stageSchema),
+      call("add_stage", { job_id: imported.jobs[0].id, name: "recruiter_screen", status: "completed" }, stageSchema),
+      call("add_stage", { job_id: imported.jobs[1].id, name: "system_design", status: "in_progress" }, stageSchema),
     ]);
     await call("update_stage", { stage_id: technical.id, status: "failed" }, stageSchema);
     const reflection = "I rushed the trade-offs. Next time ask about scale first.";
@@ -376,13 +407,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(b.job.status, "rejected");
     assert.equal(b.stages[0]?.status, "failed");
     assert.equal(b.feedback[0]?.text, "I rushed the tradeoffs. Ask about scale first.");
-    const history = await call("list_feedback", { stage_name: "system design" }, v.object({ feedback: v.array(feedbackOutput) }));
+    const history = await call("list_feedback", { stage_name: "system_design" }, v.object({ feedback: v.array(feedbackOutput) }));
     assert.equal(history.feedback[0]?.id, feedback.id);
   });
 
   test("expired rejections return to available opportunities without reopening the failed application", async () => {
     const application = await call("add_job", { company: "Reapplication Co", phase: "application", eligible_opening: await verifiedOpening("Reapplication Co") }, jobSchema);
-    const stage = await call("add_stage", { job_id: application.id, name: "System design", status: "failed" }, stageSchema);
+    const stage = await call("add_stage", { job_id: application.id, name: "system_design", status: "failed" }, stageSchema);
     const feedback = await call("add_feedback", { stage_id: stage.id, source: "recruiter", text: "Please return after the cooldown." }, feedbackOutput);
     const eligibility = v.object({ ...jobSchema.entries, reapply_policy: v.nullable(v.string()), reapply_after: v.nullable(v.string()), reapply_status: v.string() });
     const available = v.object({ jobs: v.array(eligibility), next_offset: v.nullable(v.number()) });
@@ -423,7 +454,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Calendar Co", eligible_opening: await verifiedOpening("Calendar Co"), title: "Engineer", description: "Remote", notes: "Private salary target" }] }, jobsSchema);
     assert.ok(imported.jobs[0]);
     const stage = await call("add_stage", {
-      job_id: imported.jobs[0].id, name: "Technical interview",
+      job_id: imported.jobs[0].id, name: "technical_interview",
       starts_at: "2026-11-02T09:00:00-08:00", ends_at: "2026-11-02T10:00:00-08:00",
       timezone: "America/Los_Angeles", location: "https://meet.google.com/example",
       contact_email: "recruiter@example.com", notes: "Private prep notes",
@@ -477,10 +508,10 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       { phase: "application", company: "Duplicate", eligible_opening: await verifiedOpening("Duplicate"), title: "Engineer", description: "Role", nickname: "UNIQUE-ROLE" },
     ] }, /already exists/u);
     assert.deepEqual((await call("list_jobs", { query: "Atomic rollback" }, jobsSchema)).jobs, []);
-    await error("add_stage", { job_id: imported.jobs[0].id, name: "Invalid time", starts_at: "2026-11-02T10:00:00" }, /timestamp/u);
-    await error("add_stage", { job_id: imported.jobs[0].id, name: "Invalid date", starts_at: "2026-02-30T10:00:00Z" }, /impossible/u);
-    await error("add_stage", { job_id: imported.jobs[0].id, name: "Backwards", starts_at: "2026-11-02T10:00:00Z", ends_at: "2026-11-02T09:00:00Z" }, /later/u);
-    const stage = await call("add_stage", { job_id: imported.jobs[0].id, name: "Screening", starts_at: "2026-11-03T10:00:00Z" }, stageSchema);
+    await error("add_stage", { job_id: imported.jobs[0].id, name: "technical_interview", starts_at: "2026-11-02T10:00:00" }, /timestamp/u);
+    await error("add_stage", { job_id: imported.jobs[0].id, name: "technical_interview", starts_at: "2026-02-30T10:00:00Z" }, /impossible/u);
+    await error("add_stage", { job_id: imported.jobs[0].id, name: "technical_interview", starts_at: "2026-11-02T10:00:00Z", ends_at: "2026-11-02T09:00:00Z" }, /later/u);
+    const stage = await call("add_stage", { job_id: imported.jobs[0].id, name: "recruiter_screen", starts_at: "2026-11-03T10:00:00Z" }, stageSchema);
     assert.equal(stage.timezone, "UTC");
     const draft = await call("get_calendar_event", { stage_id: stage.id }, v.object({ missing_fields: v.array(v.string()), create_event_args: v.null() }));
     assert.deepEqual(draft.missing_fields, ["ends_at"]);
@@ -668,8 +699,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const bobJob = (await scoped(bob, "add_jobs", { jobs: [{ ...opening, eligible_opening: await verifiedOpening("Shared company", bob) }] }, jobsSchema)).jobs[0];
       assert.ok(aliceJob && bobJob);
       assert.notEqual(aliceJob.id, bobJob.id);
-      const aliceStage = await scoped(alice, "add_stage", { job_id: aliceJob.id, name: "Alice interview", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
-      const bobStage = await scoped(bob, "add_stage", { job_id: bobJob.id, name: "Bob interview", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
+      const aliceStage = await scoped(alice, "add_stage", { job_id: aliceJob.id, name: "technical_interview", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
+      const bobStage = await scoped(bob, "add_stage", { job_id: bobJob.id, name: "system_design", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
       await scoped(alice, "add_feedback", { stage_id: aliceStage.id, text: "Alice private feedback" }, feedbackOutput);
       const bobFeedback = await scoped(bob, "add_feedback", { stage_id: bobStage.id, text: "Bob private feedback" }, feedbackOutput);
       const aliceOutreach = await scoped(alice, "record_outreach", { contact: { job_id: aliceJob.id, name: "Alice referrer", relationship: "friend", url: "https://t.me/example_referrer" }, direction: "outbound" }, outreachOutput);
@@ -720,7 +751,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       }
       const forbidden = [
         ["get_job", { job_id: bobJob.id }], ["get_application_context", { job_id: bobJob.id }], ["update_job", { job_id: bobJob.id, company: "Stolen" }],
-        ["add_stage", { job_id: bobJob.id, name: "Foreign stage" }], ["update_stage", { stage_id: bobStage.id, name: "Foreign round", make_current: true }],
+        ["add_stage", { job_id: bobJob.id, name: "assessment" }], ["update_stage", { stage_id: bobStage.id, name: "assessment", make_current: true }],
         ["add_feedback", { stage_id: bobStage.id, text: "Foreign feedback" }], ["update_feedback", { feedback_id: bobFeedback.id, text: "Foreign edit" }],
         ["get_calendar_event", { stage_id: bobStage.id }],
         ["record_outreach", { contact: { job_id: bobJob.id, name: "Foreign contact" }, direction: "outbound" }],
@@ -744,10 +775,10 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const bobUnchanged = await scoped(bob, "get_job", { job_id: bobJob.id }, v.object({ job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput) }));
       assert.equal(bobUnchanged.job.company, opening.company);
       assert.equal(bobUnchanged.job.score, 80);
-      assert.equal(bobUnchanged.stages[0]?.name, "Bob interview");
+      assert.equal(bobUnchanged.stages[0]?.name, "system_design");
       assert.equal(bobUnchanged.feedback[0]?.text, "Bob private feedback");
       const bobDraft = await scoped(bob, "get_calendar_event", { stage_id: bobStage.id }, v.object({ create_event_args: v.object({ description: v.string() }) }));
-      assert.match(bobDraft.create_event_args.description, /Bob interview/u);
+      assert.match(bobDraft.create_event_args.description, /system_design/u);
       assert.doesNotMatch(bobDraft.create_event_args.description, /Alice|private feedback/u);
       await scoped(alice, "set_criteria", { text: "Alice changed again" }, v.unknown());
       assert.deepEqual((await scoped(alice, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [aliceJob.id]);
@@ -809,7 +840,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     await error("record_outreach", { contact: { job_id: employer.id, name: "Uncontacted prospect" } }, /direction/u);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Future prospect" }, direction: "outbound", occurred_at: "2099-01-01T00:00:00Z" }, /future/u);
     const other = await call("add_job", { company: "Other prospect employer", eligible_opening: await verifiedOpening("Other prospect employer") }, jobSchema);
-    const foreignStage = await call("add_stage", { job_id: other.id, name: "Different employer stage" }, stageSchema);
+    const foreignStage = await call("add_stage", { job_id: other.id, name: "technical_interview" }, stageSchema);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Wrong stage prospect" }, direction: "outbound", stage_id: foreignStage.id }, /same job/u);
     const history = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
     assert.deepEqual(history.contacts, []);
@@ -835,7 +866,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       follow_up_at: v.nullable(v.string()), seconds_since_outreach: v.number(), due: v.boolean(),
     });
     const followUps = v.object({ follow_ups: v.array(activity), next_offset: v.nullable(v.number()) });
-    const referral = await call("add_stage", { job_id: employer.id, name: "attempt_referral", status: "in_progress" }, stageSchema);
+    const referral = await call("add_stage", { job_id: employer.id, name: "outreach", status: "in_progress" }, stageSchema);
     const first = await call("record_outreach", {
       contact: { job_id: employer.id, name: "Example friend", relationship: "friend/referrer", url: "https://t.me/referrer_example" },
       stage_id: referral.id, direction: "outbound", channel: "telegram",
@@ -845,16 +876,16 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(first.occurred_at, "2026-09-01T09:00:00.000Z");
     assert.equal(first.time_basis, "reported");
     assert.notEqual(first.created_at, first.occurred_at);
-    const screening = await call("add_stage", { job_id: employer.id, name: "Screening" }, stageSchema);
+    const screening = await call("add_stage", { job_id: employer.id, name: "recruiter_screen" }, stageSchema);
     const detail = await call("get_job", { job_id: employer.id }, v.object({ job: jobSchema, ...outreachHistory }));
-    assert.equal(detail.job.current_stage, "Screening");
+    assert.equal(detail.job.current_stage, "recruiter_screen");
     assert.equal(detail.last_outreach_at, "2026-09-01T09:00:00.000Z");
     assert.equal(detail.contacts[0]?.relationship, "friend/referrer");
     assert.deepEqual(detail.outreach.map((entry) => entry.stage_id), [referral.id]);
     const due = await call("get_follow_ups", { job_id: employer.id, due_only: true, as_of: "2026-09-04T09:00:00Z" }, followUps);
     assert.equal(due.follow_ups[0]?.id, friend.id);
     assert.equal(due.follow_ups[0]?.seconds_since_outreach, 3 * 86_400);
-    assert.equal(due.follow_ups[0]?.current_stage, "Screening");
+    assert.equal(due.follow_ups[0]?.current_stage, "recruiter_screen");
     assert.equal(due.follow_ups[0]?.due, true);
     const listed = await call("list_jobs", { query: "Referral Example" }, v.object({ jobs: v.array(v.object({ last_outreach_at: v.string(), follow_up_at: v.string() })) }));
     assert.equal(listed.jobs[0]?.last_outreach_at, first.occurred_at);
@@ -904,7 +935,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(unchanged.contacts.length, 2);
     assert.equal(unchanged.outreach.length, persisted.outreach.length);
     const other = await call("add_job", { company: "Different employer", eligible_opening: await verifiedOpening("Different employer") }, jobSchema);
-    const otherStage = await call("add_stage", { job_id: other.id, name: "Other round" }, stageSchema);
+    const otherStage = await call("add_stage", { job_id: other.id, name: "technical_interview" }, stageSchema);
     await error("record_outreach", { contact_id: friend.id, stage_id: otherStage.id, direction: "outbound" }, /same job/u);
     await error("update_contact", { job_id: other.id, contact_id: friend.id, name: "Wrong employer" }, /does not belong/u);
     const otherOutreach = await call("record_outreach", { contact: { job_id: other.id, name: "Recruiter", relationship: "recruiter" }, direction: "outbound", occurred_at: "2026-08-01T09:00:00Z" }, outreachOutput);
@@ -979,16 +1010,16 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped("set_criteria", { text: "Private selection criteria" }, v.unknown());
       await scoped("set_application_context", { text: "Private applicant document" }, v.unknown());
       await scoped("set_applicant_profile", { gender: "self-described" }, v.unknown());
-      await scoped("add_stage", { job_id: submitted.id, name: "Application sent", status: "completed" }, stageSchema);
-      await scoped("add_stage", { job_id: submitted.id, name: "Application sent", status: "planned" }, stageSchema);
-      const latest = await scoped("add_stage", { job_id: submitted.id, name: "Application sent", status: "completed" }, stageSchema);
+      await scoped("add_stage", { job_id: submitted.id, name: "applied", status: "completed" }, stageSchema);
+      await scoped("add_stage", { job_id: submitted.id, name: "applied", status: "planned" }, stageSchema);
+      const latest = await scoped("add_stage", { job_id: submitted.id, name: "applied", status: "completed" }, stageSchema);
       const yesterday = new Date(Date.now() - 86_400_000).toISOString();
       const pastDue = new Date(Date.now() - 3_600_000).toISOString();
       const tomorrow = new Date(Date.now() + 86_400_000).toISOString();
       const later = new Date(Date.now() + 2 * 86_400_000).toISOString();
       for (const job of [lead, rejected, withdrawn, accepted]) {
-        await scoped("record_outreach", { contact: { job_id: job.id, name: "Outside pipeline" }, direction: "outbound", occurred_at: yesterday, follow_up_at: pastDue }, outreachOutput);
-        await scoped("add_stage", { job_id: job.id, name: "Outside pipeline", starts_at: tomorrow }, stageSchema);
+        await scoped("record_outreach", { contact: { job_id: job.id, name: "technical_interview" }, direction: "outbound", occurred_at: yesterday, follow_up_at: pastDue }, outreachOutput);
+        await scoped("add_stage", { job_id: job.id, name: "technical_interview", starts_at: tomorrow }, stageSchema);
       }
       const friend = await scoped("record_outreach", {
         contact: { job_id: referral.id, name: "Example referrer", relationship: "friend/referrer", url: "https://t.me/pipeline_example" },
@@ -999,12 +1030,12 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const acknowledgement = await scoped("record_outreach", {
         contact: { job_id: offer.id, name: "Example recruiter" }, direction: "inbound", occurred_at: yesterday, follow_up_at: pastDue,
       }, outreachOutput);
-      await scoped("add_stage", { job_id: offer.id, name: "Cancelled", starts_at: tomorrow, status: "cancelled", make_current: false }, stageSchema);
-      await scoped("add_stage", { job_id: offer.id, name: "Finished", starts_at: yesterday, status: "completed", make_current: false }, stageSchema);
-      await scoped("add_stage", { job_id: offer.id, name: "Unscheduled", make_current: false }, stageSchema);
-      const ongoing = await scoped("add_stage", { job_id: offer.id, name: "Ongoing", starts_at: yesterday, status: "in_progress", make_current: false }, stageSchema);
-      await scoped("add_stage", { job_id: offer.id, name: "Later interview", starts_at: later, make_current: false }, stageSchema);
-      const soon = await scoped("add_stage", { job_id: referral.id, name: "Screening", starts_at: tomorrow, make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: offer.id, name: "technical_interview", starts_at: tomorrow, status: "cancelled", make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: offer.id, name: "technical_interview", starts_at: yesterday, status: "completed", make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: offer.id, name: "technical_interview", make_current: false }, stageSchema);
+      const ongoing = await scoped("add_stage", { job_id: offer.id, name: "technical_interview", starts_at: yesterday, status: "in_progress", make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: offer.id, name: "technical_interview", starts_at: later, make_current: false }, stageSchema);
+      const soon = await scoped("add_stage", { job_id: referral.id, name: "recruiter_screen", starts_at: tomorrow, make_current: false }, stageSchema);
       const response = await owner.callTool({ name: "get_pipeline", arguments: {} });
       const pipeline = parseTool(response, pipelineSchema);
       assert.deepEqual(pipeline.summary, { applications: 3, active: 2, offers: 1, awaiting_reply: 1, follow_ups_due: 2, scheduled_stages: 3 });

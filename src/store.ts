@@ -1,5 +1,5 @@
 import * as v from "valibot";
-import { eligibleOpeningSchema, maxJobsPerBatch, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
+import { eligibleOpeningSchema, maxJobsPerBatch, pipelineStageSchema, type AddFeedback, type AddJobs, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -289,7 +289,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
     (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
       salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis, created_at, updated_at, eligible_opening)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
-    userId, crypto.randomUUID(), job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "application",
+    userId, crypto.randomUUID(), job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "applied",
     job.title ?? null, job.nickname ?? null, job.description ?? null, job.source_url ?? null,
     job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null,
     job.salary_min ?? null, job.salary_max ?? null, job.salary_currency ?? null, job.salary_period ?? null,
@@ -467,7 +467,7 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
     patch.location = null;
     patch.current_stage = "lead";
   } else if (input.phase === "application" && job.phase === "lead" && patch.current_stage === undefined) {
-    patch.current_stage = "application";
+    patch.current_stage = "applied";
   }
   // Scores for changed descriptions must come from a new ranking.
   const invalidates = [input.company, input.title, input.description, input.location, opening].some((value) => value !== undefined);
@@ -529,6 +529,9 @@ export async function updateStage(scope: UserStore, input: UpdateStage) {
   const { db, userId } = scope;
   const stage = await requireStage(scope, input.stage_id);
   const { stage_id, make_current, ...patch } = input;
+  if (make_current && !v.is(pipelineStageSchema, patch.name ?? stage.name)) {
+    fail("Rename this legacy stage to a predefined pipeline milestone before making it current. Prepared forms, drafts, and browser handoffs are not pipeline stages.");
+  }
   if (patch.starts_at) patch.starts_at = normalizeTimestamp(patch.starts_at);
   if (patch.ends_at) patch.ends_at = normalizeTimestamp(patch.ends_at);
   if (patch.starts_at && patch.timezone === undefined && stage.timezone === null) patch.timezone = "UTC";
