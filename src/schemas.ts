@@ -23,20 +23,34 @@ const scoreOrder = v.optional(v.picklist(["highest", "lowest"]), "highest");
 const salaryAmount = v.pipe(v.number(), v.minValue(0), v.maxValue(Number.MAX_SAFE_INTEGER));
 const salaryCurrency = v.pipe(v.string(), v.regex(/^[A-Z]{3}$/, "Use a three-letter uppercase currency code, such as USD, EUR, or RUB."));
 const salaryPeriod = v.picklist(["hour", "day", "week", "month", "year"]);
+export const salaryRangeSchema = v.strictObject({
+  min: v.optional(v.nullable(salaryAmount), null),
+  max: v.optional(v.nullable(salaryAmount), null),
+  currency: v.optional(v.nullable(salaryCurrency), null),
+  period: v.optional(v.nullable(salaryPeriod), null),
+  basis: v.optional(v.nullable(v.picklist(["gross", "net"])), null),
+  text: v.optional(v.nullable(text(2_000)), null),
+  source_url: v.optional(v.nullable(url), null),
+  context: v.optional(v.nullable(text(2_000)), null),
+});
+const compensationFields = {
+  employer_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Pay advertised or confirmed by the employer. Full replacement; null clears only employer pay. Preserve original text and source_url; leave unknown units null. Never save the applicant's ask here.")))),
+  asked_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Salary actually requested by the applicant in a submitted form, message, or call. Use min=max for an exact amount. Full replacement; null clears only this communicated ask. context can identify the form/call and date. A private target or employer budget is not an actual ask.")))),
+};
 const salaryFields = {
-  salary_min: v.optional(v.nullable(salaryAmount)),
+  salary_min: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Legacy employer-advertised minimum; prefer employer_salary. This is not the applicant's ask.")))),
   salary_max: v.optional(v.nullable(salaryAmount)),
   salary_currency: v.optional(v.nullable(salaryCurrency)),
   salary_period: v.optional(v.nullable(salaryPeriod)),
 };
 const salaryAskFields = {
-  salary_ask_amount: v.optional(v.nullable(salaryAmount)),
+  salary_ask_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Private current negotiation target. This does not establish that an amount was communicated; use asked_salary for actual asks.")))),
   salary_ask_currency: v.optional(v.nullable(salaryCurrency)),
   salary_ask_period: v.optional(v.nullable(salaryPeriod)),
   salary_ask_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
 };
 const salaryDeclaredFields = {
-  salary_declared_amount: v.optional(v.nullable(salaryAmount)),
+  salary_declared_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Legacy exact amount actually communicated by the applicant. Prefer asked_salary, which also supports ranges. This is not employer-advertised pay or a private target.")))),
   salary_declared_currency: v.optional(v.nullable(salaryCurrency)),
   salary_declared_period: v.optional(v.nullable(salaryPeriod)),
   salary_declared_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
@@ -76,6 +90,7 @@ export const eligibleOpeningSchema = v.strictObject({
 });
 
 export const addJobSchema = v.strictObject({
+  ...compensationFields,
   ...salaryFields,
   ...salaryAskFields,
   ...salaryDeclaredFields,
@@ -120,6 +135,7 @@ export const nextLeadsSchema = v.strictObject({
 });
 
 export const updateJobSchema = v.strictObject({
+  ...compensationFields,
   ...salaryFields,
   ...salaryAskFields,
   ...salaryDeclaredFields,

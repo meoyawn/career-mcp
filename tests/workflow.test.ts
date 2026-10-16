@@ -235,6 +235,69 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(reranked.score, 98);
   });
 
+  test("employer ranges and actually asked ranges remain distinct from private targets, including advertised pay with unknown units", async () => {
+    await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
+    const range = v.strictObject({
+      min: v.nullable(v.number()), max: v.nullable(v.number()), currency: v.nullable(v.string()),
+      period: v.nullable(v.string()), basis: v.nullable(v.string()), text: v.nullable(v.string()),
+      source_url: v.nullable(v.string()), context: v.nullable(v.string()),
+    });
+    const fields = {
+      employer_salary: v.nullable(range), asked_salary: v.nullable(range),
+      salary_target: v.nullable(v.strictObject({ amount: v.number(), currency: v.string(), period: v.string(), basis: v.nullable(v.string()) })),
+    };
+    const row = v.object({ ...jobSchema.entries, ...fields });
+    const employer = { min: 110_000, max: 145_000, currency: "USD", period: null, basis: null,
+      text: "$110,000–145,000 USD, depending on experience", source_url: "https://jobs.example/compensation", context: null };
+    const asked = { min: 7_000, max: 8_000, currency: "EUR", period: "month", basis: "gross",
+      text: null, source_url: null, context: "Entered in the initial application form" };
+    const target = { amount: 9_000, currency: "EUR", period: "month", basis: "gross" };
+    const application = await call("add_job", { company: "Separate salary ranges", phase: "application",
+      eligible_opening: await verifiedOpening("Separate salary ranges"), employer_salary: employer, asked_salary: asked,
+      salary_ask_amount: target.amount, salary_ask_currency: target.currency, salary_ask_period: target.period, salary_ask_basis: target.basis,
+    }, row);
+    const expected = { employer_salary: employer, asked_salary: asked, salary_target: target };
+    const projection = v.object(fields);
+    assert.deepEqual(v.parse(projection, application), expected);
+    const pipeline = await call("get_pipeline", {}, v.object({ applications: v.array(v.object({ id: v.string(), ...fields })) }));
+    assert.deepEqual(pipeline.applications.find((job) => job.id === application.id), { id: application.id, ...expected });
+    const detail = v.object({ job: row });
+    for (const name of ["get_job", "get_interview_prep", "get_application_context"]) {
+      assert.deepEqual(v.parse(projection, (await call(name, { job_id: application.id }, detail)).job), expected);
+    }
+    assert.deepEqual(v.parse(projection, (await call("list_jobs", { query: "Separate salary ranges" }, v.object({ jobs: v.array(row) }))).jobs[0]), expected);
+    for (const invalid of [
+      { employer_salary: { min: 2, max: 1, currency: "USD", period: "year" } },
+      { asked_salary: { min: -1, currency: "USD", period: "month" } },
+      { asked_salary: { min: 7_000 } }, { asked_salary: {} },
+      { employer_salary: employer, salary_min: 100_000 },
+      { asked_salary: asked, salary_declared_amount: 7_000 },
+    ]) await error("update_job", { job_id: application.id, ...invalid }, /salary|range|amount|currency|period|Invalid/u);
+    assert.deepEqual(v.parse(projection, (await call("get_job", { job_id: application.id }, detail)).job), expected);
+    const cleared = await call("update_job", { job_id: application.id, asked_salary: null }, row);
+    assert.deepEqual(v.parse(projection, cleared), { ...expected, asked_salary: null });
+    const legacy = await call("update_job", { job_id: application.id,
+      salary_declared_amount: 8_000, salary_declared_currency: "USD", salary_declared_period: "month", salary_declared_basis: "net",
+    }, row);
+    assert.deepEqual(legacy.asked_salary, { min: 8_000, max: 8_000, currency: "USD", period: "month", basis: "net", text: null, source_url: null, context: null });
+    assert.deepEqual(legacy.employer_salary, employer);
+    assert.deepEqual(legacy.salary_target, target);
+    const exact = await call("update_job", { job_id: application.id,
+      asked_salary: { min: 8_500, max: 8_500, currency: "EUR", period: "month" },
+    }, v.object({ ...row.entries, salary_declared_amount: v.nullable(v.number()) }));
+    assert.equal(exact.salary_declared_amount, 8_500);
+    assert.deepEqual(exact.salary_target, target);
+    const imported = await call("add_jobs", { jobs: [{ company: "Employer range without an ask", phase: "application",
+      eligible_opening: await verifiedOpening("Employer range without an ask"),
+      salary_min: 100_000, salary_max: 120_000, salary_currency: "USD", salary_period: "year",
+      salary_ask_amount: 130_000, salary_ask_currency: "USD", salary_ask_period: "year",
+    }] }, v.object({ jobs: v.array(row) }));
+    assert.equal(imported.jobs[0]?.asked_salary, null);
+    assert.deepEqual(imported.jobs[0]?.employer_salary, { min: 100_000, max: 120_000, currency: "USD", period: "year", basis: null, text: null, source_url: null, context: null });
+    const empty = await call("update_job", { job_id: application.id, employer_salary: null, asked_salary: null }, row);
+    assert.deepEqual(v.parse(projection, empty), { employer_salary: null, asked_salary: null, salary_target: target });
+  });
+
   test("salary asks persist independently of employer budgets and appear in the active pipeline with explicit units and unknowns", async () => {
     const askFields = {
       salary_ask_amount: v.nullable(v.number()), salary_ask_currency: v.nullable(v.string()),

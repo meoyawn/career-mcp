@@ -1,5 +1,5 @@
 import * as v from "valibot";
-import { eligibleOpeningSchema, maxJobsPerBatch, pipelineStageSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
+import { eligibleOpeningSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -33,7 +33,24 @@ interface CV {
   url: string;
 }
 
-interface Job {
+interface SalaryFields {
+  employer_salary: string | null;
+  asked_salary: string | null;
+  salary_min: number | null;
+  salary_max: number | null;
+  salary_currency: string | null;
+  salary_period: "hour" | "day" | "week" | "month" | "year" | null;
+  salary_ask_amount: number | null;
+  salary_ask_currency: string | null;
+  salary_ask_period: "hour" | "day" | "week" | "month" | "year" | null;
+  salary_ask_basis: "gross" | "net" | null;
+  salary_declared_amount: number | null;
+  salary_declared_currency: string | null;
+  salary_declared_period: "hour" | "day" | "week" | "month" | "year" | null;
+  salary_declared_basis: "gross" | "net" | null;
+}
+
+interface Job extends SalaryFields {
   id: string;
   company: string;
   company_url: string | null;
@@ -53,18 +70,6 @@ interface Job {
   reapply_policy: "allowed" | "not_allowed" | null;
   reapply_after: string | null;
   score: number | null;
-  salary_min: number | null;
-  salary_max: number | null;
-  salary_currency: string | null;
-  salary_period: "hour" | "day" | "week" | "month" | "year" | null;
-  salary_ask_amount: number | null;
-  salary_ask_currency: string | null;
-  salary_ask_period: "hour" | "day" | "week" | "month" | "year" | null;
-  salary_ask_basis: "gross" | "net" | null;
-  salary_declared_amount: number | null;
-  salary_declared_currency: string | null;
-  salary_declared_period: "hour" | "day" | "week" | "month" | "year" | null;
-  salary_declared_basis: "gross" | "net" | null;
   created_at: string;
   updated_at: string;
 }
@@ -161,7 +166,7 @@ interface PipelineSummary {
   scheduled_stages: number;
 }
 
-interface PipelineJob extends Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at" | "salary_min" | "salary_max" | "salary_currency" | "salary_period" | "salary_ask_amount" | "salary_ask_currency" | "salary_ask_period" | "salary_ask_basis" | "salary_declared_amount" | "salary_declared_currency" | "salary_declared_period" | "salary_declared_basis"> {
+interface PipelineJob extends SalaryFields, Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at"> {
   current_stage_status: string | null;
   last_outreach_at: string | null;
   last_response_at: string | null;
@@ -261,8 +266,62 @@ function validateEligibleOpening(input: unknown, criteria: Criteria | null) {
   return { ...opening, checked_at: checkedAt, criteria_updated_at: criteria.updated_at };
 }
 
-function withEligibleOpening<T extends Pick<Job, "eligible_opening">>(job: T) {
-  return { ...job, eligible_opening: job.eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(job.eligible_opening)) };
+function withCompensation<T extends SalaryFields>(job: T) {
+  return {
+    ...job,
+    employer_salary: job.employer_salary === null
+      ? job.salary_min === null && job.salary_max === null ? null : v.parse(salaryRangeSchema, {
+        min: job.salary_min, max: job.salary_max, currency: job.salary_currency, period: job.salary_period,
+      }) : v.parse(salaryRangeSchema, JSON.parse(job.employer_salary)),
+    asked_salary: job.asked_salary === null
+      ? job.salary_declared_amount === null ? null : v.parse(salaryRangeSchema, {
+        min: job.salary_declared_amount, max: job.salary_declared_amount, currency: job.salary_declared_currency,
+        period: job.salary_declared_period, basis: job.salary_declared_basis,
+      }) : v.parse(salaryRangeSchema, JSON.parse(job.asked_salary)),
+    salary_target: job.salary_ask_amount === null ? null : {
+      amount: job.salary_ask_amount, currency: job.salary_ask_currency, period: job.salary_ask_period, basis: job.salary_ask_basis,
+    },
+  };
+}
+
+function withEligibleOpening<T extends SalaryFields & Pick<Job, "eligible_opening">>(job: T) {
+  return withCompensation({ ...job, eligible_opening: job.eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(job.eligible_opening)) });
+}
+
+function validateSalaryRange(range: v.InferOutput<typeof salaryRangeSchema> | null) {
+  if (range === null) return;
+  if (range.min === null && range.max === null && range.text === null) fail("A salary range needs an amount or the original salary text.");
+  if (range.min !== null && range.max !== null && range.min > range.max) fail("The salary range minimum must not exceed its maximum.");
+  if (range.text === null && (range.currency === null || range.period === null)) fail("A salary range needs currency and pay period, or original text preserving the unknown units.");
+}
+
+function prepareSalaryInput<T extends Pick<UpdateJob, "employer_salary" | "asked_salary" | "salary_min" | "salary_max" | "salary_currency" | "salary_period" | "salary_declared_amount" | "salary_declared_currency" | "salary_declared_period" | "salary_declared_basis">>(input: T) {
+  const { employer_salary, asked_salary, ...fields } = input;
+  const employerLegacy = [input.salary_min, input.salary_max, input.salary_currency, input.salary_period].some((value) => value !== undefined);
+  const askedLegacy = [input.salary_declared_amount, input.salary_declared_currency, input.salary_declared_period, input.salary_declared_basis].some((value) => value !== undefined);
+  let employer: Partial<Pick<SalaryFields, "employer_salary" | "salary_min" | "salary_max" | "salary_currency" | "salary_period">> = {};
+  let asked: Partial<Pick<SalaryFields, "asked_salary" | "salary_declared_amount" | "salary_declared_currency" | "salary_declared_period" | "salary_declared_basis">> = {};
+  if (employer_salary !== undefined) {
+    validateSalaryRange(employer_salary);
+    if (employerLegacy) fail("Use employer_salary or legacy salary_min/max/currency/period fields, not both in one write.");
+    const normalized = employer_salary?.currency != null && employer_salary.period !== null && (employer_salary.min !== null || employer_salary.max !== null);
+    employer = {
+      employer_salary: employer_salary === null ? null : JSON.stringify(employer_salary),
+      salary_min: normalized ? employer_salary.min : null, salary_max: normalized ? employer_salary.max : null,
+      salary_currency: normalized ? employer_salary.currency : null, salary_period: normalized ? employer_salary.period : null,
+    };
+  } else if (employerLegacy) employer.employer_salary = null;
+  if (asked_salary !== undefined) {
+    validateSalaryRange(asked_salary);
+    if (askedLegacy) fail("Use asked_salary or legacy salary_declared fields, not both in one write.");
+    const exact = asked_salary?.min != null && asked_salary.min === asked_salary.max && asked_salary.currency !== null && asked_salary.period !== null;
+    asked = {
+      asked_salary: asked_salary === null ? null : JSON.stringify(asked_salary),
+      salary_declared_amount: exact ? asked_salary.min : null, salary_declared_currency: exact ? asked_salary.currency : null,
+      salary_declared_period: exact ? asked_salary.period : null, salary_declared_basis: exact ? asked_salary.basis : null,
+    };
+  } else if (askedLegacy) asked.asked_salary = null;
+  return { ...fields, ...employer, ...asked };
 }
 
 function validateSalary(input: Pick<UpdateJob, "salary_min" | "salary_max" | "salary_currency" | "salary_period">) {
@@ -297,7 +356,8 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   const { db, userId } = scope;
   const now = new Date().toISOString();
   const criteria = await getCriteria(scope);
-  for (const [index, job] of jobs.entries()) {
+  const prepared = jobs.map(prepareSalaryInput);
+  for (const [index, job] of prepared.entries()) {
     try {
       validateOpening(job.phase, job);
       validateSalary(job);
@@ -311,11 +371,11 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
       throw error;
     }
   }
-  const statements = jobs.map((job) => db.prepare(`INSERT INTO jobs
+  const statements = prepared.map((job) => db.prepare(`INSERT INTO jobs
     (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
       salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
-      salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis, created_at, updated_at, eligible_opening)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
+      salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis, created_at, updated_at, eligible_opening, employer_salary, asked_salary)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
     userId, crypto.randomUUID(), job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "applied",
     job.title ?? null, job.nickname ?? null, job.description ?? null, job.source_url ?? null,
     job.location ?? null, job.recruiter_name ?? null, job.recruiter_email ?? null, job.notes ?? null, job.score ?? null,
@@ -323,6 +383,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
     job.salary_ask_amount ?? null, job.salary_ask_currency ?? null, job.salary_ask_period ?? null, job.salary_ask_basis ?? null,
     job.salary_declared_amount ?? null, job.salary_declared_currency ?? null, job.salary_declared_period ?? null, job.salary_declared_basis ?? null, now, now,
     job.eligible_opening ? JSON.stringify(job.eligible_opening) : null,
+    job.employer_salary ?? null, job.asked_salary ?? null,
   ));
   try {
     const results = await db.batch<Job>(statements);
@@ -451,6 +512,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
       j.salary_min, j.salary_max, j.salary_currency, j.salary_period,
       j.salary_ask_amount, j.salary_ask_currency, j.salary_ask_period, j.salary_ask_basis,
       j.salary_declared_amount, j.salary_declared_currency, j.salary_declared_period, j.salary_declared_basis,
+      j.employer_salary, j.asked_salary,
       (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'outbound') AS last_outreach_at,
       (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS j.user_id AND o.job_id IS j.id AND o.direction IS 'inbound') AS last_response_at
       FROM pipeline j LEFT JOIN stages current ON current.user_id IS j.user_id AND current.id IS (
@@ -478,7 +540,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
     as_of: asOf,
     summary: summary.results[0],
     applications: jobs.results.slice(0, input.limit).map((job) => ({
-      ...job,
+      ...withCompensation(job),
       pending_prep_notes: prepNotes.results.filter((note) => note.job_id === job.id).map(({ id, kind, text, stage_name }) => ({ id, kind, text, stage_name })),
       pending_contacts: contacts.results.filter((contact) => contact.job_id === job.id).map(({ job_id: _jobId, ...contact }) => ({
         ...contact,
@@ -510,6 +572,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     score, salary_min, salary_max, salary_currency, salary_period,
     salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
     salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis,
+    employer_salary, asked_salary,
     created_at, updated_at`;
   const results = await db.prepare(`WITH opportunities AS (
     SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ?
@@ -536,7 +599,7 @@ function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "f
 
 export async function updateJob(scope: UserStore, input: UpdateJob) {
   const job = await requireJob(scope, input.job_id);
-  const { job_id, eligible_opening, ...patch } = input;
+  const { job_id, eligible_opening, ...patch } = prepareSalaryInput(input);
   const needsOpening = input.phase !== undefined || input.company !== undefined || input.company_url !== undefined ||
     ((input.phase ?? job.phase) === "lead" && (input.status === "active" || input.status === "offer"));
   let opening: EligibleOpening | undefined;

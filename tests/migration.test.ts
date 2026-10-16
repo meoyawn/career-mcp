@@ -4,6 +4,32 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("salary range migration preserves employer pay, actual declarations and private targets without inferring new facts", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const name of migrations.filter((file) => file < "0011")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, salary_min, salary_max, salary_currency, salary_period,
+          salary_ask_amount, salary_ask_currency, salary_ask_period, created_at, updated_at)
+          VALUES ('alice', 'application', 'Example employer', 'application', 100000, 120000, 'USD', 'year',
+            9000, 'EUR', 'month', 'created', 'updated');`);
+      for (const name of migrations.filter((file) => file >= "0011" && file < "0015")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      db.exec("UPDATE jobs SET salary_declared_amount = 7000, salary_declared_currency = 'EUR', salary_declared_period = 'month'");
+      const original = db.prepare("SELECT * FROM jobs").get();
+      db.exec(await readFile("migrations/0015_salary_ranges.sql", "utf8"));
+      assert.deepEqual({ ...db.prepare("SELECT * FROM jobs").get() }, { ...original, employer_salary: null, asked_salary: null });
+      for (const column of ["employer_salary", "asked_salary"]) {
+        for (const invalid of ["not JSON", "[]", "42", "null"]) {
+          assert.throws(() => db.prepare(`UPDATE jobs SET ${column} = ?`).run(invalid), /CHECK|malformed JSON/u);
+        }
+      }
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("interview prep migration preserves asks and history, leaves declared salary unknown, and enforces note ownership and lifecycle", async () => {
     const db = new DatabaseSync(":memory:");
     try {
