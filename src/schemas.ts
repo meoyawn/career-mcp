@@ -8,7 +8,7 @@ const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
 const phase = v.picklist(["lead", "application"]);
 const reapplyStatus = v.picklist(["not_applicable", "unknown", "not_allowed", "cooldown", "eligible"]);
-const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100));
+const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100), v.description("Employer/opening fit against saved selection criteria, 0–100 with higher better. Never encode application order, practice sequencing, or temporary priority."));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
 export const pipelineStageSchema = v.picklist([
   "applied", "outreach", "recruiter_screen", "assessment", "technical_interview",
@@ -16,8 +16,10 @@ export const pipelineStageSchema = v.picklist([
 ], "Choose a predefined pipeline milestone. Prepared forms, drafts, and browser handoffs are not pipeline stages.");
 const currentStage = v.picklist(["lead", ...pipelineStageSchema.options]);
 const source = v.picklist(["self", "recruiter", "interviewer"]);
-const limit = v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100)), 25);
+const pageSize = v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100));
+const limit = v.optional(pageSize, 25);
 const offset = v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100_000)), 0);
+const scoreOrder = v.optional(v.picklist(["highest", "lowest"]), "highest");
 const salaryAmount = v.pipe(v.number(), v.minValue(0), v.maxValue(Number.MAX_SAFE_INTEGER));
 const salaryCurrency = v.pipe(v.string(), v.regex(/^[A-Z]{3}$/, "Use a three-letter uppercase currency code, such as USD, EUR, or RUB."));
 const salaryPeriod = v.picklist(["hour", "day", "week", "month", "year"]);
@@ -105,7 +107,15 @@ export const listJobsSchema = v.strictObject({
   reapply_status: v.optional(reapplyStatus),
   as_of: v.optional(timestamp),
   include_descriptions: v.optional(v.boolean(), false),
+  score_order: scoreOrder,
+  ranked_only: v.optional(v.boolean(), false),
   limit,
+  offset,
+});
+
+export const nextLeadsSchema = v.strictObject({
+  order: scoreOrder,
+  limit: v.optional(pageSize, 1),
   offset,
 });
 

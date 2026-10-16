@@ -503,6 +503,8 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
   if (input.phase) { where.push("phase IS ?"); bindings.push(input.phase); }
   if (input.available_only) where.push("(status IS 'active' OR reapply_status IS 'eligible')");
   if (input.reapply_status) { where.push("reapply_status IS ?"); bindings.push(input.reapply_status); }
+  if (input.ranked_only) where.push("score IS NOT NULL");
+  const scoreDirection = input.score_order === "lowest" ? "ASC" : "DESC";
   const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, eligible_opening, title, nickname, source_url, location,
     recruiter_name, recruiter_email, notes, status, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
     score, salary_min, salary_max, salary_currency, salary_period,
@@ -516,7 +518,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id AND o.direction IS 'inbound') AS last_response_at,
     (SELECT MIN(c.follow_up_at) FROM contact_activity c WHERE c.user_id IS jobs.user_id AND c.job_id IS jobs.id AND c.needs_follow_up IS 1) AS follow_up_at
     FROM opportunities AS jobs
-    ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY score DESC NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY score ${scoreDirection} NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
     .bind(...bindings, input.limit + 1, input.offset).all<Omit<Job, "description"> & { description?: string }>();
   const hasMore = results.results.length > input.limit;
   return {

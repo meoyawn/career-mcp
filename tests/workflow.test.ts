@@ -1240,6 +1240,78 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
+  test("next leads selects either end of the user's ranking without starting applications or reserving records", async () => {
+    const browser = browserFor(endpoint);
+    await enroll(browser);
+    const connection = await authorize(browser);
+    const owner = new Client({ name: "ranked-lead-selection", version: "1" });
+    async function scoped<Schema extends v.GenericSchema>(name: string, args: Record<string, unknown>, schema: Schema) {
+      return parseTool(await owner.callTool({ name, arguments: args }), schema);
+    }
+    const pageSchema = v.strictObject({ jobs: v.array(v.object({ ...jobSchema.entries, phase: v.string() })), next_offset: v.nullable(v.number()) });
+    try {
+      await owner.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${connection.token}` } } }));
+      assert.deepEqual(await scoped("get_next_leads", {}, pageSchema), { jobs: [], next_offset: null });
+      await scoped("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
+      const opening = await verifiedOpening("Selection", owner);
+      const imported = await scoped("add_jobs", { jobs: [
+        { company: "Zero", score: 0 }, { company: "Low", score: 20 },
+        { company: "Tie A", score: 50 }, { company: "Tie B", score: 50 },
+        { company: "High", score: 100 }, { company: "Unranked" },
+        { company: "Withdrawn", score: 100 }, { company: "Rejected", score: 0 },
+        { company: "Application", phase: "application", score: 100 },
+        { company: "Reapplication", phase: "application", score: 0 },
+      ].map((job) => ({ ...job, eligible_opening: { ...opening, source_url: `https://jobs.example/selection/${encodeURIComponent(job.company)}` } })) }, jobsSchema);
+      const [zero, low, tieA, tieB, high, unranked, withdrawn, rejected, application, reapplication] = imported.jobs;
+      assert.ok(zero && low && tieA && tieB && high && unranked && withdrawn && rejected && application && reapplication);
+      await scoped("update_job", { job_id: withdrawn.id, status: "withdrawn" }, jobSchema);
+      for (const job of [rejected, reapplication]) {
+        await scoped("update_job", { job_id: job.id, status: "rejected", reapply_policy: "allowed" }, jobSchema);
+      }
+      await call("set_criteria", { text: "Remote TypeScript engineering roles." }, v.unknown());
+      await call("add_job", { company: "Other user's ranked lead", score: 100, eligible_opening: await verifiedOpening("Other user's ranked lead") }, jobSchema);
+      const snapshotSchema = v.object({ jobs: v.array(v.record(v.string(), v.unknown())), next_offset: v.null() });
+      const jobsBefore = await scoped("list_jobs", { include_descriptions: true }, snapshotSchema);
+      const pipelineBefore = await scoped("get_pipeline", {}, v.object({ summary: v.unknown(), applications: v.array(v.unknown()) }));
+      const ties = [tieA.id, tieB.id].sort();
+      for (const [order, expected] of [
+        ["highest", [high.id, ...ties, low.id, zero.id]],
+        ["lowest", [zero.id, low.id, ...ties, high.id]],
+      ] as const) {
+        const single = await scoped("get_next_leads", { order }, pageSchema);
+        assert.deepEqual(single.jobs.map((job) => job.id), expected.slice(0, 1));
+        assert.equal(single.next_offset, 1);
+        const first = await scoped("get_next_leads", { order, limit: 3 }, pageSchema);
+        assert.deepEqual(first.jobs.map((job) => job.id), expected.slice(0, 3));
+        assert.equal(first.next_offset, 3);
+        const second = await scoped("get_next_leads", { order, limit: 3, offset: first.next_offset }, pageSchema);
+        assert.deepEqual(second.jobs.map((job) => job.id), expected.slice(3));
+        assert.equal(second.next_offset, null);
+        for (const job of [...first.jobs, ...second.jobs]) {
+          assert.equal(job.phase, "lead");
+          assert.equal(job.current_stage, "lead");
+          assert.equal(job.status, "active");
+        }
+      }
+      assert.deepEqual((await scoped("get_next_leads", {}, pageSchema)).jobs.map((job) => job.id), [high.id]);
+      assert.deepEqual(await scoped("get_next_leads", { offset: 5 }, pageSchema), { jobs: [], next_offset: null });
+      const lowest = await scoped("list_jobs", { phase: "lead", status: "active", score_order: "lowest" }, jobsSchema);
+      assert.deepEqual(lowest.jobs.map((job) => job.score), [0, 20, 50, 50, 100, null]);
+      for (const args of [{ order: "invalid" }, { limit: 0 }, { limit: 101 }, { limit: 1.5 }, { offset: -1 }, { user_id: "another-user" }, { phase: "application" }]) {
+        assert.equal((await owner.callTool({ name: "get_next_leads", arguments: args })).isError, true);
+      }
+      assert.deepEqual(await scoped("list_jobs", { include_descriptions: true }, snapshotSchema), jobsBefore);
+      assert.deepEqual(await scoped("get_pipeline", {}, v.object({ summary: v.unknown(), applications: v.array(v.unknown()) })), pipelineBefore);
+      await scoped("update_job", { job_id: high.id, phase: "application", eligible_opening: await verifiedOpening("High", owner) }, jobSchema);
+      assert.deepEqual((await scoped("get_next_leads", { limit: 100 }, pageSchema)).jobs.map((job) => job.id), [...ties, low.id, zero.id]);
+      for (const job of [low, tieA, tieB]) await scoped("update_job", { job_id: job.id, status: "withdrawn" }, jobSchema);
+      await scoped("update_job", { job_id: zero.id, score: null }, jobSchema);
+      assert.deepEqual(await scoped("get_next_leads", {}, pageSchema), { jobs: [], next_offset: null });
+    } finally {
+      await owner.close();
+    }
+  });
+
   test("invalid batch sizes are rejected before accessing D1", async () => {
     const scope = {
       userId: crypto.randomUUID(),
