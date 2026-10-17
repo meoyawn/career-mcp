@@ -1,8 +1,9 @@
 import * as v from "valibot";
-import { eligibleOpeningSchema, jobLifecycleSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
+import { check, execute, fail, first, type Database, type Statement } from "./database.ts";
+import { eligibleOpeningSchema, jobLifecycleSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
-  db: D1Database;
+  db: Database;
   userId: string;
 }
 
@@ -171,68 +172,74 @@ interface PipelineJob extends SalaryFields, Pick<Job, "id" | "company" | "title"
 type PipelineContact = Pick<ContactActivity, "id" | "job_id" | "name" | "relationship" | "url" | "email" | "awaiting_reply" | "follow_up_at" | "last_interaction_at" | "last_interaction_time_basis" | "last_outreach_at" | "last_response_at">;
 type PipelineStage = Pick<Stage, "id" | "job_id" | "name" | "status" | "starts_at" | "ends_at" | "timezone">;
 
-function fail(message: string): never {
-  throw new Error(message, { cause: "user" });
-}
+const criteriaStatement = ({ db, userId }: UserStore) => db.prepare("SELECT * FROM criteria WHERE user_id IS ?").bind(userId);
 
-export const getCriteria = ({ db, userId }: UserStore) => db.prepare("SELECT * FROM criteria WHERE user_id IS ?").bind(userId).first<Criteria>();
+export const getCriteria = (scope: UserStore) => first<Criteria>(scope.db, criteriaStatement(scope));
 
 export function setCriteria({ db, userId }: UserStore, text: string) {
-  return db.prepare(`INSERT INTO criteria (user_id, text, updated_at) VALUES (?, ?, ?)
+  return first<Criteria>(db, db.prepare(`INSERT INTO criteria (user_id, text, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at
-    RETURNING *`).bind(userId, text, new Date().toISOString()).first<Criteria>();
+    RETURNING *`).bind(userId, text, new Date().toISOString()));
 }
 
-export async function getApplicationContext({ db, userId }: UserStore) {
-  const [applicationContext, applicantContact, applicantProfile, cvs] = await Promise.all([
-    db.prepare("SELECT text, updated_at FROM application_context WHERE user_id IS ?").bind(userId).first<ApplicationContext>(),
-    db.prepare("SELECT email, phone, updated_at FROM applicant_contact WHERE user_id IS ?").bind(userId).first<ApplicantContact>(),
-    db.prepare("SELECT gender, updated_at FROM applicant_profile WHERE user_id IS ?").bind(userId).first<ApplicantProfile>(),
-    db.prepare("SELECT language, url FROM cvs WHERE user_id IS ? ORDER BY language").bind(userId).all<CV>(),
+export async function getApplicationContext(scope: UserStore, jobId?: string) {
+  const { db, userId } = scope;
+  const results = await execute(db, [
+    db.prepare("SELECT text, updated_at FROM application_context WHERE user_id IS ?").bind(userId),
+    db.prepare("SELECT email, phone, updated_at FROM applicant_contact WHERE user_id IS ?").bind(userId),
+    db.prepare("SELECT gender, updated_at FROM applicant_profile WHERE user_id IS ?").bind(userId),
+    db.prepare("SELECT language, url FROM cvs WHERE user_id IS ? ORDER BY language").bind(userId),
+    ...(jobId ? jobStatements(scope, "?", [jobId]) : []),
   ]);
-  return { application_context: applicationContext, applicant_contact: applicantContact, applicant_profile: applicantProfile, cvs: Object.fromEntries(cvs.results.map((cv) => [cv.language, cv.url])) };
+  return {
+    application_context: (results[0]?.results[0] ?? null) as ApplicationContext | null,
+    applicant_contact: (results[1]?.results[0] ?? null) as ApplicantContact | null,
+    applicant_profile: (results[2]?.results[0] ?? null) as ApplicantProfile | null,
+    cvs: Object.fromEntries(((results[3]?.results ?? []) as CV[]).map((cv) => [cv.language, cv.url])),
+    ...(jobId ? jobResult(results.slice(4)) : {}),
+  };
 }
 
 export async function setApplicantProfile({ db, userId }: UserStore, gender: string | null) {
   if (gender === null) {
-    await db.prepare("DELETE FROM applicant_profile WHERE user_id IS ?").bind(userId).run();
+    await execute(db, [db.prepare("DELETE FROM applicant_profile WHERE user_id IS ?").bind(userId)]);
     return null;
   }
-  return db.prepare(`INSERT INTO applicant_profile (user_id, gender, updated_at) VALUES (?, ?, ?)
+  return first<ApplicantProfile>(db, db.prepare(`INSERT INTO applicant_profile (user_id, gender, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET gender = excluded.gender, updated_at = excluded.updated_at
-    RETURNING gender, updated_at`).bind(userId, gender, new Date().toISOString()).first<ApplicantProfile>();
+    RETURNING gender, updated_at`).bind(userId, gender, new Date().toISOString()));
 }
 
 export function setApplicantContact({ db, userId }: UserStore, input: SetApplicantContact) {
   if (input.email === undefined && input.phone === undefined) fail("Supply email or phone; use null to clear a field.");
-  return db.prepare(`INSERT INTO applicant_contact (user_id, email, phone, updated_at) VALUES (?, ?, ?, ?)
+  return first<ApplicantContact>(db, db.prepare(`INSERT INTO applicant_contact (user_id, email, phone, updated_at) VALUES (?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
       email = CASE WHEN ? THEN excluded.email ELSE applicant_contact.email END,
       phone = CASE WHEN ? THEN excluded.phone ELSE applicant_contact.phone END,
       updated_at = excluded.updated_at
     RETURNING email, phone, updated_at`)
     .bind(userId, input.email ?? null, input.phone ?? null, new Date().toISOString(),
-      Number(input.email !== undefined), Number(input.phone !== undefined)).first<ApplicantContact>();
+      Number(input.email !== undefined), Number(input.phone !== undefined)));
 }
 
 export async function setApplicationContext({ db, userId }: UserStore, text: string | null) {
   if (text === null) {
-    await db.prepare("DELETE FROM application_context WHERE user_id IS ?").bind(userId).run();
+    await execute(db, [db.prepare("DELETE FROM application_context WHERE user_id IS ?").bind(userId)]);
     return null;
   }
-  return db.prepare(`INSERT INTO application_context (user_id, text, updated_at) VALUES (?, ?, ?)
+  return first<ApplicationContext>(db, db.prepare(`INSERT INTO application_context (user_id, text, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at
-    RETURNING text, updated_at`).bind(userId, text, new Date().toISOString()).first<ApplicationContext>();
+    RETURNING text, updated_at`).bind(userId, text, new Date().toISOString()));
 }
 
 export async function setCV({ db, userId }: UserStore, language: string, url: string | null) {
   language = language.toLowerCase();
   if (url === null) {
-    await db.prepare("DELETE FROM cvs WHERE user_id IS ? AND language IS ?").bind(userId, language).run();
+    await execute(db, [db.prepare("DELETE FROM cvs WHERE user_id IS ? AND language IS ?").bind(userId, language)]);
   } else {
-    await db.prepare(`INSERT INTO cvs (user_id, language, url, updated_at) VALUES (?, ?, ?, ?)
+    await execute(db, [db.prepare(`INSERT INTO cvs (user_id, language, url, updated_at) VALUES (?, ?, ?, ?)
       ON CONFLICT(user_id, language) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at`)
-      .bind(userId, language, url, new Date().toISOString()).run();
+      .bind(userId, language, url, new Date().toISOString())]);
   }
   return { language, url };
 }
@@ -250,16 +257,25 @@ function validateOpening(phase: Job["phase"], input: Pick<UpdateJob, "title" | "
   }
 }
 
-function validateEligibleOpening(input: unknown, criteria: Criteria | null) {
+function validateEligibleOpening(input: unknown) {
   const result = v.safeParse(eligibleOpeningSchema, input);
   if (!result.success) fail("Every new job record requires a verified eligible opening: title, description, source_url, location, status:open, eligibility:eligible, checked_at, criteria_updated_at, and eligibility_reason. Excluded, closed, unknown, and employer-only records cannot be saved; phase:application does not bypass this check.");
-  if (!criteria) fail("Save selection criteria before adding jobs, then verify an open role against those criteria.");
   const opening = result.output;
-  if (normalizeTimestamp(opening.criteria_updated_at) !== criteria.updated_at) fail("Opening eligibility uses outdated criteria. Load get_lead_context and reassess against the current criteria.");
   const checkedAt = normalizeTimestamp(opening.checked_at);
   const age = Date.now() - Date.parse(checkedAt);
   if (age < 0 || age > 24 * 60 * 60 * 1_000) fail("Verify the opening is still open within the last 24 hours; checked_at cannot be in the future.");
-  return { ...opening, checked_at: checkedAt, criteria_updated_at: criteria.updated_at };
+  return { ...opening, checked_at: checkedAt, criteria_updated_at: normalizeTimestamp(opening.criteria_updated_at) };
+}
+
+function openingChecks({ db, userId }: UserStore, opening: string, bindings: unknown[], condition = "1", conditionBindings: unknown[] = []) {
+  return [
+    check(db, "opening_required", `${condition} AND (${opening}) IS NULL`, ...conditionBindings, ...bindings),
+    check(db, "criteria_required", `${condition} AND NOT EXISTS (SELECT 1 FROM criteria WHERE user_id IS ?)`, ...conditionBindings, userId),
+    check(db, "outdated_criteria", `${condition} AND NOT EXISTS (SELECT 1 FROM criteria WHERE user_id IS ?
+      AND updated_at IS json_extract((${opening}), '$.criteria_updated_at'))`, ...conditionBindings, userId, ...bindings),
+    check(db, "opening_expired", `${condition} AND coalesce(julianday(json_extract((${opening}), '$.checked_at'))
+      BETWEEN julianday('now') - 1 AND julianday('now'), 0) IS 0`, ...conditionBindings, ...bindings),
+  ];
 }
 
 function withCompensation<T extends SalaryFields>(job: T) {
@@ -351,7 +367,6 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   }
   const { db, userId } = scope;
   const now = new Date().toISOString();
-  const criteria = await getCriteria(scope);
   const prepared = jobs.map(prepareSalaryInput);
   for (const [index, job] of prepared.entries()) {
     try {
@@ -359,7 +374,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
       validateSalary(job);
       validateSalaryAsk(job);
       validateDeclaredSalary(job);
-      job.eligible_opening = validateEligibleOpening(job.eligible_opening, criteria);
+      job.eligible_opening = validateEligibleOpening(job.eligible_opening);
     } catch (error) {
       if (error instanceof Error && error.cause === "user") {
         fail(`Batch rejected: 0 of ${jobs.length} records saved. Record ${index + 1}: ${error.message}`);
@@ -382,7 +397,15 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
     job.employer_salary ?? null, job.asked_salary ?? null,
   ));
   try {
-    const results = await db.batch<Job>(statements);
+    const evidence = JSON.stringify(prepared.map((job) => job.eligible_opening));
+    const checks = [
+      check(db, "criteria_required", "NOT EXISTS (SELECT 1 FROM criteria WHERE user_id IS ?)", userId),
+      check(db, "outdated_criteria", `EXISTS (SELECT 1 FROM json_each(?) opening WHERE NOT EXISTS (
+        SELECT 1 FROM criteria WHERE user_id IS ? AND updated_at IS json_extract(opening.value, '$.criteria_updated_at')))`, evidence, userId),
+      check(db, "opening_expired", `EXISTS (SELECT 1 FROM json_each(?) opening WHERE coalesce(
+        julianday(json_extract(opening.value, '$.checked_at')) BETWEEN julianday('now') - 1 AND julianday('now'), 0) IS 0)`, evidence),
+    ];
+    const results = await execute<Job>(db, [...checks, ...statements]);
     return { jobs: results.flatMap((result) => result.results).map(withEligibleOpening) };
   } catch (error) {
     duplicateError(error);
@@ -396,33 +419,25 @@ const reapplyStatusSql = `CASE
   WHEN reapply_after > ? THEN 'cooldown'
   ELSE 'eligible' END`;
 
-async function requireJob({ db, userId }: UserStore, id: string) {
-  const job = await db.prepare(`SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ? AND id IS ?`)
-    .bind(new Date().toISOString(), userId, id).first<Job>();
-  if (!job) fail("Job not found. Use list_jobs to resolve a company, role, or nickname to its job_id.");
-  return job;
-}
-
-async function requireStage({ db, userId }: UserStore, id: string) {
-  const stage = await db.prepare("SELECT * FROM stages WHERE user_id IS ? AND id IS ?").bind(userId, id).first<Stage>();
-  if (!stage) fail("Stage not found. Use get_job to load its stages and stage_id values.");
-  return stage;
-}
-
-export async function getJob(scope: UserStore, id: string) {
+function jobStatements(scope: UserStore, idSql: string, bindings: unknown[]) {
   const { db, userId } = scope;
-  const job = await requireJob(scope, id);
-  const [stages, feedback, contacts, outreach, prepNotes] = await Promise.all([
-    db.prepare("SELECT * FROM stages WHERE user_id IS ? AND job_id IS ? ORDER BY created_at, rowid").bind(userId, id).all<Stage>(),
+  return [
+    db.prepare(`SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ? AND id IS (${idSql})`)
+      .bind(new Date().toISOString(), userId, ...bindings),
+    db.prepare(`SELECT * FROM stages WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY created_at, rowid`).bind(userId, ...bindings),
     db.prepare(`SELECT f.*, s.name AS stage_name FROM feedback f JOIN stages s ON s.id IS f.stage_id AND s.user_id IS f.user_id
-      WHERE f.user_id IS ? AND s.job_id IS ? ORDER BY f.created_at, f.rowid`).bind(userId, id).all<Feedback & { stage_name: string }>(),
-    db.prepare("SELECT * FROM contact_activity WHERE user_id IS ? AND job_id IS ? ORDER BY created_at, id")
-      .bind(userId, id).all<ContactActivity>(),
-    db.prepare("SELECT * FROM outreach WHERE user_id IS ? AND job_id IS ? ORDER BY occurred_at, created_at, rowid")
-      .bind(userId, id).all<Outreach>(),
-    db.prepare("SELECT id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at FROM prep_notes WHERE user_id IS ? AND job_id IS ? ORDER BY created_at, rowid")
-      .bind(userId, id).all<PrepNote>(),
-  ]);
+      WHERE f.user_id IS ? AND s.job_id IS (${idSql}) ORDER BY f.created_at, f.rowid`).bind(userId, ...bindings),
+    db.prepare(`SELECT * FROM contact_activity WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY created_at, id`).bind(userId, ...bindings),
+    db.prepare(`SELECT * FROM outreach WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY occurred_at, created_at, rowid`).bind(userId, ...bindings),
+    db.prepare(`SELECT id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at FROM prep_notes
+      WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY created_at, rowid`).bind(userId, ...bindings),
+  ];
+}
+
+function jobResult(results: D1Result[]) {
+  const [jobs, stages, feedback, contacts, outreach, prepNotes] = results as [D1Result<Job>, D1Result<Stage>, D1Result<Feedback & { stage_name: string }>, D1Result<ContactActivity>, D1Result<Outreach>, D1Result<PrepNote>];
+  const job = jobs.results[0];
+  if (!job) fail("Job not found. Use list_jobs to resolve a company, role, or nickname to its job_id.");
   return {
     job: withEligibleOpening(job), stages: stages.results, feedback: feedback.results, contacts: contacts.results, outreach: outreach.results,
     prep_notes: prepNotes.results,
@@ -431,26 +446,28 @@ export async function getJob(scope: UserStore, id: string) {
   };
 }
 
+export const getJob = async (scope: UserStore, id: string) => jobResult(await execute(scope.db, jobStatements(scope, "?", [id])));
+
 export async function getInterviewPrep(scope: UserStore, input: InterviewPrep) {
   const { db, userId } = scope;
   const asOf = new Date().toISOString();
-  let stage: Stage | null;
-  if (input.stage_id) {
-    stage = await requireStage(scope, input.stage_id);
-    if (input.job_id && stage.job_id !== input.job_id) fail("Stage does not belong to this job.");
-    if (input.stage_name && stage.name !== input.stage_name) fail("Stage does not match stage_name.");
-  } else {
-    stage = await db.prepare(`SELECT s.* FROM stages s JOIN jobs j ON j.user_id IS s.user_id AND j.id IS s.job_id
+  const selected = input.stage_id ? "?" : `SELECT s.id FROM stages s JOIN jobs j ON j.user_id IS s.user_id AND j.id IS s.job_id
       WHERE s.user_id IS ? AND j.phase IS 'application' AND j.status IN ('active', 'offer')
         AND (? IS NULL OR s.job_id IS ?) AND (? IS NULL OR s.name IS ?)
         AND s.status IN ('planned', 'in_progress') AND s.starts_at IS NOT NULL
         AND (s.starts_at >= ? OR s.ends_at > ? OR (s.status IS 'in_progress' AND s.ends_at IS NULL))
-      ORDER BY s.starts_at, s.id LIMIT 1`)
-      .bind(userId, input.job_id ?? null, input.job_id ?? null, input.stage_name ?? null, input.stage_name ?? null, asOf, asOf).first<Stage>();
-  }
-  const jobId = input.job_id ?? stage?.job_id;
-  if (!jobId) fail("No upcoming interview found. Supply job_id and optionally stage_name to prepare for an unscheduled call.");
-  const { job, stages, feedback, contacts, prep_notes } = await getJob(scope, jobId);
+      ORDER BY s.starts_at, s.id LIMIT 1`;
+  const selectionBindings = input.stage_id ? [input.stage_id] : [userId, input.job_id ?? null, input.job_id ?? null, input.stage_name ?? null, input.stage_name ?? null, asOf, asOf];
+  const results = await execute(db, [
+    db.prepare(`SELECT * FROM stages WHERE user_id IS ? AND id IS (${selected})`).bind(userId, ...selectionBindings),
+    ...jobStatements(scope, `coalesce(?, (SELECT job_id FROM stages WHERE user_id IS ? AND id IS (${selected})))`, [input.job_id ?? null, userId, ...selectionBindings]),
+  ]);
+  const stage = (results[0]?.results[0] ?? null) as Stage | null;
+  if (input.stage_id && !stage) fail("Stage not found. Use get_job to load its stages and stage_id values.");
+  if (stage && input.job_id && stage.job_id !== input.job_id) fail("Stage does not belong to this job.");
+  if (stage && input.stage_name && stage.name !== input.stage_name) fail("Stage does not match stage_name.");
+  if (!input.job_id && !stage) fail("No upcoming interview found. Supply job_id and optionally stage_name to prepare for an unscheduled call.");
+  const { job, stages, feedback, contacts, prep_notes } = jobResult(results.slice(1));
   const stageName = input.stage_name ?? stage?.name ?? null;
   return {
     as_of: asOf, job, stage, stage_name: stageName,
@@ -461,27 +478,34 @@ export async function getInterviewPrep(scope: UserStore, input: InterviewPrep) {
 
 export async function addPrepNote(scope: UserStore, input: AddPrepNote) {
   const { db, userId } = scope;
-  await requireJob(scope, input.job_id);
   const now = new Date().toISOString();
-  return db.prepare(`INSERT INTO prep_notes (user_id, id, job_id, kind, text, stage_name, created_at, updated_at)
+  const results = await execute<PrepNote>(db, [requireRow(scope, "jobs", input.job_id, "job_not_found"),
+    db.prepare(`INSERT INTO prep_notes (user_id, id, job_id, kind, text, stage_name, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at`)
-    .bind(userId, crypto.randomUUID(), input.job_id, input.kind, input.text, input.stage_name ?? null, now, now).first<PrepNote>();
+      .bind(userId, crypto.randomUUID(), input.job_id, input.kind, input.text, input.stage_name ?? null, now, now),
+  ]);
+  return results.at(-1)?.results[0];
 }
 
-export async function updatePrepNote({ db, userId }: UserStore, input: UpdatePrepNote) {
-  const note = await db.prepare("SELECT * FROM prep_notes WHERE user_id IS ? AND id IS ?")
-    .bind(userId, input.prep_note_id).first<PrepNote>();
-  if (!note) fail("Prep note not found. Use get_job to load prep_note_id values.");
+export async function updatePrepNote(scope: UserStore, input: UpdatePrepNote) {
+  const { db, userId } = scope;
   if (input.kind === undefined && input.text === undefined && input.stage_name === undefined && input.status === undefined && input.resolution === undefined) fail("Provide at least one field to update.");
-  const status = input.status ?? note.status;
-  if (status === "pending" && input.resolution != null) fail("A resolution requires resolved or cancelled status. Reopening clears the previous resolution.");
   const now = new Date().toISOString();
-  const resolution = status === "pending" ? null : input.resolution === undefined ? note.resolution : input.resolution;
-  const closedAt = status === "pending" ? null : status === note.status ? note.closed_at : now;
-  return db.prepare(`UPDATE prep_notes SET kind = ?, text = ?, stage_name = ?, status = ?, resolution = ?, closed_at = ?, updated_at = ?
-    WHERE user_id IS ? AND id IS ? RETURNING id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at`)
-    .bind(input.kind ?? note.kind, input.text ?? note.text, input.stage_name === undefined ? note.stage_name : input.stage_name,
-      status, resolution, closedAt, now, userId, input.prep_note_id).first<PrepNote>();
+  const results = await execute<PrepNote>(db, [
+    requireRow(scope, "prep_notes", input.prep_note_id, "prep_note_not_found"),
+    check(db, "prep_resolution", `? IS NOT NULL AND EXISTS (SELECT 1 FROM prep_notes WHERE user_id IS ? AND id IS ? AND coalesce(?, status) IS 'pending')`,
+      input.resolution ?? null, userId, input.prep_note_id, input.status ?? null),
+    db.prepare(`UPDATE prep_notes SET kind = coalesce(?, kind), text = coalesce(?, text),
+      stage_name = CASE WHEN ? THEN ? ELSE stage_name END,
+      resolution = CASE WHEN coalesce(?, status) IS 'pending' THEN NULL WHEN ? THEN ? ELSE resolution END,
+      closed_at = CASE WHEN coalesce(?, status) IS 'pending' THEN NULL WHEN ? IS status OR ? IS NULL THEN closed_at ELSE ? END,
+      status = coalesce(?, status), updated_at = ?
+      WHERE user_id IS ? AND id IS ? RETURNING id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at`)
+      .bind(input.kind ?? null, input.text ?? null, Number(input.stage_name !== undefined), input.stage_name ?? null,
+        input.status ?? null, Number(input.resolution !== undefined), input.resolution ?? null,
+        input.status ?? null, input.status ?? null, input.status ?? null, now, input.status ?? null, now, userId, input.prep_note_id),
+  ]);
+  return results.at(-1)?.results[0];
 }
 
 const searchPattern = (query: string) => `%${query.replace(/[\\%_]/gu, "\\$&")}%`;
@@ -492,7 +516,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
   const page = `${scope} ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`;
   const scheduled = `s.status IN ('planned', 'in_progress') AND s.starts_at IS NOT NULL
     AND (s.starts_at >= ? OR s.ends_at > ? OR (s.status IS 'in_progress' AND s.ends_at IS NULL))`;
-  const [summary, jobs, contacts, stages, prepNotes] = await db.batch([
+  const [summary, jobs, contacts, stages, prepNotes] = await execute(db, [
     db.prepare(`WITH pipeline AS (${scope}) SELECT COUNT(*) AS applications,
       COUNT(CASE WHEN j.status IS 'active' THEN 1 END) AS active,
       COUNT(CASE WHEN j.status IS 'offer' THEN 1 END) AS offers,
@@ -549,7 +573,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
   };
 }
 
-export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
+function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
   const where: string[] = [];
   const bindings: (string | number)[] = [input.as_of ? normalizeTimestamp(input.as_of) : new Date().toISOString(), userId];
   if (input.query) {
@@ -570,7 +594,7 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis,
     employer_salary, asked_salary,
     created_at, updated_at`;
-  const results = await db.prepare(`WITH opportunities AS (
+  return db.prepare(`WITH opportunities AS (
     SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ?
   ) SELECT ${columns},
     (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id AND o.direction IS 'outbound') AS last_outreach_at,
@@ -578,7 +602,10 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
     (SELECT MIN(c.follow_up_at) FROM contact_activity c WHERE c.user_id IS jobs.user_id AND c.job_id IS jobs.id AND c.needs_follow_up IS 1) AS follow_up_at
     FROM opportunities AS jobs
     ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY score ${scoreDirection} NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
-    .bind(...bindings, input.limit + 1, input.offset).all<Omit<Job, "description"> & { description?: string }>();
+    .bind(...bindings, input.limit + 1, input.offset);
+}
+
+function listJobsResult(results: D1Result<Omit<Job, "description"> & { description?: string }>, input: ListJobs) {
   const hasMore = results.results.length > input.limit;
   return {
     jobs: results.results.slice(0, input.limit).map(withEligibleOpening),
@@ -586,52 +613,58 @@ export async function listJobs({ db, userId }: UserStore, input: ListJobs) {
   };
 }
 
-function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "feedback" | "contacts" | "outreach", id: string, patch: Record<string, string | number | null | undefined>) {
+export async function listJobs(scope: UserStore, input: ListJobs) {
+  const results = await execute<Omit<Job, "description"> & { description?: string }>(scope.db, [listJobsStatement(scope, input)]);
+  return listJobsResult(results[0]!, input);
+}
+
+export async function getLeadContext(scope: UserStore, input: ListJobs) {
+  const results = await execute(scope.db, [criteriaStatement(scope), listJobsStatement(scope, input)]);
+  return { criteria: (results[0]?.results[0] ?? null) as Criteria | null,
+    ...listJobsResult(results[1] as D1Result<Omit<Job, "description"> & { description?: string }>, input) };
+}
+
+const requireRow = ({ db, userId }: UserStore, table: "jobs" | "stages" | "contacts" | "outreach" | "prep_notes", id: string, code: string) =>
+  check(db, code, `NOT EXISTS (SELECT 1 FROM ${table} WHERE user_id IS ? AND id IS ?)`, userId, id);
+
+function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "feedback" | "contacts" | "outreach", id: string, patch: Record<string, string | number | null | undefined>, expressions: Record<string, string> = {}) {
   const entries = Object.entries(patch).filter((entry) => entry[1] !== undefined);
-  if (entries.length === 0) fail("Provide at least one field to update.");
-  return db.prepare(`UPDATE ${table} SET ${entries.map(([key]) => `${key} = ?`).join(", ")}, updated_at = ? WHERE user_id IS ? AND id IS ? RETURNING *`)
+  const assignments = [...entries.map(([key]) => `${key} = ?`), ...Object.entries(expressions).map(([key, sql]) => `${key} = ${sql}`)];
+  if (assignments.length === 0) fail("Provide at least one field to update.");
+  return db.prepare(`UPDATE ${table} SET ${assignments.join(", ")}, updated_at = ? WHERE user_id IS ? AND id IS ? RETURNING *`)
     .bind(...entries.map(([, value]) => value), new Date().toISOString(), userId, id);
 }
 
 export async function updateJob(scope: UserStore, input: UpdateJob) {
-  const job = await requireJob(scope, input.job_id);
+  const { db, userId } = scope;
   const { job_id, eligible_opening, ...patch } = prepareSalaryInput(input);
-  if ((input.phase ?? job.phase) === "lead" && (input.status ?? job.status) !== "active") {
-    fail("Leads must stay active. Use remove_lead if an uncontacted lead no longer meets the criteria; rejected, withdrawn, offer and accepted describe actual applications only.");
-  }
-  if (job.phase === "application" && input.phase === "lead") {
-    fail("An application cannot return to a lead. Preserve its outcome and process history; create a separate application for a new attempt.");
-  }
-  if (input.phase === "application" && job.phase === "lead" && patch.current_stage === undefined) patch.current_stage = "applied";
-  const lifecycle = { ...job, ...patch };
-  if (lifecycle.phase === "lead" && !v.is(jobLifecycleSchema, lifecycle)) {
-    fail("A lead must stay active at the lead milestone without recruiter engagement or reapplication policy. Start an actual application before recording application state; add_stage and record_outreach start it atomically.");
-  }
-  if (lifecycle.phase === "application" && input.current_stage === "lead") {
-    fail("An application requires an application milestone; it cannot return to the lead milestone.");
-  }
-  const needsOpening = input.phase !== undefined || input.company !== undefined || input.company_url !== undefined ||
-    ((input.phase ?? job.phase) === "lead" && input.status === "active");
-  let opening: EligibleOpening | undefined;
-  if (needsOpening || eligible_opening !== undefined) opening = validateEligibleOpening(eligible_opening, await getCriteria(scope));
+  const opening = eligible_opening === undefined ? undefined : validateEligibleOpening(eligible_opening);
+  const statements = [requireRow(scope, "jobs", job_id, "job_not_found"),
+    check(db, "leads_stay_active", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
+      AND coalesce(?, phase) IS 'lead' AND coalesce(?, status) IS NOT 'active')`, userId, job_id, input.phase ?? null, input.status ?? null),
+    check(db, "application_to_lead", `? IS 'lead' AND EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'application')`, input.phase ?? null, userId, job_id),
+  ];
+  if (opening) statements.push(...openingChecks(scope, "?", [JSON.stringify(opening)]));
+  else statements.push(check(db, "opening_required", `? OR (? AND EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'lead'))`,
+    Number(input.phase !== undefined || input.company !== undefined || input.company_url !== undefined),
+    Number(input.status === "active"), userId, job_id));
   if (patch.recruiter_engaged_at) {
     patch.recruiter_engaged_at = normalizeTimestamp(patch.recruiter_engaged_at);
     if (Date.parse(patch.recruiter_engaged_at) > Date.now()) fail("recruiter_engaged_at records actual recruiter contact and cannot be in the future.");
   }
   if (patch.reapply_after) patch.reapply_after = normalizeTimestamp(patch.reapply_after);
-  const reapplyPolicy = patch.reapply_policy === undefined ? job.reapply_policy : patch.reapply_policy;
-  const reapplyAfter = patch.reapply_after === undefined ? job.reapply_after : patch.reapply_after;
-  if (reapplyAfter !== null && reapplyPolicy !== "allowed") fail("reapply_after requires reapply_policy:allowed. Clear the deadline when clearing or denying reapplication.");
-  validateOpening(input.phase ?? job.phase, input);
-  validateSalary({ ...job, ...patch });
-  validateSalaryAsk({ ...job, ...patch });
-  validateDeclaredSalary({ ...job, ...patch });
   // Scores for changed descriptions must come from a new ranking.
   const invalidates = [input.company, input.title, input.description, input.location, opening].some((value) => value !== undefined);
   if (invalidates && patch.score === undefined) patch.score = null;
+  const expressions = input.phase === "application" && patch.current_stage === undefined
+    ? { current_stage: "CASE WHEN phase IS 'lead' THEN 'applied' ELSE current_stage END" } : {};
   try {
-    await patchStatement(scope, "jobs", job_id, { ...patch, eligible_opening: opening ? JSON.stringify(opening) : undefined }).run();
-    return withEligibleOpening(await requireJob(scope, job_id));
+    statements.push(patchStatement(scope, "jobs", job_id, { ...patch, eligible_opening: opening ? JSON.stringify(opening) : undefined }, expressions));
+    const results = await execute<Job>(db, statements);
+    const job = results.at(-1)!.results[0]!;
+    return withEligibleOpening({ ...job, reapply_status: job.status !== "rejected" ? "not_applicable"
+      : job.reapply_policy === null ? "unknown" : job.reapply_policy === "not_allowed" ? "not_allowed"
+      : job.reapply_after !== null && job.reapply_after > new Date().toISOString() ? "cooldown" : "eligible" });
   } catch (error) {
     duplicateError(error);
   }
@@ -639,12 +672,14 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
 
 export async function removeLead(scope: UserStore, id: string) {
   const { db, userId } = scope;
-  await requireJob(scope, id);
-  const removed = await db.prepare(`DELETE FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'lead'
+  const results = await execute<{ id: string }>(db, [requireRow(scope, "jobs", id, "job_not_found"),
+    db.prepare(`DELETE FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'lead'
     AND current_stage IS 'lead' AND recruiter_engaged_at IS NULL
     AND NOT EXISTS (SELECT 1 FROM stages s WHERE s.user_id IS jobs.user_id AND s.job_id IS jobs.id)
     AND NOT EXISTS (SELECT 1 FROM outreach o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id)
-    RETURNING id`).bind(userId, id).first<{ id: string }>();
+    RETURNING id`).bind(userId, id),
+  ]);
+  const removed = results.at(-1)?.results[0];
   if (!removed) fail("Only uncontacted leads can be removed. Preserve actual application and communication history.");
   return { job_id: removed.id, removed: true };
 }
@@ -664,92 +699,83 @@ function validateSchedule(stage: Pick<Stage, "starts_at" | "ends_at" | "timezone
     if (stage.ends_at !== null || stage.timezone !== null) fail("A timezone or end time requires starts_at. Clear all three to remove a schedule.");
   } else {
     if (stage.timezone === null) fail("Scheduled stages require an IANA timezone, for example America/Los_Angeles or UTC.");
-    try {
-      new Intl.DateTimeFormat("en", { timeZone: stage.timezone }).resolvedOptions();
-    } catch {
-      fail("Use a valid IANA timezone, for example America/Los_Angeles or UTC.");
-    }
+    validateTimezone(stage.timezone);
     if (stage.ends_at !== null && stage.ends_at <= stage.starts_at) fail("ends_at must be later than starts_at.");
   }
   if (stage.calendar_event_id !== null && stage.calendar_id === null) fail("Provide calendar_id with calendar_event_id.");
 }
 
-async function startApplication(scope: UserStore, job: Job, milestone: AddStage["name"]) {
-  if (job.phase === "application") return [];
-  validateEligibleOpening(job.eligible_opening === null ? null : JSON.parse(job.eligible_opening), await getCriteria(scope));
-  return [scope.db.prepare("UPDATE jobs SET phase = 'application', current_stage = ?, updated_at = ? WHERE user_id IS ? AND id IS ? AND phase IS 'lead'")
-    .bind(milestone, new Date().toISOString(), scope.userId, job.id)];
+function validateTimezone(timezone: string) {
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: timezone }).resolvedOptions();
+  } catch {
+    fail("Use a valid IANA timezone, for example America/Los_Angeles or UTC.");
+  }
+}
+
+function startApplication(scope: UserStore, jobSql: string, bindings: unknown[], milestone: AddStage["name"], makeCurrent = false) {
+  const { db, userId } = scope;
+  const target = `FROM jobs WHERE user_id IS ? AND id IS (${jobSql})`;
+  const targetBindings = [userId, ...bindings];
+  return [
+    check(db, "job_not_found", `NOT EXISTS (SELECT 1 ${target})`, ...targetBindings),
+    ...openingChecks(scope, `SELECT eligible_opening ${target}`, targetBindings,
+      `EXISTS (SELECT 1 ${target} AND phase IS 'lead')`, targetBindings),
+    db.prepare(`UPDATE jobs SET phase = 'application',
+      current_stage = CASE WHEN phase IS 'lead' OR ? THEN ? ELSE current_stage END, updated_at = ?
+      WHERE user_id IS ? AND id IS (${jobSql}) AND (phase IS 'lead' OR ?)`)
+      .bind(Number(makeCurrent), milestone, new Date().toISOString(), ...targetBindings, Number(makeCurrent)),
+  ];
 }
 
 export async function addStage(scope: UserStore, input: AddStage) {
   const { db, userId } = scope;
-  const job = await requireJob(scope, input.job_id);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const startsAt = input.starts_at ? normalizeTimestamp(input.starts_at) : null;
   const endsAt = input.ends_at ? normalizeTimestamp(input.ends_at) : null;
   const timezone = input.timezone ?? (startsAt === null ? null : "UTC");
   validateSchedule({ starts_at: startsAt, ends_at: endsAt, timezone, calendar_event_id: null, calendar_id: null });
-  const statements = [...await startApplication(scope, job, input.name), db.prepare(`INSERT INTO stages
+  const statements = [...startApplication(scope, "?", [input.job_id], input.name, input.make_current), db.prepare(`INSERT INTO stages
     (user_id, id, job_id, name, status, starts_at, ends_at, timezone, location, contact_name, contact_email, notes, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(userId, id, input.job_id, input.name,
     input.status, startsAt, endsAt, timezone, input.location ?? null, input.contact_name ?? null,
     input.contact_email ?? null, input.notes ?? null, now, now)];
-  if (input.make_current) statements.push(db.prepare("UPDATE jobs SET current_stage = ?, updated_at = ? WHERE user_id IS ? AND id IS ?")
-    .bind(input.name, now, userId, input.job_id));
-  await db.batch(statements);
-  return requireStage(scope, id);
+  const results = await execute<Stage>(db, statements);
+  return results.at(-1)?.results[0];
 }
 
 export async function updateStage(scope: UserStore, input: UpdateStage) {
   const { db, userId } = scope;
-  const stage = await requireStage(scope, input.stage_id);
   const { stage_id, make_current, ...patch } = input;
-  if (make_current && !v.is(pipelineStageSchema, patch.name ?? stage.name)) {
-    fail("Rename this legacy stage to a predefined pipeline milestone before making it current. Prepared forms, drafts, and browser handoffs are not pipeline stages.");
-  }
   if (patch.starts_at) patch.starts_at = normalizeTimestamp(patch.starts_at);
   if (patch.ends_at) patch.ends_at = normalizeTimestamp(patch.ends_at);
-  if (patch.starts_at && patch.timezone === undefined && stage.timezone === null) patch.timezone = "UTC";
-  const merged = {
-    starts_at: patch.starts_at === undefined ? stage.starts_at : patch.starts_at,
-    ends_at: patch.ends_at === undefined ? stage.ends_at : patch.ends_at,
-    timezone: patch.timezone === undefined ? stage.timezone : patch.timezone,
-    calendar_id: patch.calendar_id === undefined ? stage.calendar_id : patch.calendar_id,
-    calendar_event_id: patch.calendar_event_id === undefined ? stage.calendar_event_id : patch.calendar_event_id,
-  };
-  validateSchedule(merged);
-  const statements: D1PreparedStatement[] = [];
-  if (Object.keys(patch).length > 0) statements.push(patchStatement(scope, "stages", stage_id, patch));
-  if (make_current) statements.push(db.prepare("UPDATE jobs SET current_stage = ?, updated_at = ? WHERE user_id IS ? AND id IS ?")
-    .bind(patch.name ?? stage.name, new Date().toISOString(), userId, stage.job_id));
-  if (statements.length === 0) fail("Provide a field to update or set make_current to true.");
-  await db.batch(statements);
-  return requireStage(scope, stage_id);
-}
-
-async function requireContact({ db, userId }: UserStore, id: string) {
-  const contact = await db.prepare("SELECT * FROM contacts WHERE user_id IS ? AND id IS ?").bind(userId, id).first<Contact>();
-  if (!contact) fail("Contact not found. Use get_job to find this employer's contacts.");
-  return contact;
-}
-
-async function requireOutreach({ db, userId }: UserStore, id: string) {
-  const outreach = await db.prepare("SELECT * FROM outreach WHERE user_id IS ? AND id IS ?").bind(userId, id).first<Outreach>();
-  if (!outreach) fail("Outreach not found. Use get_job to find the communication history.");
-  return outreach;
+  if (patch.timezone) validateTimezone(patch.timezone);
+  if (Object.keys(patch).length === 0 && !make_current) fail("Provide a field to update or set make_current to true.");
+  const statements = [requireRow(scope, "stages", stage_id, "stage_not_found")];
+  if (make_current) statements.push(check(db, "legacy_milestone", `EXISTS (SELECT 1 FROM stages WHERE user_id IS ? AND id IS ?
+    AND coalesce(?, name) NOT IN (${pipelineStageSchema.options.map(() => "?").join(", ")}))`, userId, stage_id, patch.name ?? null, ...pipelineStageSchema.options));
+  const expressions: Record<string, string> = patch.starts_at && patch.timezone === undefined ? { timezone: "coalesce(timezone, 'UTC')" } : {};
+  if (Object.keys(patch).length > 0) statements.push(patchStatement(scope, "stages", stage_id, patch, expressions));
+  if (make_current) statements.push(db.prepare(`UPDATE jobs SET current_stage = (SELECT name FROM stages WHERE user_id IS ? AND id IS ?), updated_at = ?
+    WHERE user_id IS ? AND id IS (SELECT job_id FROM stages WHERE user_id IS ? AND id IS ?)`)
+    .bind(userId, stage_id, new Date().toISOString(), userId, userId, stage_id));
+  statements.push(db.prepare("SELECT * FROM stages WHERE user_id IS ? AND id IS ?").bind(userId, stage_id));
+  const results = await execute<Stage>(db, statements);
+  return results.at(-1)?.results[0];
 }
 
 export async function updateContact(scope: UserStore, input: UpdateContact) {
   const { db, userId } = scope;
   const { contact_id, job_id, ...patch } = input;
-  const contact = await requireContact(scope, contact_id);
-  if (contact.job_id !== job_id) fail("Contact does not belong to this job.");
-  const communication = await db.prepare("SELECT id FROM outreach WHERE user_id IS ? AND contact_id IS ? LIMIT 1")
-    .bind(userId, contact_id).first<{ id: string }>();
-  if (!communication) fail("Contacts require actual communication. Record the real interaction with record_outreach first.");
   try {
-    return await patchStatement(scope, "contacts", contact_id, patch).first<Contact>();
+    const results = await execute<Contact>(db, [
+      requireRow(scope, "contacts", contact_id, "contact_not_found"),
+      check(db, "contact_job", `EXISTS (SELECT 1 FROM contacts WHERE user_id IS ? AND id IS ? AND job_id IS NOT ?)`, userId, contact_id, job_id),
+      check(db, "contact_communication", `NOT EXISTS (SELECT 1 FROM outreach WHERE user_id IS ? AND contact_id IS ?)`, userId, contact_id),
+      patchStatement(scope, "contacts", contact_id, patch),
+    ]);
+    return results.at(-1)?.results[0];
   } catch (error) {
     if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
       fail("A contact with this URL or email already exists for this job. Use get_job to find its contact_id.");
@@ -768,36 +794,37 @@ export async function recordOutreach(scope: UserStore, input: RecordOutreach) {
   if ((input.contact_id === undefined) === (input.contact === undefined)) {
     fail("Provide exactly one of contact_id for an existing contact or contact with job_id and name for the actual first communication.");
   }
-  const existing = input.contact_id ? await requireContact(scope, input.contact_id) : undefined;
-  const jobId = existing?.job_id ?? input.contact?.job_id;
-  if (!jobId) fail("A job is required for the actual first communication.");
-  const job = await requireJob(scope, jobId);
-  if (input.stage_id) {
-    const stage = await requireStage(scope, input.stage_id);
-    if (stage.job_id !== jobId) fail("Stage and contact must belong to the same job.");
-  }
+  const jobSql = input.contact ? "?" : "SELECT job_id FROM contacts WHERE user_id IS ? AND id IS ?";
+  const jobBindings = input.contact ? [input.contact.job_id] : [userId, input.contact_id];
   if (input.time_basis === "reported" && !input.occurred_at) fail("Reported event times require occurred_at; omit both to record the logging time.");
   const now = new Date().toISOString();
   const occurredAt = input.occurred_at ? normalizeTimestamp(input.occurred_at) : now;
   const followUpAt = input.follow_up_at ? normalizeTimestamp(input.follow_up_at) : null;
   const followUpStatus = input.follow_up_status ?? (input.direction === "outbound" || followUpAt !== null ? "pending" : null);
   validateOutreach({ direction: input.direction, occurred_at: occurredAt, follow_up_at: followUpAt, follow_up_status: followUpStatus });
-  const contactId = existing?.id ?? crypto.randomUUID();
+  const contactId = input.contact_id ?? crypto.randomUUID();
   const outreachId = crypto.randomUUID();
-  const statements = await startApplication(scope, job, "outreach");
+  const statements: Statement[] = [];
+  if (input.contact_id) statements.push(requireRow(scope, "contacts", input.contact_id, "contact_not_found"));
+  if (input.stage_id) statements.push(
+    requireRow(scope, "stages", input.stage_id, "stage_not_found"),
+    check(db, "stage_job", `EXISTS (SELECT 1 FROM stages WHERE user_id IS ? AND id IS ? AND job_id IS NOT (${jobSql}))`,
+      userId, input.stage_id, ...jobBindings),
+  );
+  statements.push(...startApplication(scope, jobSql, jobBindings, "outreach"));
   if (input.contact) {
     statements.push(db.prepare(`INSERT INTO contacts (user_id, id, job_id, name, relationship, url, email, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(userId, contactId, jobId, input.contact.name,
+      VALUES (?, ?, (${jobSql}), ?, ?, ?, ?, ?, ?, ?)`).bind(userId, contactId, ...jobBindings, input.contact.name,
       input.contact.relationship ?? "other", input.contact.url ?? null, input.contact.email ?? null, input.contact.notes ?? null, now, now));
   }
   statements.push(db.prepare(`INSERT INTO outreach (user_id, id, job_id, contact_id, stage_id, direction, occurred_at,
     time_basis, channel, notes, follow_up_at, follow_up_status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`)
-    .bind(userId, outreachId, jobId, contactId, input.stage_id ?? null, input.direction, occurredAt,
+    VALUES (?, ?, (${jobSql}), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`)
+    .bind(userId, outreachId, ...jobBindings, contactId, input.stage_id ?? null, input.direction, occurredAt,
       input.time_basis ?? (input.occurred_at ? "reported" : "recorded"), input.channel ?? null, input.notes ?? null,
       followUpAt, followUpStatus, now, now));
   try {
-    const results = await db.batch<Outreach>(statements);
+    const results = await execute<Outreach>(db, statements);
     return results.at(-1)?.results[0];
   } catch (error) {
     if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
@@ -808,7 +835,6 @@ export async function recordOutreach(scope: UserStore, input: RecordOutreach) {
 }
 
 export async function updateOutreach(scope: UserStore, input: UpdateOutreach) {
-  const outreach = await requireOutreach(scope, input.outreach_id);
   const { outreach_id, ...patch } = input;
   if (patch.occurred_at) {
     patch.occurred_at = normalizeTimestamp(patch.occurred_at);
@@ -818,13 +844,10 @@ export async function updateOutreach(scope: UserStore, input: UpdateOutreach) {
     patch.follow_up_at = normalizeTimestamp(patch.follow_up_at);
     patch.follow_up_status ??= "pending";
   }
-  validateOutreach({
-    direction: outreach.direction,
-    occurred_at: patch.occurred_at ?? outreach.occurred_at,
-    follow_up_at: patch.follow_up_at === undefined ? outreach.follow_up_at : patch.follow_up_at,
-    follow_up_status: patch.follow_up_status ?? outreach.follow_up_status,
-  });
-  return patchStatement(scope, "outreach", outreach_id, patch).first<Outreach>();
+  if (patch.occurred_at && Date.parse(patch.occurred_at) > Date.now()) fail("Outreach records actual communication; occurred_at cannot be in the future.");
+  const results = await execute<Outreach>(scope.db, [requireRow(scope, "outreach", outreach_id, "outreach_not_found"),
+    patchStatement(scope, "outreach", outreach_id, patch)]);
+  return results.at(-1)?.results[0];
 }
 
 export async function getFollowUps({ db, userId }: UserStore, input: FollowUps) {
@@ -837,11 +860,12 @@ export async function getFollowUps({ db, userId }: UserStore, input: FollowUps) 
   if (input.reached_out_before) {
     where.push("c.last_outreach_at <= ?"); bindings.push(normalizeTimestamp(input.reached_out_before));
   }
-  const result = await db.prepare(`SELECT c.*, j.company, j.title, j.phase, j.current_stage, j.recruiter_engaged_at
+  const results = await execute<ContactActivity & Pick<Job, "company" | "title" | "phase" | "current_stage" | "recruiter_engaged_at">>(db, [db.prepare(`SELECT c.*, j.company, j.title, j.phase, j.current_stage, j.recruiter_engaged_at
     FROM contact_activity c JOIN jobs j ON j.user_id IS c.user_id AND j.id IS c.job_id
     WHERE ${where.join(" AND ")}
     ORDER BY (j.recruiter_engaged_at IS NOT NULL), c.follow_up_at ASC NULLS LAST, c.last_outreach_at, c.id LIMIT ? OFFSET ?`)
-    .bind(...bindings, input.limit + 1, input.offset).all<ContactActivity & Pick<Job, "company" | "title" | "phase" | "current_stage" | "recruiter_engaged_at">>();
+    .bind(...bindings, input.limit + 1, input.offset)]);
+  const result = results[0]!;
   return {
     as_of: asOf,
     follow_ups: result.results.slice(0, input.limit).map((entry) => ({
@@ -856,15 +880,17 @@ export async function getFollowUps({ db, userId }: UserStore, input: FollowUps) 
 
 export async function addFeedback(scope: UserStore, input: AddFeedback) {
   const { db, userId } = scope;
-  await requireStage(scope, input.stage_id);
   const now = new Date().toISOString();
-  return db.prepare(`INSERT INTO feedback (user_id, id, stage_id, text, source, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(userId, crypto.randomUUID(), input.stage_id, input.text, input.source, now, now).first<Feedback>();
+  const results = await execute<Feedback>(db, [requireRow(scope, "stages", input.stage_id, "stage_not_found"),
+    db.prepare(`INSERT INTO feedback (user_id, id, stage_id, text, source, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(userId, crypto.randomUUID(), input.stage_id, input.text, input.source, now, now),
+  ]);
+  return results.at(-1)?.results[0];
 }
 
 export async function updateFeedback(scope: UserStore, input: UpdateFeedback) {
   const { feedback_id, ...patch } = input;
-  const feedback = await patchStatement(scope, "feedback", feedback_id, patch).first<Feedback>();
+  const feedback = await first<Feedback>(scope.db, patchStatement(scope, "feedback", feedback_id, patch));
   if (!feedback) fail("Feedback not found. Use get_job or list_feedback to find feedback_id values.");
   return feedback;
 }
@@ -875,10 +901,11 @@ export async function listFeedback({ db, userId }: UserStore, input: ListFeedbac
   if (input.job_id) { where.push("s.job_id IS ?"); bindings.push(input.job_id); }
   if (input.stage_name) { where.push("s.name LIKE ? ESCAPE '\\'"); bindings.push(searchPattern(input.stage_name)); }
   if (input.source) { where.push("f.source IS ?"); bindings.push(input.source); }
-  const results = await db.prepare(`SELECT f.*, s.name AS stage_name, s.status AS stage_status,
+  const batch = await execute<Feedback>(db, [db.prepare(`SELECT f.*, s.name AS stage_name, s.status AS stage_status,
     s.job_id, j.company, j.title, j.nickname FROM feedback f JOIN stages s ON s.id IS f.stage_id AND s.user_id IS f.user_id
     JOIN jobs j ON j.id IS s.job_id AND j.user_id IS s.user_id WHERE ${where.join(" AND ")} ORDER BY f.created_at DESC, f.id LIMIT ? OFFSET ?`)
-    .bind(...bindings, input.limit + 1, input.offset).all<Feedback>();
+    .bind(...bindings, input.limit + 1, input.offset)]);
+  const results = batch[0]!;
   return { feedback: results.results.slice(0, input.limit), next_offset: results.results.length > input.limit ? input.offset + input.limit : null };
 }
 
@@ -886,16 +913,24 @@ export async function getUpcoming({ db, userId }: UserStore, input: Upcoming) {
   const from = normalizeTimestamp(input.from);
   const to = input.to ? normalizeTimestamp(input.to) : null;
   if (to !== null && to <= from) fail("to must be later than from.");
-  const results = await db.prepare(`SELECT s.*, j.company, j.title, j.nickname, j.recruiter_name, j.recruiter_email
+  const batch = await execute<Stage>(db, [db.prepare(`SELECT s.*, j.company, j.title, j.nickname, j.recruiter_name, j.recruiter_email
     FROM stages s JOIN jobs j ON j.id IS s.job_id AND j.user_id IS s.user_id WHERE s.user_id IS ? AND s.status IN ('planned', 'in_progress')
     AND j.status IN ('active', 'offer') AND s.starts_at >= ? AND (? IS NULL OR s.starts_at < ?)
-    ORDER BY s.starts_at, s.id LIMIT ? OFFSET ?`).bind(userId, from, to, to, input.limit + 1, input.offset).all<Stage>();
+    ORDER BY s.starts_at, s.id LIMIT ? OFFSET ?`).bind(userId, from, to, to, input.limit + 1, input.offset)]);
+  const results = batch[0]!;
   return { stages: results.results.slice(0, input.limit), next_offset: results.results.length > input.limit ? input.offset + input.limit : null };
 }
 
 export async function getCalendarEvent(scope: UserStore, input: CalendarEvent) {
-  const stage = await requireStage(scope, input.stage_id);
-  const job = await requireJob(scope, stage.job_id);
+  const { db, userId } = scope;
+  const results = await execute(db, [
+    db.prepare("SELECT * FROM stages WHERE user_id IS ? AND id IS ?").bind(userId, input.stage_id),
+    db.prepare(`SELECT * FROM jobs WHERE user_id IS ? AND id IS (SELECT job_id FROM stages WHERE user_id IS ? AND id IS ?)`)
+      .bind(userId, userId, input.stage_id),
+  ]);
+  const stage = results[0]?.results[0] as Stage | undefined;
+  if (!stage) fail("Stage not found. Use get_job to load its stages and stage_id values.");
+  const job = results[1]!.results[0] as Job;
   if (stage.calendar_event_id !== null && input.calendar_id && input.calendar_id !== stage.calendar_id) {
     fail("This stage already has an event in a different calendar. Read the linked event before moving or replacing it.");
   }

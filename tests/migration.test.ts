@@ -4,6 +4,60 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("trigger-free rebuild preserves CRM records and ordering while enforcing relational and row constraints", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const file of migrations.filter((name) => name < "0011")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, current_stage, salary_min, salary_max, salary_currency, salary_period,
+          salary_ask_amount, salary_ask_currency, salary_ask_period, created_at, updated_at) VALUES
+          ('alice', 'application', 'Historical employer', 'application', 'Legacy screening', 100000, 150000, 'USD', 'year', 12000, 'EUR', 'month', 'created', 'updated'),
+          ('bob', 'lead', 'Untouched employer', 'lead', 'lead', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'created', 'updated');
+        INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'round', 'application', 'Legacy screening', 'created', 'updated');
+        INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)
+          VALUES ('alice', 'reflection', 'round', 'Preserve history', 'created', 'updated');
+        INSERT INTO contacts (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'person', 'application', 'Example contact', 'created', 'updated');
+        INSERT INTO outreach (user_id, id, job_id, contact_id, stage_id, direction, occurred_at, time_basis, follow_up_status, created_at, updated_at)
+          VALUES ('alice', 'message', 'application', 'person', 'round', 'outbound', '2026-01-01T00:00:00.000Z', 'reported', 'pending', 'created', 'updated');`);
+      for (const file of migrations.filter((name) => name >= "0011" && name < "0018")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec(`INSERT INTO prep_notes (user_id, id, job_id, kind, text, created_at, updated_at)
+        VALUES ('alice', 'prep', 'application', 'reminder', 'Ask about team scope', 'created', 'updated');
+        UPDATE jobs SET employer_salary = '{"text":"Negotiable"}', asked_salary = '{"min":100,"max":120}',
+          salary_declared_amount = 10000, salary_declared_currency = 'EUR', salary_declared_period = 'month'
+          WHERE id IS 'application';`);
+      const tables = ["jobs", "stages", "feedback", "contacts", "outreach", "prep_notes"];
+      const snapshots = tables.map((table) => ({
+        table,
+        columns: db.prepare(`PRAGMA table_info(${table})`).all().map((column) => String(column.name)),
+        rows: db.prepare(`SELECT rowid, * FROM ${table} ORDER BY rowid`).all(),
+      }));
+      for (const file of migrations.filter((name) => name >= "0018")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema WHERE type IS 'trigger'").all(), []);
+      for (const { table, columns, rows } of snapshots) {
+        assert.deepEqual(db.prepare(`SELECT rowid, ${columns.join(", ")} FROM ${table} ORDER BY rowid`).all(), rows);
+      }
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      assert.throws(() => db.exec("INSERT INTO jobs (user_id, id, company, created_at, updated_at) VALUES ('bob', 'invalid', 'No evidence', 'created', 'updated')"), /opening_required/u);
+      assert.throws(() => db.exec("UPDATE jobs SET status = 'withdrawn' WHERE id IS 'lead'"), /leads_stay_active/u);
+      assert.throws(() => db.exec("UPDATE jobs SET current_stage = 'outreach' WHERE id IS 'lead'"), /lead_application_state/u);
+      assert.throws(() => db.exec("UPDATE jobs SET current_stage = 'lead' WHERE id IS 'application'"), /application_milestone/u);
+      assert.throws(() => db.exec("UPDATE stages SET job_id = 'lead', user_id = 'bob' WHERE id IS 'round'"), /FOREIGN KEY/u);
+      assert.throws(() => db.exec("UPDATE outreach SET job_id = 'lead', user_id = 'bob' WHERE id IS 'message'"), /FOREIGN KEY/u);
+      assert.throws(() => db.exec("UPDATE stages SET name = 'prepared' WHERE id IS 'round'"), /pipeline_milestone/u);
+      db.exec("UPDATE stages SET status = 'completed' WHERE id IS 'round'");
+      db.exec("UPDATE jobs SET notes = 'Legacy facts remain editable' WHERE id IS 'application'");
+      assert.equal(db.prepare("SELECT name FROM stages WHERE id IS 'round'").get()?.name, "Legacy screening");
+      assert.equal(db.prepare("SELECT last_outreach_at FROM contact_activity WHERE id IS 'person'").get()?.last_outreach_at, "2026-01-01T00:00:00.000Z");
+      db.exec("DELETE FROM jobs WHERE id IS 'application'");
+      for (const table of tables.filter((name) => name !== "jobs")) assert.deepEqual(db.prepare(`SELECT * FROM ${table}`).all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("active-only lead migration removes exclusions, preserves actual outcomes and history, and rejects invalid lead states", async () => {
     const db = new DatabaseSync(":memory:");
     try {
@@ -81,7 +135,7 @@ describe("User ownership schema and lead migrations", () => {
       for (const name of migrations.filter((file) => file >= "0011" && file < "0017")) db.exec(await readFile(`migrations/${name}`, "utf8"));
       const history = ["stages", "feedback", "contacts", "outreach"].map((table) => db.prepare(`SELECT * FROM ${table}`).all());
       const details = db.prepare("SELECT id, company, status, score, created_at, updated_at FROM jobs ORDER BY id").all();
-      for (const name of migrations.filter((file) => file >= "0017")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      for (const name of migrations.filter((file) => file >= "0017" && file < "0018")) db.exec(await readFile(`migrations/${name}`, "utf8"));
       assert.deepEqual(db.prepare("SELECT id FROM jobs WHERE phase IS 'lead' ORDER BY id").all().map((row) => row.id), ["other-lead", "untouched"]);
       for (const [id, milestone] of [["interviewed", "technical_interview"], ["contacted", "outreach"], ["engaged", "outreach"], ["milestone", "recruiter_screen"], ["submitted", "applied"]] as const) {
         assert.deepEqual({ ...db.prepare("SELECT phase, current_stage FROM jobs WHERE id IS ?").get(id) }, { phase: "application", current_stage: milestone });
