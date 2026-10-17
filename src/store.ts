@@ -600,8 +600,11 @@ function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "f
 export async function updateJob(scope: UserStore, input: UpdateJob) {
   const job = await requireJob(scope, input.job_id);
   const { job_id, eligible_opening, ...patch } = prepareSalaryInput(input);
+  if ((input.phase ?? job.phase) === "lead" && (input.status ?? job.status) !== "active") {
+    fail("Leads must stay active. Use remove_lead if an uncontacted lead no longer meets the criteria; rejected, withdrawn, offer and accepted describe actual applications only.");
+  }
   const needsOpening = input.phase !== undefined || input.company !== undefined || input.company_url !== undefined ||
-    ((input.phase ?? job.phase) === "lead" && (input.status === "active" || input.status === "offer"));
+    ((input.phase ?? job.phase) === "lead" && input.status === "active");
   let opening: EligibleOpening | undefined;
   if (needsOpening || eligible_opening !== undefined) opening = validateEligibleOpening(eligible_opening, await getCriteria(scope));
   if (patch.recruiter_engaged_at) {
@@ -634,6 +637,18 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   } catch (error) {
     duplicateError(error);
   }
+}
+
+export async function removeLead(scope: UserStore, id: string) {
+  const { db, userId } = scope;
+  await requireJob(scope, id);
+  const removed = await db.prepare(`DELETE FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'lead'
+    AND current_stage IS 'lead' AND recruiter_engaged_at IS NULL
+    AND NOT EXISTS (SELECT 1 FROM stages s WHERE s.user_id IS jobs.user_id AND s.job_id IS jobs.id)
+    AND NOT EXISTS (SELECT 1 FROM outreach o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id)
+    RETURNING id`).bind(userId, id).first<{ id: string }>();
+  if (!removed) fail("Only uncontacted leads can be removed. Preserve actual application and communication history.");
+  return { job_id: removed.id, removed: true };
 }
 
 function normalizeTimestamp(value: string) {

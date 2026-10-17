@@ -4,6 +4,56 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("active-only lead migration removes exclusions, preserves actual outcomes and history, and rejects invalid lead states", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const name of migrations.filter((file) => file < "0011")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, status, score, created_at, updated_at) VALUES
+          ('alice', 'keep', 'Eligible employer', 'lead', 'active', 0, 'created', 'updated'),
+          ('alice', 'excluded', 'Excluded employer', 'lead', 'withdrawn', 90, 'created', 'updated'),
+          ('bob', 'excluded-other', 'Other excluded employer', 'lead', 'rejected', 80, 'created', 'updated'),
+          ('alice', 'attempt', 'Actual application', 'application', 'withdrawn', 70, 'created', 'updated'),
+          ('alice', 'interviewed', 'Historical interview', 'lead', 'rejected', 60, 'created', 'updated'),
+          ('alice', 'contacted', 'Historical communication', 'lead', 'withdrawn', 50, 'created', 'updated'),
+          ('alice', 'offer', 'Actual offer', 'lead', 'offer', 100, 'created', 'updated');
+        INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'round', 'interviewed', 'technical_interview', 'created', 'updated');
+        INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)
+          VALUES ('alice', 'reflection', 'round', 'Preserve feedback', 'created', 'updated');
+        INSERT INTO contacts (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'person', 'contacted', 'Example recruiter', 'created', 'updated');
+        INSERT INTO outreach (user_id, id, job_id, contact_id, direction, occurred_at, time_basis, created_at, updated_at)
+          VALUES ('alice', 'reply', 'contacted', 'person', 'inbound', '2026-01-01T00:00:00.000Z', 'reported', 'created', 'updated');`);
+      const histories = ["stages", "feedback", "contacts", "outreach"].map((table) => db.prepare(`SELECT * FROM ${table}`).all());
+      const attempt = db.prepare("SELECT id, phase, status, score, created_at, updated_at FROM jobs WHERE id IS 'attempt'").get();
+      for (const name of migrations.filter((file) => file >= "0011")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      assert.deepEqual(db.prepare("SELECT id FROM jobs WHERE phase IS 'lead' ORDER BY id").all().map((row) => row.id), ["keep"]);
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM jobs").get()?.count, 5);
+      assert.deepEqual(db.prepare("SELECT id, phase, status, score, created_at, updated_at FROM jobs WHERE id IS 'attempt'").get(), attempt);
+      for (const id of ["interviewed", "contacted", "offer"]) {
+        assert.equal(db.prepare("SELECT phase FROM jobs WHERE id IS ?").get(id)?.phase, "application");
+      }
+      assert.deepEqual(["stages", "feedback", "contacts", "outreach"].map((table) => db.prepare(`SELECT * FROM ${table}`).all()), histories);
+      const now = new Date().toISOString();
+      db.prepare("INSERT INTO criteria (user_id, text, updated_at) VALUES ('alice', 'Remote engineering', ?)").run(now);
+      const proof = JSON.stringify({
+        title: "Engineer", description: "Build developer tools", source_url: "https://jobs.example/active-only", location: "Remote",
+        status: "open", eligibility: "eligible", checked_at: now, criteria_updated_at: now, eligibility_reason: "Passes all exclusions",
+      });
+      for (const status of ["withdrawn", "rejected", "offer", "accepted"]) {
+        assert.throws(() => db.prepare("INSERT INTO jobs (user_id, id, company, status, eligible_opening, created_at, updated_at) VALUES ('alice', 'invalid', 'New employer', ?, ?, 'created', 'updated')").run(status, proof), /lead.*active/iu);
+        assert.throws(() => db.prepare("UPDATE jobs SET status = ?, eligible_opening = ? WHERE id IS 'keep'").run(status, proof), /lead.*active/iu);
+      }
+      assert.throws(() => db.prepare("UPDATE jobs SET phase = 'lead', eligible_opening = ? WHERE id IS 'attempt'").run(proof), /lead.*active/iu);
+      assert.throws(() => db.exec("UPDATE jobs SET company = 'Changed employer' WHERE id IS 'attempt'"), /eligible opening/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("salary range migration preserves employer pay, actual declarations and private targets without inferring new facts", async () => {
     const db = new DatabaseSync(":memory:");
     try {

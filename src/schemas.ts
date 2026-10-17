@@ -111,7 +111,7 @@ export const addJobSchema = v.strictObject({
 
 export const maxJobsPerBatch = 100;
 export const addJobsSchema = v.strictObject({
-  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(maxJobsPerBatch, `Save at most ${maxJobsPerBatch} employers or applications per call. Split larger imports into batches of up to ${maxJobsPerBatch}; keep every employer.`)),
+  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(maxJobsPerBatch, `Save at most ${maxJobsPerBatch} employers or applications per call. Split larger imports into batches of up to ${maxJobsPerBatch}; save only opportunities that meet the criteria.`)),
 });
 
 export const listJobsSchema = v.strictObject({
@@ -152,7 +152,7 @@ export const updateJobSchema = v.strictObject({
   recruiter_name: v.optional(v.nullable(text(200))),
   recruiter_email: v.optional(v.nullable(email)),
   notes: v.optional(v.nullable(text(20_000))),
-  status: v.optional(jobStatus),
+  status: v.optional(v.pipe(jobStatus, v.description("Leads must stay active. Other statuses describe actual application outcomes only. Use remove_lead when an uncontacted lead no longer meets the selection criteria; never mark it withdrawn or rejected."))),
   current_stage: v.optional(currentStage),
   recruiter_engaged_at: v.optional(v.nullable(timestamp)),
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),

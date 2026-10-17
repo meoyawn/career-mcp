@@ -512,7 +512,28 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     await error("add_job", { company: "No opening stale criteria", eligible_opening: opening }, /outdated criteria/u);
   });
 
-  test("eligible leads retain proof and salary, and employer changes, reactivation and returns to leads require fresh proof", async () => {
+  test("leads stay active until removed for eligibility, while application outcomes and communication history survive", async () => {
+    await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
+    const lead = await call("add_job", { company: "Eligibility-only lead", score: 0, eligible_opening: await verifiedOpening("Eligibility-only lead") }, jobSchema);
+    for (const status of ["withdrawn", "rejected", "offer", "accepted"]) {
+      await error("update_job", { job_id: lead.id, status }, /leads.*active.*remove_lead/iu);
+      assert.equal((await call("get_job", { job_id: lead.id }, v.object({ job: jobSchema }))).job.status, "active");
+    }
+    const application = await call("add_job", { company: "Actual withdrawn application", phase: "application", eligible_opening: await verifiedOpening("Actual withdrawn application") }, jobSchema);
+    await call("update_job", { job_id: application.id, status: "withdrawn" }, jobSchema);
+    await error("update_job", { job_id: application.id, phase: "lead", eligible_opening: await verifiedOpening("Actual withdrawn application") }, /leads.*active/iu);
+    await error("remove_lead", { job_id: application.id }, /application.*history/iu);
+    const contacted = await call("add_job", { company: "Contacted lead", eligible_opening: await verifiedOpening("Contacted lead") }, jobSchema);
+    const message = await call("record_outreach", { contact: { job_id: contacted.id, name: "Example referrer" }, direction: "outbound" }, outreachOutput);
+    await error("remove_lead", { job_id: contacted.id }, /communication history/iu);
+    assert.deepEqual((await call("get_job", { job_id: contacted.id }, v.object({ outreach: v.array(outreachOutput) }))).outreach, [message]);
+    assert.deepEqual(await call("remove_lead", { job_id: lead.id }, v.object({ job_id: v.string(), removed: v.boolean() })), { job_id: lead.id, removed: true });
+    assert.deepEqual((await call("list_jobs", { query: "Eligibility-only lead" }, jobsSchema)).jobs, []);
+    await error("get_job", { job_id: lead.id }, /not found/iu);
+    assert.equal((await call("get_job", { job_id: application.id }, v.object({ job: jobSchema }))).job.status, "withdrawn");
+  });
+
+  test("eligible leads retain proof and salary, and employer changes and returns to leads require fresh proof", async () => {
     const detailSchema = v.object({ job: v.object({ ...jobSchema.entries, phase: v.string(), description: v.nullable(v.string()), location: v.nullable(v.string()) }) });
     const eligibleOpening = await verifiedOpening("Employer only");
     const lead = await call("add_job", { company: "Employer only", eligible_opening: eligibleOpening, company_url: "https://employer.example/careers",
@@ -541,7 +562,6 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     await error("update_job", { job_id: lead.id, phase: "lead" }, /eligible opening/u);
     await call("update_job", { job_id: lead.id, phase: "lead", eligible_opening: eligibleOpening }, jobSchema);
     await error("update_job", { job_id: lead.id, company: "Different employer" }, /eligible opening/u);
-    await call("update_job", { job_id: lead.id, status: "withdrawn" }, jobSchema);
     await error("update_job", { job_id: lead.id, status: "active" }, /eligible opening/u);
     await call("update_job", { job_id: lead.id, status: "active", eligible_opening: eligibleOpening }, jobSchema);
     const proof = v.object({ eligible_opening: v.record(v.string(), v.unknown()) });
@@ -1005,6 +1025,9 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.deepEqual((await scoped(alice, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [aliceJob.id]);
       assert.deepEqual((await scoped(bob, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [bobJob.id]);
       const lead = await scoped(alice, "add_job", { company: "Alice lead", eligible_opening: await verifiedOpening("Alice lead", alice) }, jobSchema);
+      const foreignRemoval = await bob.callTool({ name: "remove_lead", arguments: { job_id: lead.id } });
+      assert.equal(foreignRemoval.isError, true);
+      assert.equal((await scoped(alice, "get_job", { job_id: lead.id }, v.object({ job: jobSchema }))).job.id, lead.id);
       const prompt = await alice.getPrompt({ name: "rank_jobs", arguments: { limit: "25", offset: "0" } });
       assert.ok(prompt.messages[0]?.content.type === "text");
       assert.match(prompt.messages[0].content.text, new RegExp(lead.id, "u"));
@@ -1178,7 +1201,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(checkBack.follow_ups[0]?.last_outreach_at, "2026-09-02T09:00:00.000Z");
     await call("update_outreach", { outreach_id: acknowledgement.id, follow_up_status: "cancelled" }, outreachOutput);
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups.map((contact) => contact.id), [friend.id]);
-    await call("update_job", { job_id: employer.id, status: "withdrawn" }, jobSchema);
+    await call("update_job", { job_id: employer.id, phase: "application", current_stage: "outreach", eligible_opening: await verifiedOpening("Referral Example"), status: "withdrawn" }, jobSchema);
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups, []);
   });
 
@@ -1321,7 +1344,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         { company: "Zero", score: 0 }, { company: "Low", score: 20 },
         { company: "Tie A", score: 50 }, { company: "Tie B", score: 50 },
         { company: "High", score: 100 }, { company: "Unranked" },
-        { company: "Withdrawn", score: 100 }, { company: "Rejected", score: 0 },
+        { company: "Withdrawn", phase: "application", score: 100 }, { company: "Rejected", phase: "application", score: 0 },
         { company: "Application", phase: "application", score: 100 },
         { company: "Reapplication", phase: "application", score: 0 },
       ].map((job) => ({ ...job, eligible_opening: { ...opening, source_url: `https://jobs.example/selection/${encodeURIComponent(job.company)}` } })) }, jobsSchema);
@@ -1367,7 +1390,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.deepEqual(await scoped("get_pipeline", {}, v.object({ summary: v.unknown(), applications: v.array(v.unknown()) })), pipelineBefore);
       await scoped("update_job", { job_id: high.id, phase: "application", eligible_opening: await verifiedOpening("High", owner) }, jobSchema);
       assert.deepEqual((await scoped("get_next_leads", { limit: 100 }, pageSchema)).jobs.map((job) => job.id), [...ties, low.id, zero.id]);
-      for (const job of [low, tieA, tieB]) await scoped("update_job", { job_id: job.id, status: "withdrawn" }, jobSchema);
+      for (const job of [low, tieA, tieB]) await scoped("remove_lead", { job_id: job.id }, v.unknown());
       await scoped("update_job", { job_id: zero.id, score: null }, jobSchema);
       assert.deepEqual(await scoped("get_next_leads", {}, pageSchema), { jobs: [], next_offset: null });
     } finally {
