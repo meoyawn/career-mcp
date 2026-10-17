@@ -1,5 +1,5 @@
 import * as v from "valibot";
-import { eligibleOpeningSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
+import { eligibleOpeningSchema, jobLifecycleSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type EligibleOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: D1Database;
@@ -50,11 +50,10 @@ interface SalaryFields {
   salary_declared_basis: "gross" | "net" | null;
 }
 
-interface Job extends SalaryFields {
+interface JobDetails extends SalaryFields {
   id: string;
   company: string;
   company_url: string | null;
-  phase: "lead" | "application";
   eligible_opening: string | null;
   title: string | null;
   nickname: string | null;
@@ -64,15 +63,12 @@ interface Job extends SalaryFields {
   recruiter_name: string | null;
   recruiter_email: string | null;
   notes: string | null;
-  status: string;
-  current_stage: string;
-  recruiter_engaged_at: string | null;
-  reapply_policy: "allowed" | "not_allowed" | null;
-  reapply_after: string | null;
   score: number | null;
   created_at: string;
   updated_at: string;
 }
+
+type Job = JobDetails & v.InferOutput<typeof jobLifecycleSchema>;
 
 interface PrepNote {
   id: string;
@@ -603,6 +599,17 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   if ((input.phase ?? job.phase) === "lead" && (input.status ?? job.status) !== "active") {
     fail("Leads must stay active. Use remove_lead if an uncontacted lead no longer meets the criteria; rejected, withdrawn, offer and accepted describe actual applications only.");
   }
+  if (job.phase === "application" && input.phase === "lead") {
+    fail("An application cannot return to a lead. Preserve its outcome and process history; create a separate application for a new attempt.");
+  }
+  if (input.phase === "application" && job.phase === "lead" && patch.current_stage === undefined) patch.current_stage = "applied";
+  const lifecycle = { ...job, ...patch };
+  if (lifecycle.phase === "lead" && !v.is(jobLifecycleSchema, lifecycle)) {
+    fail("A lead must stay active at the lead milestone without recruiter engagement or reapplication policy. Start an actual application before recording application state; add_stage and record_outreach start it atomically.");
+  }
+  if (lifecycle.phase === "application" && input.current_stage === "lead") {
+    fail("An application requires an application milestone; it cannot return to the lead milestone.");
+  }
   const needsOpening = input.phase !== undefined || input.company !== undefined || input.company_url !== undefined ||
     ((input.phase ?? job.phase) === "lead" && input.status === "active");
   let opening: EligibleOpening | undefined;
@@ -619,15 +626,6 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   validateSalary({ ...job, ...patch });
   validateSalaryAsk({ ...job, ...patch });
   validateDeclaredSalary({ ...job, ...patch });
-  if (input.phase === "lead") {
-    patch.title = null;
-    patch.description = null;
-    patch.source_url = null;
-    patch.location = null;
-    patch.current_stage = "lead";
-  } else if (input.phase === "application" && job.phase === "lead" && patch.current_stage === undefined) {
-    patch.current_stage = "applied";
-  }
   // Scores for changed descriptions must come from a new ranking.
   const invalidates = [input.company, input.title, input.description, input.location, opening].some((value) => value !== undefined);
   if (invalidates && patch.score === undefined) patch.score = null;
@@ -676,24 +674,31 @@ function validateSchedule(stage: Pick<Stage, "starts_at" | "ends_at" | "timezone
   if (stage.calendar_event_id !== null && stage.calendar_id === null) fail("Provide calendar_id with calendar_event_id.");
 }
 
+async function startApplication(scope: UserStore, job: Job, milestone: AddStage["name"]) {
+  if (job.phase === "application") return [];
+  validateEligibleOpening(job.eligible_opening === null ? null : JSON.parse(job.eligible_opening), await getCriteria(scope));
+  return [scope.db.prepare("UPDATE jobs SET phase = 'application', current_stage = ?, updated_at = ? WHERE user_id IS ? AND id IS ? AND phase IS 'lead'")
+    .bind(milestone, new Date().toISOString(), scope.userId, job.id)];
+}
+
 export async function addStage(scope: UserStore, input: AddStage) {
   const { db, userId } = scope;
-  await requireJob(scope, input.job_id);
+  const job = await requireJob(scope, input.job_id);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const startsAt = input.starts_at ? normalizeTimestamp(input.starts_at) : null;
   const endsAt = input.ends_at ? normalizeTimestamp(input.ends_at) : null;
   const timezone = input.timezone ?? (startsAt === null ? null : "UTC");
   validateSchedule({ starts_at: startsAt, ends_at: endsAt, timezone, calendar_event_id: null, calendar_id: null });
-  const statements = [db.prepare(`INSERT INTO stages
+  const statements = [...await startApplication(scope, job, input.name), db.prepare(`INSERT INTO stages
     (user_id, id, job_id, name, status, starts_at, ends_at, timezone, location, contact_name, contact_email, notes, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(userId, id, input.job_id, input.name,
     input.status, startsAt, endsAt, timezone, input.location ?? null, input.contact_name ?? null,
     input.contact_email ?? null, input.notes ?? null, now, now)];
   if (input.make_current) statements.push(db.prepare("UPDATE jobs SET current_stage = ?, updated_at = ? WHERE user_id IS ? AND id IS ?")
     .bind(input.name, now, userId, input.job_id));
-  const results = await db.batch<Stage>(statements);
-  return results[0]?.results[0];
+  await db.batch(statements);
+  return requireStage(scope, id);
 }
 
 export async function updateStage(scope: UserStore, input: UpdateStage) {
@@ -766,7 +771,7 @@ export async function recordOutreach(scope: UserStore, input: RecordOutreach) {
   const existing = input.contact_id ? await requireContact(scope, input.contact_id) : undefined;
   const jobId = existing?.job_id ?? input.contact?.job_id;
   if (!jobId) fail("A job is required for the actual first communication.");
-  if (!existing) await requireJob(scope, jobId);
+  const job = await requireJob(scope, jobId);
   if (input.stage_id) {
     const stage = await requireStage(scope, input.stage_id);
     if (stage.job_id !== jobId) fail("Stage and contact must belong to the same job.");
@@ -779,7 +784,7 @@ export async function recordOutreach(scope: UserStore, input: RecordOutreach) {
   validateOutreach({ direction: input.direction, occurred_at: occurredAt, follow_up_at: followUpAt, follow_up_status: followUpStatus });
   const contactId = existing?.id ?? crypto.randomUUID();
   const outreachId = crypto.randomUUID();
-  const statements: D1PreparedStatement[] = [];
+  const statements = await startApplication(scope, job, "outreach");
   if (input.contact) {
     statements.push(db.prepare(`INSERT INTO contacts (user_id, id, job_id, name, relationship, url, email, notes, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(userId, contactId, jobId, input.contact.name,

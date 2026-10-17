@@ -28,7 +28,7 @@ describe("User ownership schema and lead migrations", () => {
           VALUES ('alice', 'reply', 'contacted', 'person', 'inbound', '2026-01-01T00:00:00.000Z', 'reported', 'created', 'updated');`);
       const histories = ["stages", "feedback", "contacts", "outreach"].map((table) => db.prepare(`SELECT * FROM ${table}`).all());
       const attempt = db.prepare("SELECT id, phase, status, score, created_at, updated_at FROM jobs WHERE id IS 'attempt'").get();
-      for (const name of migrations.filter((file) => file >= "0011")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      for (const name of migrations.filter((file) => file >= "0011" && file < "0017")) db.exec(await readFile(`migrations/${name}`, "utf8"));
       assert.deepEqual(db.prepare("SELECT id FROM jobs WHERE phase IS 'lead' ORDER BY id").all().map((row) => row.id), ["keep"]);
       assert.equal(db.prepare("SELECT COUNT(*) AS count FROM jobs").get()?.count, 5);
       assert.deepEqual(db.prepare("SELECT id, phase, status, score, created_at, updated_at FROM jobs WHERE id IS 'attempt'").get(), attempt);
@@ -48,6 +48,69 @@ describe("User ownership schema and lead migrations", () => {
       }
       assert.throws(() => db.prepare("UPDATE jobs SET phase = 'lead', eligible_opening = ? WHERE id IS 'attempt'").run(proof), /lead.*active/iu);
       assert.throws(() => db.exec("UPDATE jobs SET company = 'Changed employer' WHERE id IS 'attempt'"), /eligible opening/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("lifecycle migration recovers active application histories and prevents cross-phase writes through SQL", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const name of migrations.filter((file) => file < "0011")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      db.exec(`INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created');
+        INSERT INTO jobs (user_id, id, company, phase, current_stage, created_at, updated_at) VALUES
+          ('alice', 'untouched', 'Untouched employer', 'lead', 'lead', 'created', 'updated'),
+          ('bob', 'other-lead', 'Other untouched employer', 'lead', 'lead', 'created', 'updated'),
+          ('alice', 'interviewed', 'Scheduled employer', 'lead', 'lead', 'created', 'updated'),
+          ('alice', 'contacted', 'Contacted employer', 'lead', 'lead', 'created', 'updated'),
+          ('bob', 'engaged', 'Engaged employer', 'lead', 'lead', 'created', 'updated'),
+          ('alice', 'milestone', 'Milestone employer', 'lead', 'recruiter_screen', 'created', 'updated'),
+          ('alice', 'submitted', 'Submitted employer', 'application', 'lead', 'created', 'updated');
+        UPDATE jobs SET recruiter_engaged_at = '2026-01-01T00:00:00.000Z' WHERE id IS 'engaged';
+        UPDATE jobs SET reapply_policy = 'allowed', reapply_after = '2026-01-01T00:00:00.000Z' WHERE id IS 'untouched';
+        INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'round', 'interviewed', 'technical_interview', 'created', 'updated');
+        INSERT INTO feedback (user_id, id, stage_id, text, created_at, updated_at)
+          VALUES ('alice', 'reflection', 'round', 'Preserve this feedback', 'created', 'updated');
+        INSERT INTO contacts (user_id, id, job_id, name, created_at, updated_at)
+          VALUES ('alice', 'person', 'contacted', 'Example referrer', 'created', 'updated');
+        INSERT INTO outreach (user_id, id, job_id, contact_id, direction, occurred_at, time_basis, follow_up_status, created_at, updated_at)
+          VALUES ('alice', 'message', 'contacted', 'person', 'outbound', '2026-01-01T00:00:00.000Z', 'reported', 'pending', 'created', 'updated');`);
+      for (const name of migrations.filter((file) => file >= "0011" && file < "0017")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      const history = ["stages", "feedback", "contacts", "outreach"].map((table) => db.prepare(`SELECT * FROM ${table}`).all());
+      const details = db.prepare("SELECT id, company, status, score, created_at, updated_at FROM jobs ORDER BY id").all();
+      for (const name of migrations.filter((file) => file >= "0017")) db.exec(await readFile(`migrations/${name}`, "utf8"));
+      assert.deepEqual(db.prepare("SELECT id FROM jobs WHERE phase IS 'lead' ORDER BY id").all().map((row) => row.id), ["other-lead", "untouched"]);
+      for (const [id, milestone] of [["interviewed", "technical_interview"], ["contacted", "outreach"], ["engaged", "outreach"], ["milestone", "recruiter_screen"], ["submitted", "applied"]] as const) {
+        assert.deepEqual({ ...db.prepare("SELECT phase, current_stage FROM jobs WHERE id IS ?").get(id) }, { phase: "application", current_stage: milestone });
+      }
+      assert.deepEqual(db.prepare("SELECT id, company, status, score, created_at, updated_at FROM jobs ORDER BY id").all(), details);
+      assert.deepEqual(["stages", "feedback", "contacts", "outreach"].map((table) => db.prepare(`SELECT * FROM ${table}`).all()), history);
+      assert.deepEqual({ ...db.prepare("SELECT reapply_policy, reapply_after FROM jobs WHERE id IS 'untouched'").get() }, { reapply_policy: null, reapply_after: null });
+      for (const patch of ["current_stage = 'outreach'", "recruiter_engaged_at = '2026-01-01T00:00:00.000Z'", "reapply_policy = 'allowed'", "reapply_policy = 'not_allowed'"]) {
+        assert.throws(() => db.exec(`UPDATE jobs SET ${patch} WHERE id IS 'untouched'`), /lead.*application/iu);
+      }
+      assert.throws(() => db.exec("UPDATE jobs SET phase = 'lead', current_stage = 'lead' WHERE id IS 'submitted'"), /application.*lead/iu);
+      assert.throws(() => db.exec("UPDATE jobs SET current_stage = 'lead' WHERE id IS 'submitted'"), /application.*milestone/iu);
+      const now = new Date().toISOString();
+      db.prepare("INSERT INTO criteria (user_id, text, updated_at) VALUES ('alice', 'Remote engineering', ?)").run(now);
+      const proof = JSON.stringify({ title: "Engineer", description: "Build tools", source_url: "https://jobs.example/lifecycle", location: "Remote", status: "open", eligibility: "eligible", checked_at: now, criteria_updated_at: now, eligibility_reason: "Matches criteria" });
+      for (const [phase, milestone, engagement, policy] of [
+        ["lead", "outreach", null, null], ["lead", "lead", now, null], ["lead", "lead", null, "allowed"], ["application", "lead", null, null],
+      ] as const) {
+        assert.throws(() => db.prepare(`INSERT INTO jobs (user_id, id, company, phase, current_stage, recruiter_engaged_at, reapply_policy, eligible_opening, created_at, updated_at)
+          VALUES ('alice', 'invalid', 'Invalid lifecycle', ?, ?, ?, ?, ?, 'created', 'updated')`).run(phase, milestone, engagement, policy, proof), /lead.*application|application.*milestone/iu);
+      }
+      for (const [owner, id] of [["alice", "untouched"], ["bob", "other-lead"], ["bob", "interviewed"]] as const) {
+        assert.throws(() => db.prepare(`INSERT INTO stages (user_id, id, job_id, name, created_at, updated_at)
+          VALUES (?, 'invalid-round', ?, 'outreach', 'created', 'updated')`).run(owner, id), /requires an application/u);
+        assert.throws(() => db.prepare(`INSERT INTO outreach (user_id, id, job_id, contact_id, direction, occurred_at, time_basis, created_at, updated_at)
+          VALUES (?, 'invalid-message', ?, 'person', 'outbound', '2026-01-01T00:00:00.000Z', 'reported', 'created', 'updated')`).run(owner, id), /requires an application/u);
+        for (const table of ["stages", "outreach"]) assert.throws(() => db.prepare(`UPDATE ${table} SET user_id = ?, job_id = ?`).run(owner, id), /requires an application/u);
+      }
+      assert.deepEqual(["stages", "feedback", "contacts", "outreach"].map((table) => db.prepare(`SELECT * FROM ${table}`).all()), history);
       assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
     } finally {
       db.close();

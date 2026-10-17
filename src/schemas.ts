@@ -15,6 +15,24 @@ export const pipelineStageSchema = v.picklist([
   "system_design", "hiring_manager", "final_interview", "reference_check", "offer",
 ], "Choose a predefined pipeline milestone. Prepared forms, drafts, and browser handoffs are not pipeline stages.");
 const currentStage = v.picklist(["lead", ...pipelineStageSchema.options]);
+export const jobLifecycleSchema = v.variant("phase", [
+  v.object({
+    phase: v.literal("lead"),
+    status: v.literal("active"),
+    current_stage: v.literal("lead"),
+    recruiter_engaged_at: v.null(),
+    reapply_policy: v.null(),
+    reapply_after: v.null(),
+  }),
+  v.object({
+    phase: v.literal("application"),
+    status: jobStatus,
+    current_stage: pipelineStageSchema,
+    recruiter_engaged_at: v.nullable(timestamp),
+    reapply_policy: v.nullable(v.picklist(["allowed", "not_allowed"])),
+    reapply_after: v.nullable(timestamp),
+  }),
+]);
 const source = v.picklist(["self", "recruiter", "interviewer"]);
 const pageSize = v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100));
 const limit = v.optional(pageSize, 25);
