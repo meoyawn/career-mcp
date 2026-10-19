@@ -156,6 +156,7 @@ interface ContactActivity extends Contact {
 
 interface PipelineSummary {
   applications: number;
+  submitted: number;
   active: number;
   offers: number;
   awaiting_reply: number;
@@ -164,6 +165,7 @@ interface PipelineSummary {
 }
 
 interface PipelineJob extends SalaryFields, Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at"> {
+  pipeline_status: "submitted" | "active" | "offer";
   current_stage_status: string | null;
   last_outreach_at: string | null;
   last_response_at: string | null;
@@ -512,14 +514,22 @@ const searchPattern = (query: string) => `%${query.replace(/[\\%_]/gu, "\\$&")}%
 
 export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
   const asOf = new Date().toISOString();
-  const scope = "SELECT * FROM jobs WHERE user_id IS ? AND phase IS 'application' AND status IN ('active', 'offer')";
+  const scope = `SELECT j.*, CASE WHEN j.status IS 'offer' THEN 'offer'
+    WHEN EXISTS (SELECT 1 FROM stages s WHERE s.user_id IS j.user_id AND s.job_id IS j.id
+      AND s.name IN ('recruiter_screen', 'assessment', 'technical_interview', 'system_design',
+        'hiring_manager', 'final_interview', 'reference_check')
+      AND s.status IS NOT 'cancelled'
+      AND (s.starts_at IS NOT NULL OR s.status IN ('in_progress', 'passed', 'failed', 'completed')))
+    THEN 'active' ELSE 'submitted' END AS pipeline_status
+    FROM jobs j WHERE j.user_id IS ? AND j.phase IS 'application' AND j.status IN ('active', 'offer')`;
   const page = `${scope} ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`;
   const scheduled = `s.status IN ('planned', 'in_progress') AND s.starts_at IS NOT NULL
     AND (s.starts_at >= ? OR s.ends_at > ? OR (s.status IS 'in_progress' AND s.ends_at IS NULL))`;
   const [summary, jobs, contacts, stages, prepNotes] = await execute(db, [
     db.prepare(`WITH pipeline AS (${scope}) SELECT COUNT(*) AS applications,
-      COUNT(CASE WHEN j.status IS 'active' THEN 1 END) AS active,
-      COUNT(CASE WHEN j.status IS 'offer' THEN 1 END) AS offers,
+      COUNT(CASE WHEN j.pipeline_status IS 'submitted' THEN 1 END) AS submitted,
+      COUNT(CASE WHEN j.pipeline_status IS 'active' THEN 1 END) AS active,
+      COUNT(CASE WHEN j.pipeline_status IS 'offer' THEN 1 END) AS offers,
       COUNT(CASE WHEN EXISTS (SELECT 1 FROM contact_activity c
         WHERE c.user_id IS j.user_id AND c.job_id IS j.id AND c.awaiting_reply IS 1) THEN 1 END) AS awaiting_reply,
       (SELECT COUNT(*) FROM contact_activity c JOIN pipeline p ON p.user_id IS c.user_id AND p.id IS c.job_id
@@ -527,7 +537,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
       (SELECT COUNT(*) FROM stages s JOIN pipeline p ON p.user_id IS s.user_id AND p.id IS s.job_id
         WHERE ${scheduled}) AS scheduled_stages
       FROM pipeline j`).bind(userId, asOf, asOf, asOf),
-    db.prepare(`WITH pipeline AS (${page}) SELECT j.id, j.company, j.title, j.source_url, j.status,
+    db.prepare(`WITH pipeline AS (${page}) SELECT j.id, j.company, j.title, j.source_url, j.status, j.pipeline_status,
       j.current_stage, current.status AS current_stage_status, j.recruiter_engaged_at,
       j.salary_min, j.salary_max, j.salary_currency, j.salary_period,
       j.salary_ask_amount, j.salary_ask_currency, j.salary_ask_period, j.salary_ask_basis,

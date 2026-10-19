@@ -1,5 +1,6 @@
 # Rules
 
+- Use `aube` only for package management and package commands. Never use `npm` or `npx`.
 - Never create SQL triggers. Enforce stored invariants with CHECK, UNIQUE, and foreign-key constraints, and perform cross-row validation explicitly in the same transaction as the mutation. Preserve historical migrations; remove their active triggers with a forward migration.
 - Each MCP tool call may execute at most one database transaction. Use one statement or one D1 batch for all validation reads, mutations, and returned data. Do not execute preliminary reads, follow-up reads, nested batches, or retries in separate transactions.
 - Before applying a production schema migration, export a full backup into a verified Git-ignored path under `backups/`. Rehearse the migration on a private local copy and verify all existing values, row IDs, and foreign keys before changing production. A rebuild must abort if its preservation checks fail.

@@ -1221,7 +1221,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups, []);
   });
 
-  test("one pipeline read summarizes active applications and offers with compact paginated stages and pending contacts", async () => {
+  test("one pipeline read separates submitted applications from active rounds and offers with compact paginated details", async () => {
     const browser = browserFor(endpoint);
     await enroll(browser);
     const connection = await authorize(browser);
@@ -1230,13 +1230,14 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       return parseTool(await owner.callTool({ name, arguments: args }), schema);
     }
     const summarySchema = v.strictObject({
-      applications: v.number(), active: v.number(), offers: v.number(), awaiting_reply: v.number(),
+      applications: v.number(), submitted: v.number(), active: v.number(), offers: v.number(), awaiting_reply: v.number(),
       follow_ups_due: v.number(), scheduled_stages: v.number(),
     });
     const pipelineSchema = v.strictObject({
       as_of: v.pipe(v.string(), v.isoTimestamp()), summary: summarySchema,
       applications: v.array(v.object({
         id: v.string(), company: v.string(), current_stage: v.string(), current_stage_status: v.nullable(v.string()),
+        pipeline_status: v.picklist(["submitted", "active", "offer"]),
         pending_prep_notes: v.array(v.object({ id: v.string(), text: v.string() })),
         pending_contacts: v.array(v.object({
           id: v.string(), name: v.string(), relationship: v.string(), url: v.nullable(v.string()),
@@ -1249,7 +1250,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     try {
       await owner.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${connection.token}` } } }));
       const empty = await scoped("get_pipeline", {}, pipelineSchema);
-      assert.deepEqual(empty.summary, { applications: 0, active: 0, offers: 0, awaiting_reply: 0, follow_ups_due: 0, scheduled_stages: 0 });
+      assert.deepEqual(empty.summary, { applications: 0, submitted: 0, active: 0, offers: 0, awaiting_reply: 0, follow_ups_due: 0, scheduled_stages: 0 });
       assert.deepEqual(empty.applications, []);
       assert.equal(empty.next_offset, null);
       await scoped("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
@@ -1295,6 +1296,12 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const acknowledgement = await scoped("record_outreach", {
         contact: { job_id: offer.id, name: "Example recruiter" }, direction: "inbound", occurred_at: yesterday, follow_up_at: pastDue,
       }, outreachOutput);
+      await scoped("add_stage", { job_id: submitted.id, name: "recruiter_screen", make_current: false }, stageSchema);
+      await scoped("add_stage", { job_id: submitted.id, name: "recruiter_screen", starts_at: tomorrow, status: "cancelled", make_current: false }, stageSchema);
+      const beforeScheduling = await scoped("get_pipeline", {}, pipelineSchema);
+      assert.equal(beforeScheduling.summary.submitted, 2);
+      assert.equal(beforeScheduling.summary.active, 0);
+      assert.equal(beforeScheduling.applications.find((job) => job.id === referral.id)?.pipeline_status, "submitted");
       await scoped("add_stage", { job_id: offer.id, name: "technical_interview", starts_at: tomorrow, status: "cancelled", make_current: false }, stageSchema);
       await scoped("add_stage", { job_id: offer.id, name: "technical_interview", starts_at: yesterday, status: "completed", make_current: false }, stageSchema);
       await scoped("add_stage", { job_id: offer.id, name: "technical_interview", make_current: false }, stageSchema);
@@ -1303,7 +1310,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const soon = await scoped("add_stage", { job_id: referral.id, name: "recruiter_screen", starts_at: tomorrow, make_current: false }, stageSchema);
       const response = await owner.callTool({ name: "get_pipeline", arguments: {} });
       const pipeline = parseTool(response, pipelineSchema);
-      assert.deepEqual(pipeline.summary, { applications: 3, active: 2, offers: 1, awaiting_reply: 1, follow_ups_due: 2, scheduled_stages: 3 });
+      assert.deepEqual(pipeline.summary, { applications: 3, submitted: 1, active: 1, offers: 1, awaiting_reply: 1, follow_ups_due: 2, scheduled_stages: 3 });
       assert.deepEqual(new Set(pipeline.applications.map((job) => job.id)), new Set([submitted.id, referral.id, offer.id]));
       for (const job of pipeline.applications) {
         const note = notes.find((entry) => entry.job_id === job.id);
@@ -1312,16 +1319,19 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       }
       const submittedRow = pipeline.applications.find((job) => job.id === submitted.id);
       assert.ok(submittedRow);
+      assert.equal(submittedRow.pipeline_status, "submitted");
       assert.equal(submittedRow?.current_stage, latest.name);
       assert.equal(submittedRow?.current_stage_status, "completed");
       assert.equal(submittedRow.next_stage, null);
       const referralRow = pipeline.applications.find((job) => job.id === referral.id);
+      assert.equal(referralRow?.pipeline_status, "active");
       assert.deepEqual(referralRow?.pending_contacts.map((contact) => contact.id), [friend.contact_id]);
       assert.equal(referralRow?.pending_contacts[0]?.awaiting_reply, true);
       assert.equal(referralRow?.pending_contacts[0]?.due, true);
       assert.equal(referralRow?.pending_contacts[0]?.last_interaction_time_basis, "reported");
       assert.equal(referralRow?.next_stage?.id, soon.id);
       const offerRow = pipeline.applications.find((job) => job.id === offer.id);
+      assert.equal(offerRow?.pipeline_status, "offer");
       assert.equal(offerRow?.pending_contacts[0]?.id, acknowledgement.contact_id);
       assert.equal(offerRow?.pending_contacts[0]?.awaiting_reply, false);
       assert.equal(offerRow?.next_stage?.id, ongoing.id);
@@ -1337,6 +1347,24 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const emptyPage = await scoped("get_pipeline", { offset: 3 }, pipelineSchema);
       assert.deepEqual(emptyPage.applications, []);
       assert.deepEqual(emptyPage.summary, pipeline.summary);
+      await scoped("update_stage", { stage_id: soon.id, status: "cancelled" }, stageSchema);
+      const cancelled = await scoped("get_pipeline", {}, pipelineSchema);
+      assert.equal(cancelled.summary.active, 0);
+      assert.equal(cancelled.summary.submitted, 2);
+      assert.equal(cancelled.applications.find((job) => job.id === referral.id)?.pipeline_status, "submitted");
+      await scoped("update_stage", { stage_id: soon.id, status: "completed" }, stageSchema);
+      const technical = await scoped("add_stage", { job_id: referral.id, name: "technical_interview" }, stageSchema);
+      const betweenRounds = await scoped("get_pipeline", {}, pipelineSchema);
+      assert.equal(betweenRounds.summary.active, 1);
+      assert.equal(betweenRounds.applications.find((job) => job.id === referral.id)?.pipeline_status, "active");
+      assert.equal(betweenRounds.applications.find((job) => job.id === referral.id)?.next_stage, null);
+      await scoped("update_stage", { stage_id: soon.id, status: "cancelled" }, stageSchema);
+      for (const status of ["in_progress", "passed", "failed", "completed"]) {
+        await scoped("update_stage", { stage_id: technical.id, status }, stageSchema);
+        const afterTechnical = await scoped("get_pipeline", {}, pipelineSchema);
+        assert.equal(afterTechnical.summary.active, 1);
+        assert.equal(afterTechnical.applications.find((job) => job.id === referral.id)?.pipeline_status, "active");
+      }
     } finally {
       await owner.close();
     }
