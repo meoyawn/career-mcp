@@ -88,6 +88,12 @@ export const cvSchema = v.strictObject({
   url: v.nullable(url),
 });
 export const jobIdSchema = v.strictObject({ job_id: id });
+export const closeOpeningSchema = v.strictObject({
+  job_id: id,
+  source_url: url,
+  reason: text(5_000),
+  checked_at: v.optional(timestamp),
+});
 export const pipelineSchema = v.strictObject({ limit, offset });
 export const interviewPrepSchema = v.strictObject({
   job_id: v.optional(id),
@@ -136,6 +142,7 @@ export const listJobsSchema = v.strictObject({
   query: v.optional(text(300)),
   status: v.optional(jobStatus),
   phase: v.optional(phase),
+  opening_status: v.optional(v.picklist(["open", "closed", "unknown"])),
   available_only: v.optional(v.boolean(), false),
   reapply_status: v.optional(reapplyStatus),
   as_of: v.optional(timestamp),
@@ -319,6 +326,7 @@ export type Pipeline = v.InferOutput<typeof pipelineSchema>;
 export type InterviewPrep = v.InferOutput<typeof interviewPrepSchema>;
 export type SetApplicantContact = v.InferOutput<typeof applicantContactSchema>;
 export type UpdateJob = v.InferOutput<typeof updateJobSchema>;
+export type CloseOpening = v.InferOutput<typeof closeOpeningSchema>;
 export type AddPrepNote = v.InferOutput<typeof addPrepNoteSchema>;
 export type UpdatePrepNote = v.InferOutput<typeof updatePrepNoteSchema>;
 export type AddStage = v.InferOutput<typeof addStageSchema>;

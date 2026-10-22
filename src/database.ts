@@ -31,6 +31,9 @@ export function createToolStore(database: D1Database, userId: string) {
 }
 
 const errors: Record<string, string> = {
+  opening_closed: "This opening is closed. Browse the same company's live career inventory and save a verified eligible replacement through update_job. Preserve the employer and application history.",
+  opening_mismatch: "Closure URL does not match the current opening. Reload get_job before recording a closure.",
+  closure_outdated: "Closure evidence predates the current opening check. Verify the live posting again.",
   job_not_found: "Job not found. Use list_jobs to resolve a company, role, or nickname to its job_id.",
   stage_not_found: "Stage not found. Use get_job to load its stages and stage_id values.",
   contact_not_found: "Contact not found. Use get_job to find this employer's contacts.",
@@ -92,3 +95,6 @@ export async function first<T>(db: Database, statement: Statement) {
 
 export const check = (db: Database, code: string, condition: string, ...bindings: unknown[]) =>
   db.prepare(`INSERT INTO command_checks (error) SELECT ? WHERE ${condition}`).bind(code, ...bindings);
+
+export const openingCheck = (db: Database, code: "opening_closed" | "opening_mismatch" | "closure_outdated", condition: string, ...bindings: unknown[]) =>
+  db.prepare(`INSERT INTO opening_checks (error) SELECT ? WHERE ${condition}`).bind(code, ...bindings);

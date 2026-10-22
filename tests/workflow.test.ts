@@ -958,13 +958,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped(alice, "update_job", { job_id: aliceJob.id, score: 90, notes: "Alice assessment" }, jobSchema);
       await scoped(bob, "update_job", { job_id: bobJob.id, score: 80, notes: "Bob assessment" }, jobSchema);
       for (const [owner, ownJob, ownStage, criteria] of [[alice, aliceJob, aliceStage, "Alice remote product roles"], [bob, bobJob, bobStage, "Bob onsite roles"]] as const) {
-        const context = await scoped(owner, "get_lead_context", {}, v.strictObject({ criteria: v.object({ text: v.string() }), jobs: v.array(jobSchema), next_offset: v.null() }));
+        const context = await scoped(owner, "get_lead_context", {}, v.strictObject({ criteria: v.object({ text: v.string() }), jobs: v.array(jobSchema), next_offset: v.null(), replacement_search: jobsSchema }));
         assert.equal(context.criteria.text, criteria);
         assert.deepEqual(context.jobs.map((job) => job.id), [ownJob.id]);
         assert.deepEqual((await scoped(owner, "list_jobs", { include_descriptions: true }, jobsSchema)).jobs.map((job) => job.id), [ownJob.id]);
         assert.deepEqual((await scoped(owner, "get_upcoming", { from: "2026-12-01T00:00:00Z" }, v.object({ stages: v.array(stageSchema) }))).stages.map((stage) => stage.id), [ownStage.id]);
         assert.deepEqual((await scoped(owner, "list_feedback", {}, v.object({ feedback: v.array(feedbackOutput) }))).feedback.map((feedback) => feedback.stage_id), [ownStage.id]);
-        const detail = await scoped(owner, "get_job", { job_id: ownJob.id }, v.strictObject({ job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput), prep_notes: v.array(prepNoteOutput), ...outreachHistory }));
+        const detail = await scoped(owner, "get_job", { job_id: ownJob.id }, v.strictObject({ job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput), prep_notes: v.array(prepNoteOutput), opening_closures: v.array(v.unknown()), ...outreachHistory }));
         assert.deepEqual(detail.prep_notes, [owner === alice ? aliceNote : bobNote]);
         const preparation = await scoped(owner, "get_interview_prep", {}, v.object({ job: jobSchema, pending_prep_notes: v.array(prepNoteOutput) }));
         assert.equal(preparation.job.id, ownJob.id);
@@ -988,7 +988,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         assert.equal(pipeline.applications[0]?.next_stage.id, ownStage.id);
         assert.deepEqual(pipeline.applications[0]?.pending_prep_notes.map((note) => note.id), detail.prep_notes.map((note) => note.id));
         const application = await scoped(owner, "get_application_context", { job_id: ownJob.id }, v.strictObject({
-          ...applicationOutput.entries, job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput), prep_notes: v.array(prepNoteOutput), ...outreachHistory,
+          ...applicationOutput.entries, job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput), prep_notes: v.array(prepNoteOutput), opening_closures: v.array(v.unknown()), ...outreachHistory,
         }));
         assert.equal(application.job.id, ownJob.id);
         assert.deepEqual(application.stages, detail.stages);
@@ -1003,6 +1003,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         assert.deepEqual(v.parse(applicationOutput, JSON.parse(applicationResource.contents[0].text)), owner === alice ? aliceApplication : bobApplication);
       }
       const forbidden = [
+        ["close_opening", { job_id: bobJob.id, source_url: "https://jobs.example/foreign", reason: "Foreign closure" }],
         ["get_interview_prep", { job_id: bobJob.id }], ["get_interview_prep", { stage_id: bobStage.id }],
         ["add_prep_note", { job_id: bobJob.id, kind: "question", text: "Foreign question" }],
         ["update_prep_note", { prep_note_id: bobNote.id, status: "resolved" }],
@@ -1496,4 +1497,56 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       }
     }
   });
+  test("closed postings retain employers and history while requiring replacement research before applying", async () => {
+    await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
+    const opening = await verifiedOpening("Closure lifecycle");
+    const lead = await call("add_job", {
+      company: "Closure lifecycle", eligible_opening: opening, score: 80, notes: "Keep employer context",
+    }, jobSchema);
+    const state = v.object({ ...jobSchema.entries, opening_status: v.string() });
+    const closed = await call("close_opening", {
+      job_id: lead.id, source_url: opening.source_url, reason: "Posting returns HTTP 404",
+    }, state);
+    assert.equal(closed.opening_status, "closed");
+    assert.equal(closed.status, "active");
+    assert.equal(closed.current_stage, "lead");
+    assert.equal(closed.score, null);
+    await call("close_opening", { job_id: lead.id, source_url: opening.source_url, reason: "Confirmed closed" }, state);
+    await call("update_job", { job_id: lead.id, score: 90 }, state);
+    const available = await call("list_jobs", { query: "Closure lifecycle", available_only: true }, jobsSchema);
+    assert.deepEqual(available.jobs, []);
+    const next = await call("get_next_leads", { limit: 100 }, jobsSchema);
+    assert.ok(!next.jobs.some((job) => job.id === lead.id));
+    const research = await call("get_lead_context", {}, v.object({ replacement_search: jobsSchema }));
+    assert.ok(research.replacement_search.jobs.some((job) => job.id === lead.id));
+    const filtered = await call("list_jobs", { opening_status: "closed", query: "Closure lifecycle" }, jobsSchema);
+    assert.equal(filtered.jobs[0]?.id, lead.id);
+    await error("update_job", { job_id: lead.id, eligible_opening: opening, phase: "application" }, /closed/u);
+    await error("add_stage", { job_id: lead.id, name: "applied" }, /closed/u);
+    await error("record_outreach", { contact: { job_id: lead.id, name: "Example recruiter" }, direction: "outbound" }, /closed/u);
+    const detail = v.object({
+      job: v.object({ ...state.entries, notes: v.nullable(v.string()) }),
+      opening_closures: v.array(v.object({ source_url: v.string(), reason: v.string() })),
+      stages: v.array(stageSchema), contacts: v.array(contactOutput), outreach: v.array(outreachOutput),
+    });
+    const unchanged = await call("get_job", { job_id: lead.id }, detail);
+    assert.equal(unchanged.opening_closures.length, 1);
+    assert.equal(unchanged.job.notes, "Keep employer context");
+    assert.deepEqual([unchanged.stages, unchanged.contacts, unchanged.outreach], [[], [], []]);
+    const replacement = { ...await verifiedOpening("Closure replacement"), title: "Replacement engineer" };
+    const refreshed = await call("update_job", { job_id: lead.id, eligible_opening: replacement }, state);
+    assert.equal(refreshed.opening_status, "open");
+    assert.equal(refreshed.created_at, lead.created_at);
+    assert.equal(refreshed.score, null);
+    await error("close_opening", { job_id: lead.id, source_url: opening.source_url, reason: "Delayed stale check" }, /current opening/u);
+    await call("add_stage", { job_id: lead.id, name: "applied" }, stageSchema);
+    const application = await call("get_job", { job_id: lead.id }, detail);
+    await call("close_opening", { job_id: lead.id, source_url: replacement.source_url, reason: "Employer closed posting" }, state);
+    const history = await call("get_job", { job_id: lead.id }, detail);
+    assert.equal(history.job.status, "active");
+    assert.deepEqual(history.stages, application.stages);
+    assert.equal(history.opening_closures.length, 2);
+    assert.equal(history.job.created_at, lead.created_at);
+  });
+
 });

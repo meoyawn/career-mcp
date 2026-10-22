@@ -1,6 +1,6 @@
 import * as v from "valibot";
-import { check, execute, fail, first, type Database, type Statement } from "./database.ts";
-import { eligibleOpeningSchema, jobLifecycleSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
+import { check, execute, fail, first, openingCheck, type Database, type Statement } from "./database.ts";
+import { eligibleOpeningSchema, jobLifecycleSchema, listJobsSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type CloseOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type Pipeline, type RecordOutreach, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: Database;
@@ -70,6 +70,12 @@ interface JobDetails extends SalaryFields {
 }
 
 type Job = JobDetails & v.InferOutput<typeof jobLifecycleSchema>;
+
+const openingStatusSql = `CASE WHEN EXISTS (
+  SELECT 1 FROM opening_closures c WHERE c.user_id IS jobs.user_id AND c.job_id IS jobs.id
+    AND c.source_url IS coalesce(json_extract(jobs.eligible_opening, '$.source_url'), jobs.source_url, c.source_url)
+    AND (jobs.eligible_opening IS NULL OR c.checked_at >= json_extract(jobs.eligible_opening, '$.checked_at'))
+) THEN 'closed' WHEN jobs.eligible_opening IS NOT NULL THEN 'open' ELSE 'unknown' END`;
 
 interface PrepNote {
   id: string;
@@ -424,7 +430,7 @@ const reapplyStatusSql = `CASE
 function jobStatements(scope: UserStore, idSql: string, bindings: unknown[]) {
   const { db, userId } = scope;
   return [
-    db.prepare(`SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ? AND id IS (${idSql})`)
+    db.prepare(`SELECT *, ${openingStatusSql} AS opening_status, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ? AND id IS (${idSql})`)
       .bind(new Date().toISOString(), userId, ...bindings),
     db.prepare(`SELECT * FROM stages WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY created_at, rowid`).bind(userId, ...bindings),
     db.prepare(`SELECT f.*, s.name AS stage_name FROM feedback f JOIN stages s ON s.id IS f.stage_id AND s.user_id IS f.user_id
@@ -433,6 +439,8 @@ function jobStatements(scope: UserStore, idSql: string, bindings: unknown[]) {
     db.prepare(`SELECT * FROM outreach WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY occurred_at, created_at, rowid`).bind(userId, ...bindings),
     db.prepare(`SELECT id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at FROM prep_notes
       WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY created_at, rowid`).bind(userId, ...bindings),
+    db.prepare(`SELECT source_url, reason, checked_at, eligible_opening, created_at FROM opening_closures
+      WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY checked_at, source_url`).bind(userId, ...bindings),
   ];
 }
 
@@ -443,6 +451,10 @@ function jobResult(results: D1Result[]) {
   return {
     job: withEligibleOpening(job), stages: stages.results, feedback: feedback.results, contacts: contacts.results, outreach: outreach.results,
     prep_notes: prepNotes.results,
+    opening_closures: results[6]!.results.map(function parseClosure(closure) {
+      const row = closure as Record<string, unknown> & { eligible_opening: string | null };
+      return { ...row, eligible_opening: row.eligible_opening === null ? null : JSON.parse(row.eligible_opening) };
+    }),
     last_outreach_at: outreach.results.filter((entry) => entry.direction === "outbound").at(-1)?.occurred_at ?? null,
     last_response_at: outreach.results.filter((entry) => entry.direction === "inbound").at(-1)?.occurred_at ?? null,
   };
@@ -593,11 +605,12 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
   }
   if (input.status) { where.push("status IS ?"); bindings.push(input.status); }
   if (input.phase) { where.push("phase IS ?"); bindings.push(input.phase); }
-  if (input.available_only) where.push("(status IS 'active' OR reapply_status IS 'eligible')");
+  if (input.available_only) where.push("(status IS 'active' OR reapply_status IS 'eligible') AND opening_status IS NOT 'closed'");
+  if (input.opening_status) { where.push("opening_status IS ?"); bindings.push(input.opening_status); }
   if (input.reapply_status) { where.push("reapply_status IS ?"); bindings.push(input.reapply_status); }
   if (input.ranked_only) where.push("score IS NOT NULL");
   const scoreDirection = input.score_order === "lowest" ? "ASC" : "DESC";
-  const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, eligible_opening, title, nickname, source_url, location,
+  const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, eligible_opening, opening_status, title, nickname, source_url, location,
     recruiter_name, recruiter_email, notes, status, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
     score, salary_min, salary_max, salary_currency, salary_period,
     salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
@@ -605,7 +618,7 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
     employer_salary, asked_salary,
     created_at, updated_at`;
   return db.prepare(`WITH opportunities AS (
-    SELECT *, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ?
+    SELECT *, ${openingStatusSql} AS opening_status, ${reapplyStatusSql} AS reapply_status FROM jobs WHERE user_id IS ?
   ) SELECT ${columns},
     (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id AND o.direction IS 'outbound') AS last_outreach_at,
     (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id AND o.direction IS 'inbound') AS last_response_at,
@@ -629,8 +642,10 @@ export async function listJobs(scope: UserStore, input: ListJobs) {
 }
 
 export async function getLeadContext(scope: UserStore, input: ListJobs) {
-  const results = await execute(scope.db, [criteriaStatement(scope), listJobsStatement(scope, input)]);
+  const replacements = v.parse(listJobsSchema, { phase: "lead", opening_status: "closed", limit: input.limit, offset: input.offset });
+  const results = await execute(scope.db, [criteriaStatement(scope), listJobsStatement(scope, input), listJobsStatement(scope, replacements)]);
   return { criteria: (results[0]?.results[0] ?? null) as Criteria | null,
+    replacement_search: listJobsResult(results[2] as D1Result<Omit<Job, "description"> & { description?: string }>, replacements),
     ...listJobsResult(results[1] as D1Result<Omit<Job, "description"> & { description?: string }>, input) };
 }
 
@@ -658,6 +673,8 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   else statements.push(check(db, "opening_required", `? OR (? AND EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'lead'))`,
     Number(input.phase !== undefined || input.company !== undefined || input.company_url !== undefined),
     Number(input.status === "active"), userId, job_id));
+  if (opening) statements.push(openingCheck(db, "opening_closed", `EXISTS (SELECT 1 FROM opening_closures
+    WHERE user_id IS ? AND job_id IS ? AND source_url IS ? AND checked_at >= ?)`, userId, job_id, opening.source_url, opening.checked_at));
   if (patch.recruiter_engaged_at) {
     patch.recruiter_engaged_at = normalizeTimestamp(patch.recruiter_engaged_at);
     if (Date.parse(patch.recruiter_engaged_at) > Date.now()) fail("recruiter_engaged_at records actual recruiter contact and cannot be in the future.");
@@ -670,6 +687,7 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
     ? { current_stage: "CASE WHEN phase IS 'lead' THEN 'applied' ELSE current_stage END" } : {};
   try {
     statements.push(patchStatement(scope, "jobs", job_id, { ...patch, eligible_opening: opening ? JSON.stringify(opening) : undefined }, expressions));
+    statements.push(db.prepare(`SELECT *, ${openingStatusSql} AS opening_status FROM jobs WHERE user_id IS ? AND id IS ?`).bind(userId, job_id));
     const results = await execute<Job>(db, statements);
     const job = results.at(-1)!.results[0]!;
     return withEligibleOpening({ ...job, reapply_status: job.status !== "rejected" ? "not_applicable"
@@ -678,6 +696,28 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   } catch (error) {
     duplicateError(error);
   }
+}
+
+export async function closeOpening(scope: UserStore, input: CloseOpening) {
+  const { db, userId } = scope;
+  const checkedAt = normalizeTimestamp(input.checked_at ?? new Date().toISOString());
+  if (Date.parse(checkedAt) > Date.now()) fail("A closure check cannot be in the future.");
+  const now = new Date().toISOString();
+  const results = await execute<Job>(db, [
+    requireRow(scope, "jobs", input.job_id, "job_not_found"),
+    openingCheck(db, "opening_mismatch", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
+      AND coalesce(json_extract(eligible_opening, '$.source_url'), source_url, ?) IS NOT ?)`, userId, input.job_id, input.source_url, input.source_url),
+    openingCheck(db, "closure_outdated", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
+      AND json_extract(eligible_opening, '$.checked_at') > ?)`, userId, input.job_id, checkedAt),
+    db.prepare(`INSERT INTO opening_closures (user_id, job_id, source_url, reason, checked_at, eligible_opening, created_at)
+      SELECT user_id, id, ?, ?, ?, eligible_opening, ? FROM jobs WHERE user_id IS ? AND id IS ?
+      ON CONFLICT (user_id, job_id, source_url) DO UPDATE SET reason = excluded.reason, checked_at = excluded.checked_at
+      WHERE excluded.checked_at >= opening_closures.checked_at`)
+      .bind(input.source_url, input.reason, checkedAt, now, userId, input.job_id),
+    db.prepare(`UPDATE jobs SET score = NULL, updated_at = ? WHERE user_id IS ? AND id IS ?`).bind(now, userId, input.job_id),
+    db.prepare(`SELECT *, ${openingStatusSql} AS opening_status FROM jobs WHERE user_id IS ? AND id IS ?`).bind(userId, input.job_id),
+  ]);
+  return withEligibleOpening(results.at(-1)!.results[0]!);
 }
 
 export async function removeLead(scope: UserStore, id: string) {
@@ -729,6 +769,7 @@ function startApplication(scope: UserStore, jobSql: string, bindings: unknown[],
   const targetBindings = [userId, ...bindings];
   return [
     check(db, "job_not_found", `NOT EXISTS (SELECT 1 ${target})`, ...targetBindings),
+    openingCheck(db, "opening_closed", `EXISTS (SELECT 1 ${target} AND phase IS 'lead' AND (${openingStatusSql}) IS 'closed')`, ...targetBindings),
     ...openingChecks(scope, `SELECT eligible_opening ${target}`, targetBindings,
       `EXISTS (SELECT 1 ${target} AND phase IS 'lead')`, targetBindings),
     db.prepare(`UPDATE jobs SET phase = 'application',

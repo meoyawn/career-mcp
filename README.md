@@ -87,7 +87,7 @@ WebAuthn requires discoverable credentials and user verification. Challenges are
 
 The funnel goal is to maximize achievable job-offer compensation. Employer counts are bookkeeping, not a success metric. Opportunities enter only after meeting the saved selection criteria. A low fit score or temporary priority does not make an eligible opportunity ineligible; lower-ranked eligible roles may support interview practice.
 
-Every stored lead is active. There are no withdrawn, rejected, disqualified, or archived leads. If an uncontacted lead no longer meets the criteria or its opening closes, resolve its ID and call `remove_lead`; it leaves storage instead of acquiring an exclusion status. This tool refuses applications and leads with stages, actual communication, or recruiter engagement, preserving real process history. `rejected`, `withdrawn`, `offer`, and `accepted` are application outcomes only, enforced by both MCP mutations and database guards. Applications cannot return to leads, even after resetting their status to active. Preserve each attempt and create a separate record for a new attempt. A lead must have `current_stage: "lead"`, no recruiter engagement, and no reapplication policy.
+Every stored lead is active. There are no withdrawn, rejected, disqualified, or archived leads. If an uncontacted employer no longer meets the criteria, resolve its ID and call `remove_lead`; it leaves storage instead of acquiring an exclusion status. This tool refuses applications and leads with stages, actual communication, or recruiter engagement, preserving real process history. `rejected`, `withdrawn`, `offer`, and `accepted` are application outcomes only, enforced by both MCP mutations and database guards. Applications cannot return to leads, even after resetting their status to active. Preserve each attempt and create a separate record for a new attempt. A lead must have `current_stage: "lead"`, no recruiter engagement, and no reapplication policy.
 
 Migration `0017_job_lifecycle.sql` also recovers active records with real stages, outreach, recruiter engagement, or an application milestone as applications. It restores a missing current milestone from recorded history, clears meaningless reapplication settings on untouched leads, and preserves outcomes, timestamps, compensation, stages, contacts, outreach, and feedback. Transactional validation rejects application-to-lead changes; foreign keys reject stage/outreach writes against leads.
 
@@ -148,7 +148,8 @@ Selection is read-only and does not reserve leads, create batches, or advance th
 | `list_jobs` | Search company, application title, or nickname; filter by phase/status and rank by score. |
 | `get_job` | Load employer or application details, salary, stages, calendar details, and feedback. |
 | `update_job` | Edit employer/contact details, salary, phase, application outcomes, stage, score, or opening details; leads stay active. |
-| `remove_lead` | Remove an uncontacted lead that no longer meets the criteria or whose opening closed; preserve actual application and communication history. |
+| `close_opening` | Preserve a closed posting and employer for replacement research without changing an application outcome. |
+| `remove_lead` | Remove an uncontacted employer that no longer meets the criteria; use `close_opening` for closed postings; preserve actual application and communication history. |
 | `add_stage` | Add any named stage and optionally its schedule. |
 | `update_stage` | Record an outcome, reschedule, or link a calendar event. |
 | `update_contact` | Edit a person with actual communication history; cannot create contacts. |
@@ -205,6 +206,16 @@ For rejected applications, reads derive `reapply_status`: `unknown` without a po
 `get_lead_context` and `rank_jobs` include active records and eligible reapplications. Use `list_jobs` with `available_only: true` to paginate the same opportunities, or filter `reapply_status` directly. A `status: "active"` filter still means exactly active; rejected history remains accessible with `status: "rejected"`. Optional `list_jobs.as_of` previews cooldown eligibility at an explicit timestamp; it does not reconstruct historical application state. Eligibility and priority are separate: keep a user's decision to apply later in notes. When a fresh attempt actually starts, create its own application record and clear the previous attempt's policy and deadline together to consume that next-attempt eligibility and avoid listing both attempts as opportunities. Preserve the older stages and feedback.
 
 Migration `0007_reapplication.sql` adds the policy and deadline without changing existing outcomes or inferring private interview dates. These facts belong in D1 or Git-ignored private exports, not source fixtures.
+
+## Closed openings and replacements
+
+Use `close_opening` with `job_id`, the exact posting `source_url`, and a `reason` after confirming a closure (for example, HTTP 404). `checked_at` defaults to now. Access blocking or parser failures alone do not prove closure. This preserves the employer, original evidence, notes, application outcome, stages, and communication history while clearing the stale fit score. Repeated calls are idempotent for the job/URL.
+
+`list_jobs` exposes `opening_status` (`open`, `closed`, or `unknown`); open means saved evidence, not an automatic live check. Filter `opening_status: "closed"` to research replacements. `get_lead_context.replacement_search` includes these retained leads with its own `next_offset`; paginate through `list_jobs` with `phase: "lead"` and `opening_status: "closed"`. `available_only` and `get_next_leads` exclude known closed postings, and starting an application against one fails atomically.
+
+Browse the same company's current career inventory and read candidates against the current saved criteria. Save an eligible replacement through `update_job.eligible_opening` on the same uncontacted lead; reassess its salary and fit instead of copying the old posting's values. If nothing qualifies, retain the closed posting for future research. A genuinely reopened URL needs verification newer than its closure. `get_job.opening_closures` retains closure evidence after replacements. For an actual application, preserve the original attempt and create a separate record for a different opening; closure alone never rejects or withdraws it.
+
+Migration `0019_opening_closures.sql` adds a table with ownership foreign keys without rewriting existing records or adding triggers.
 
 ## Outreach and follow-ups
 
