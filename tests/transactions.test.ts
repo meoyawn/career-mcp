@@ -37,7 +37,7 @@ describe("MCP transaction boundary", () => {
     try {
       await server.connect(serverTransport);
       await client.connect(clientTransport);
-      for (const name of ["get_lead_context", "get_application_context", "get_pipeline"]) {
+      for (const name of ["get_lead_context", "get_application_context", "get_pipeline", "get_pipeline_counts"]) {
         for (let attempt = 0; attempt < 2; attempt++) {
           transactions = 0;
           const result = await client.callTool({ name, arguments: {} });

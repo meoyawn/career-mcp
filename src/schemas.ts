@@ -95,6 +95,10 @@ export const closeOpeningSchema = v.strictObject({
   checked_at: v.optional(timestamp),
 });
 export const pipelineSchema = v.strictObject({ limit, offset });
+export const pipelineCountsSchema = v.strictObject({
+  rejected_from: v.optional(v.pipe(timestamp, v.description("Inclusive rejection-date window start. Defaults to three calendar months before rejected_to. Does not filter current applications or interviews."))),
+  rejected_to: v.optional(v.pipe(timestamp, v.description("Inclusive rejection-date window end. Defaults to server time. Does not filter current applications or interviews."))),
+});
 export const interviewPrepSchema = v.strictObject({
   job_id: v.optional(id),
   stage_id: v.optional(id),
@@ -112,6 +116,27 @@ export const eligibleOpeningSchema = v.strictObject({
   criteria_updated_at: timestamp,
   eligibility_reason: text(5_000),
 });
+
+export const openingSchema = v.strictObject({
+  ...eligibleOpeningSchema.entries,
+  status: v.picklist(["open", "closed", "unknown"]),
+  eligibility: v.picklist(["eligible", "ineligible", "unknown"]),
+  criteria_updated_at: v.nullable(timestamp),
+});
+export const saveOpeningSchema = v.strictObject({
+  job_id: id,
+  opening: openingSchema,
+  employer_salary: compensationFields.employer_salary,
+  notes: v.optional(v.nullable(text(20_000))),
+});
+export const listOpeningsSchema = v.strictObject({
+  job_id: id,
+  status: v.optional(openingSchema.entries.status),
+  eligibility: v.optional(openingSchema.entries.eligibility),
+  limit,
+  offset,
+});
+export const selectOpeningSchema = v.strictObject({ job_id: id, opening_id: id });
 
 export const addJobSchema = v.strictObject({
   ...compensationFields,
@@ -178,6 +203,7 @@ export const updateJobSchema = v.strictObject({
   recruiter_email: v.optional(v.nullable(email)),
   notes: v.optional(v.nullable(text(20_000))),
   status: v.optional(v.pipe(jobStatus, v.description("Leads must stay active. Other statuses describe actual application outcomes only. Use remove_lead when an uncontacted lead no longer meets the selection criteria; never mark it withdrawn or rejected."))),
+  rejected_at: v.optional(v.nullable(v.pipe(v.union([timestamp, v.pipe(v.string(), v.isoDate())]), v.description("Known rejection date or time from the user or verified evidence, including historical corrections; requires a rejected application. Accepts YYYY-MM-DD (stored as midnight UTC for that calendar date) or an ISO timestamp with Z/offset. Cannot be in the future. Null marks the date unknown. Omitted dates are preserved; a new rejection defaults to server time. Never substitute updated_at, an import date, or a failed interview date.")))),
   current_stage: v.optional(currentStage),
   recruiter_engaged_at: v.optional(v.nullable(timestamp)),
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),
@@ -321,8 +347,12 @@ export const rankPromptSchema = v.strictObject({
 
 export type AddJobs = v.InferOutput<typeof addJobsSchema>;
 export type EligibleOpening = v.InferOutput<typeof eligibleOpeningSchema>;
+export type SaveOpening = v.InferOutput<typeof saveOpeningSchema>;
+export type ListOpenings = v.InferOutput<typeof listOpeningsSchema>;
+export type SelectOpening = v.InferOutput<typeof selectOpeningSchema>;
 export type ListJobs = v.InferOutput<typeof listJobsSchema>;
 export type Pipeline = v.InferOutput<typeof pipelineSchema>;
+export type PipelineCounts = v.InferOutput<typeof pipelineCountsSchema>;
 export type InterviewPrep = v.InferOutput<typeof interviewPrepSchema>;
 export type SetApplicantContact = v.InferOutput<typeof applicantContactSchema>;
 export type UpdateJob = v.InferOutput<typeof updateJobSchema>;

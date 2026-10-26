@@ -4,6 +4,80 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("rejection dates leave historical outcomes undated and constrain dates to rejected applications", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const file of migrations.filter((name) => name < "0021")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec("INSERT INTO users (id, created_at) VALUES ('alice', 'created')");
+      const opening = JSON.stringify({ title: "Engineer", description: "Build developer tools", source_url: "https://jobs.example/engineer",
+        location: "Remote", status: "open", eligibility: "eligible", checked_at: "2026-10-01T00:00:00.000Z",
+        criteria_updated_at: "2026-10-01T00:00:00.000Z", eligibility_reason: "Verified eligible" });
+      db.prepare(`INSERT INTO jobs (user_id, id, company, phase, current_stage, status, eligible_opening, created_at, updated_at)
+        VALUES ('alice', 'historical', 'Example employer', 'application', 'applied', 'rejected', ?, 'created', '2026-10-01T00:00:00.000Z')`).run(opening);
+      const before = db.prepare("SELECT rowid, * FROM jobs").get();
+      db.exec(await readFile("migrations/0021_rejection_dates.sql", "utf8"));
+      assert.deepEqual({ ...db.prepare("SELECT rowid, * FROM jobs").get() }, { ...before, rejected_at: null });
+      const update = db.prepare("UPDATE jobs SET rejected_at = ? WHERE id IS 'historical'");
+      assert.throws(() => update.run("not-a-date"), /CHECK/u);
+      assert.throws(() => update.run("2026-10-01T00:00:00Z"), /CHECK/u);
+      update.run("2026-10-01T00:00:00.000Z");
+      assert.throws(() => db.exec("UPDATE jobs SET status = 'active' WHERE id IS 'historical'"), /CHECK/u);
+      db.exec("UPDATE jobs SET status = 'active', rejected_at = NULL WHERE id IS 'historical'");
+      assert.throws(() => update.run("2026-10-01T00:00:00.000Z"), /CHECK/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("multiple-opening migration adds selected evidence without rewriting employer, closure or compensation history", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const file of migrations.filter((name) => name < "0020")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      const checked = "2026-10-01T00:00:00.000Z";
+      const closed = "2026-10-02T00:00:00.000Z";
+      db.exec("INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created')");
+      const opening = { title: "Engineer", description: "Help people complete their work", source_url: "https://jobs.example/open",
+        location: "Remote", status: "open", eligibility: "eligible", checked_at: checked, criteria_updated_at: checked, eligibility_reason: "Verified eligible" };
+      db.prepare(`INSERT INTO jobs (user_id, id, company, eligible_opening, salary_min, salary_currency, salary_period,
+        salary_ask_amount, salary_ask_currency, salary_ask_period, salary_declared_amount, salary_declared_currency, salary_declared_period, created_at, updated_at)
+        VALUES ('alice', 'open', 'Example employer', ?, 100000, 'USD', 'year', 150000, 'USD', 'year', 140000, 'USD', 'year', 'created', 'updated')`)
+        .run(JSON.stringify(opening));
+      db.prepare(`INSERT INTO jobs (user_id, id, company, eligible_opening, phase, current_stage, source_url, employer_salary, created_at, updated_at)
+        VALUES ('alice', 'closed', 'Historical application', ?, 'application', 'applied', 'https://jobs.example/original-submission', '{"text":"Negotiable"}', 'created', 'updated')`)
+        .run(JSON.stringify({ ...opening, source_url: "https://jobs.example/closed" }));
+      db.prepare(`INSERT INTO opening_closures (user_id, job_id, source_url, reason, checked_at, eligible_opening, created_at)
+        VALUES ('alice', 'closed', 'https://jobs.example/closed', 'Confirmed closed', ?, ?, 'created')`).run(closed, JSON.stringify(opening));
+      const jobs = db.prepare("SELECT rowid, * FROM jobs ORDER BY rowid").all();
+      const closures = db.prepare("SELECT rowid, * FROM opening_closures ORDER BY rowid").all();
+      db.exec(await readFile("migrations/0020_multiple_openings.sql", "utf8"));
+      assert.deepEqual(db.prepare("SELECT rowid, * FROM jobs ORDER BY rowid").all(), jobs);
+      assert.deepEqual(db.prepare("SELECT rowid, * FROM opening_closures ORDER BY rowid").all(), closures);
+      const rows = db.prepare("SELECT id, job_id, evidence, employer_salary, salary_target, status, checked_at FROM job_openings ORDER BY id").all();
+      assert.equal(rows.length, 2);
+      assert.deepEqual(rows.map((row) => row.id), ["closed", "open"]);
+      assert.equal(rows[0]?.status, "closed");
+      assert.equal(rows[0]?.checked_at, closed);
+      assert.deepEqual(JSON.parse(String(rows[0]?.employer_salary)), { text: "Negotiable" });
+      assert.deepEqual(JSON.parse(String(rows[1]?.employer_salary)), { min: 100000, max: null, currency: "USD", period: "year" });
+      assert.deepEqual(JSON.parse(String(rows[1]?.salary_target)), { amount: 150000, currency: "USD", period: "year", basis: null });
+      assert.deepEqual(JSON.parse(String(rows[1]?.evidence)), opening);
+      const insert = db.prepare("INSERT INTO job_openings (id, user_id, job_id, evidence, created_at, updated_at) VALUES (?, ?, ?, ?, 'created', 'updated')");
+      const unknown = JSON.stringify({ ...opening, source_url: "https://jobs.example/unknown", eligibility: "unknown", criteria_updated_at: null });
+      insert.run("candidate", "alice", "open", unknown);
+      assert.throws(() => insert.run("foreign", "bob", "open", unknown), /FOREIGN KEY/u);
+      assert.throws(() => insert.run("duplicate", "alice", "open", unknown), /UNIQUE/u);
+      assert.throws(() => insert.run("invalid", "alice", "open", JSON.stringify({ ...opening, source_url: "https://jobs.example/invalid", eligibility: "eligible", criteria_updated_at: null })), /CHECK/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      db.exec("DELETE FROM jobs WHERE id IS 'open'");
+      assert.deepEqual(db.prepare("SELECT id FROM job_openings ORDER BY id").all().map((row) => row.id), ["closed"]);
+    } finally {
+      db.close();
+    }
+  });
+
   test("trigger-free rebuild preserves CRM records and ordering while enforcing relational and row constraints", async () => {
     const db = new DatabaseSync(":memory:");
     try {

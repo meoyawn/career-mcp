@@ -31,6 +31,11 @@ export function createToolStore(database: D1Database, userId: string) {
 }
 
 const errors: Record<string, string> = {
+  rejected_at: "rejected_at requires a rejected application. Set status:rejected with the known rejection date, or clear the date with null.",
+  opening_not_found: "Opening not found for this employer. Use list_openings with its job_id to resolve opening_id.",
+  opening_unavailable: "The selected opening must be open and eligible. Unknown or ineligible roles can be retained with save_opening, but cannot start an application.",
+  opening_outdated: "New opening evidence predates a saved check or closure. Reload list_openings and verify the posting again.",
+  application_opening: "An actual application's destination is historical. Select openings only on leads; preserve this attempt and create a separate record for a new application.",
   opening_closed: "This opening is closed. Browse the same company's live career inventory and save a verified eligible replacement through update_job. Preserve the employer and application history.",
   opening_mismatch: "Closure URL does not match the current opening. Reload get_job before recording a closure.",
   closure_outdated: "Closure evidence predates the current opening check. Verify the live posting again.",
@@ -98,3 +103,6 @@ export const check = (db: Database, code: string, condition: string, ...bindings
 
 export const openingCheck = (db: Database, code: "opening_closed" | "opening_mismatch" | "closure_outdated", condition: string, ...bindings: unknown[]) =>
   db.prepare(`INSERT INTO opening_checks (error) SELECT ? WHERE ${condition}`).bind(code, ...bindings);
+
+export const jobOpeningCheck = (db: Database, code: "opening_not_found" | "opening_unavailable" | "opening_outdated" | "application_opening", condition: string, ...bindings: unknown[]) =>
+  db.prepare(`INSERT INTO job_opening_checks (error) SELECT ? WHERE ${condition}`).bind(code, ...bindings);
