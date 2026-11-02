@@ -65,6 +65,7 @@ interface JobDetails extends SalaryFields {
   recruiter_email: string | null;
   notes: string | null;
   score: number | null;
+  priority: number | null;
   created_at: string;
   updated_at: string;
   rejected_at: string | null;
@@ -194,7 +195,7 @@ interface PipelineSummary {
   scheduled_stages: number;
 }
 
-interface PipelineJob extends SalaryFields, Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at"> {
+interface PipelineJob extends SalaryFields, Pick<Job, "id" | "company" | "title" | "source_url" | "status" | "current_stage" | "recruiter_engaged_at" | "priority"> {
   pipeline_status: "submitted" | "active" | "offer";
   current_stage_status: string | null;
   last_outreach_at: string | null;
@@ -709,7 +710,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
     WHEN ${interviewProgressSql}
     THEN 'active' ELSE 'submitted' END AS pipeline_status
     FROM jobs j WHERE j.user_id IS ? AND j.phase IS 'application' AND j.status IN ('active', 'offer')`;
-  const page = `${scope} ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`;
+  const page = `${scope} ORDER BY priority ASC NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`;
   const scheduled = `s.status IN ('planned', 'in_progress') AND s.starts_at IS NOT NULL
     AND (s.starts_at >= ? OR s.ends_at > ? OR (s.status IS 'in_progress' AND s.ends_at IS NULL))`;
   const [summary, jobs, contacts, stages, prepNotes] = await execute(db, [
@@ -725,7 +726,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
         WHERE ${scheduled}) AS scheduled_stages
       FROM pipeline j`).bind(userId, asOf, asOf, asOf),
     db.prepare(`WITH pipeline AS (${page}) SELECT j.id, j.company, j.title, j.source_url, j.status, j.pipeline_status,
-      j.current_stage, current.status AS current_stage_status, j.recruiter_engaged_at,
+      j.current_stage, current.status AS current_stage_status, j.recruiter_engaged_at, j.priority,
       j.salary_min, j.salary_max, j.salary_currency, j.salary_period,
       j.salary_ask_amount, j.salary_ask_currency, j.salary_ask_period, j.salary_ask_basis,
       j.salary_declared_amount, j.salary_declared_currency, j.salary_declared_period, j.salary_declared_basis,
@@ -735,7 +736,7 @@ export async function getPipeline({ db, userId }: UserStore, input: Pipeline) {
       FROM pipeline j LEFT JOIN stages current ON current.user_id IS j.user_id AND current.id IS (
         SELECT s.id FROM stages s WHERE s.user_id IS j.user_id AND s.job_id IS j.id AND s.name IS j.current_stage
         ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1)
-      ORDER BY j.updated_at DESC, j.id`).bind(userId, input.limit + 1, input.offset),
+      ORDER BY j.priority ASC NULLS LAST, j.updated_at DESC, j.id`).bind(userId, input.limit + 1, input.offset),
     db.prepare(`WITH pipeline AS (${page}) SELECT c.id, c.job_id, c.name, c.relationship, c.url, c.email,
       c.awaiting_reply, c.follow_up_at, c.last_interaction_at, c.last_interaction_time_basis,
       c.last_outreach_at, c.last_response_at
@@ -785,11 +786,11 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
   if (input.available_only) where.push("(status IS 'active' OR reapply_status IS 'eligible') AND opening_status IS 'open' AND opening_eligibility IS 'eligible'");
   if (input.opening_status) { where.push("opening_status IS ?"); bindings.push(input.opening_status); }
   if (input.reapply_status) { where.push("reapply_status IS ?"); bindings.push(input.reapply_status); }
-  if (input.ranked_only) where.push("score IS NOT NULL");
+  if (input.ranked_only) where.push("(score IS NOT NULL OR priority IS NOT NULL)");
   const scoreDirection = input.score_order === "lowest" ? "ASC" : "DESC";
   const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, eligible_opening, opening_status, opening_eligibility, selected_opening_id, opening_count, title, nickname, source_url, location,
     recruiter_name, recruiter_email, notes, status, rejected_at, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
-    score, salary_min, salary_max, salary_currency, salary_period,
+    score, priority, salary_min, salary_max, salary_currency, salary_period,
     salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
     salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis,
     employer_salary, asked_salary,
@@ -801,7 +802,7 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
     (SELECT MAX(o.occurred_at) FROM outreach o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id AND o.direction IS 'inbound') AS last_response_at,
     (SELECT MIN(c.follow_up_at) FROM contact_activity c WHERE c.user_id IS jobs.user_id AND c.job_id IS jobs.id AND c.needs_follow_up IS 1) AS follow_up_at
     FROM opportunities AS jobs
-    ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY score ${scoreDirection} NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY priority ASC NULLS LAST, score ${scoreDirection} NULLS LAST, updated_at DESC, id LIMIT ? OFFSET ?`)
     .bind(...bindings, input.limit + 1, input.offset);
 }
 

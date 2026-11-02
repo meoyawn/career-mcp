@@ -1,0 +1,2 @@
+ALTER TABLE jobs ADD COLUMN priority INTEGER
+  CHECK (priority IS NULL OR priority BETWEEN 1 AND 1000000);

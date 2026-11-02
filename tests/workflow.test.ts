@@ -976,8 +976,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const bobStage = await scoped(bob, "add_stage", { job_id: bobJob.id, name: "system_design", starts_at: "2026-12-01T10:00:00Z", ends_at: "2026-12-01T11:00:00Z" }, stageSchema);
       await scoped(alice, "add_feedback", { stage_id: aliceStage.id, text: "Alice private feedback" }, feedbackOutput);
       const bobFeedback = await scoped(bob, "add_feedback", { stage_id: bobStage.id, text: "Bob private feedback" }, feedbackOutput);
-      const aliceOutreach = await scoped(alice, "record_outreach", { contact: { job_id: aliceJob.id, name: "Alice referrer", relationship: "friend", url: "https://t.me/example_referrer" }, direction: "outbound" }, outreachOutput);
-      const bobOutreach = await scoped(bob, "record_outreach", { contact: { job_id: bobJob.id, name: "Bob referrer", relationship: "friend", url: "https://t.me/example_referrer" }, direction: "outbound" }, outreachOutput);
+      const aliceOutreach = await scoped(alice, "record_outreach", { contact: { job_id: aliceJob.id, name: "Alice referrer", relationship: "friend", url: "https://contacts.example/example_referrer" }, direction: "outbound" }, outreachOutput);
+      const bobOutreach = await scoped(bob, "record_outreach", { contact: { job_id: bobJob.id, name: "Bob referrer", relationship: "friend", url: "https://contacts.example/example_referrer" }, direction: "outbound" }, outreachOutput);
       const aliceContact = { id: aliceOutreach.contact_id };
       const bobContact = { id: bobOutreach.contact_id };
       await scoped(alice, "update_job", { job_id: aliceJob.id, score: 90, notes: "Alice assessment" }, jobSchema);
@@ -1157,7 +1157,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const followUps = v.object({ follow_ups: v.array(activity), next_offset: v.nullable(v.number()) });
     const referral = await call("add_stage", { job_id: employer.id, name: "outreach", status: "in_progress" }, stageSchema);
     const first = await call("record_outreach", {
-      contact: { job_id: employer.id, name: "Example friend", relationship: "friend/referrer", url: "https://t.me/referrer_example" },
+      contact: { job_id: employer.id, name: "Example friend", relationship: "friend/referrer", url: "https://contacts.example/referrer_example" },
       stage_id: referral.id, direction: "outbound", channel: "telegram",
       occurred_at: "2026-09-01T12:00:00+03:00", follow_up_at: "2026-09-04T12:00:00+03:00",
     }, outreachOutput);
@@ -1210,11 +1210,11 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.ok(Date.parse(logged.occurred_at) >= loggingStartedAt && Date.parse(logged.occurred_at) <= Date.now());
     await call("update_contact", { job_id: employer.id, contact_id: friend.id, name: "Renamed friend", relationship: "referrer" }, contactOutput);
     const persisted = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
-    assert.equal(persisted.contacts.find((contact) => contact.id === friend.id)?.url, "https://t.me/referrer_example");
+    assert.equal(persisted.contacts.find((contact) => contact.id === friend.id)?.url, "https://contacts.example/referrer_example");
     assert.equal(persisted.last_outreach_at, logged.occurred_at);
     assert.equal(persisted.outreach.length, 6);
     for (const [name, args, message] of [
-      ["record_outreach", { contact: { job_id: employer.id, name: "Duplicate", url: "https://t.me/referrer_example" }, direction: "outbound" }, /already exists/u],
+      ["record_outreach", { contact: { job_id: employer.id, name: "Duplicate", url: "https://contacts.example/referrer_example" }, direction: "outbound" }, /already exists/u],
       ["record_outreach", { contact_id: friend.id, direction: "outbound", time_basis: "reported" }, /require occurred_at/u],
       ["record_outreach", { contact_id: friend.id, direction: "outbound", occurred_at: "2099-01-01T00:00:00Z" }, /future/u],
       ["update_outreach", { outreach_id: first.id, follow_up_at: "2026-08-01T00:00:00Z" }, /earlier/u],
@@ -1330,7 +1330,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         await scoped("add_stage", { job_id: job.id, name: "technical_interview", starts_at: tomorrow }, stageSchema);
       }
       const friend = await scoped("record_outreach", {
-        contact: { job_id: referral.id, name: "Example referrer", relationship: "friend/referrer", url: "https://t.me/pipeline_example" },
+        contact: { job_id: referral.id, name: "Example referrer", relationship: "friend/referrer", url: "https://contacts.example/pipeline_example" },
         direction: "outbound", occurred_at: yesterday, follow_up_at: pastDue,
       }, outreachOutput);
       const hr = await scoped("record_outreach", { contact: { job_id: referral.id, name: "Example HR" }, direction: "outbound", occurred_at: yesterday }, outreachOutput);
@@ -1532,6 +1532,37 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       }
       assert.deepEqual(await scoped("list_jobs", { include_descriptions: true }, snapshotSchema), jobsBefore);
       assert.deepEqual(await scoped("get_pipeline", {}, v.object({ summary: v.unknown(), applications: v.array(v.unknown()) })), pipelineBefore);
+      const prioritySchema = v.object({ ...jobSchema.entries, priority: v.nullable(v.number()) });
+      const pinned = await scoped("update_job", { job_id: unranked.id, priority: 1 }, prioritySchema);
+      assert.equal(pinned.priority, 1);
+      assert.equal(pinned.score, null);
+      assert.equal(pinned.current_stage, "lead");
+      await scoped("update_job", { job_id: application.id, priority: 2 }, prioritySchema);
+      await scoped("update_job", { job_id: withdrawn.id, status: "active" }, jobSchema);
+      const top = await scoped("list_jobs", { limit: 2 }, jobsSchema);
+      assert.deepEqual(top.jobs.map((job) => job.id), [unranked.id, application.id]);
+      assert.equal(top.next_offset, 2);
+      const rest = await scoped("list_jobs", { offset: top.next_offset, limit: 100 }, jobsSchema);
+      assert.ok(rest.jobs.every((job) => job.id !== unranked.id && job.id !== application.id));
+      const priorityPipeline = await scoped("get_pipeline", { limit: 1 }, v.object({ applications: v.array(v.object({ id: v.string(), priority: v.nullable(v.number()) })), next_offset: v.number() }));
+      assert.deepEqual(priorityPipeline.applications.map((job) => job.id), [application.id]);
+      assert.equal(priorityPipeline.applications[0]?.priority, 2);
+      assert.equal(priorityPipeline.next_offset, 1);
+      for (const order of ["highest", "lowest"]) {
+        assert.deepEqual((await scoped("get_next_leads", { order }, pageSchema)).jobs.map((job) => job.id), [unranked.id]);
+      }
+      for (const priority of [0, -1, 1.5, 1_000_001, "1"]) {
+        assert.equal((await owner.callTool({ name: "update_job", arguments: { job_id: unranked.id, priority } })).isError, true);
+      }
+      await error("update_job", { job_id: unranked.id, priority: 1 }, /not found/iu);
+      await scoped("close_opening", { job_id: unranked.id, source_url: "https://jobs.example/selection/Unranked", reason: "Posting closed" }, v.unknown());
+      assert.deepEqual((await scoped("get_next_leads", {}, pageSchema)).jobs.map((job) => job.id), [high.id]);
+      await scoped("update_job", { job_id: unranked.id, priority: null }, prioritySchema);
+      await scoped("update_job", { job_id: application.id, priority: null }, prioritySchema);
+      const cleared = await scoped("get_job", { job_id: unranked.id }, v.object({ job: prioritySchema }));
+      assert.equal(cleared.job.priority, null);
+      assert.equal(cleared.job.score, null);
+      assert.equal(cleared.job.current_stage, "lead");
       await scoped("update_job", { job_id: high.id, phase: "application", eligible_opening: await verifiedOpening("High", owner) }, jobSchema);
       assert.deepEqual((await scoped("get_next_leads", { limit: 100 }, pageSchema)).jobs.map((job) => job.id), [...ties, low.id, zero.id]);
       for (const job of [low, tieA, tieB]) await scoped("remove_lead", { job_id: job.id }, v.unknown());

@@ -8,7 +8,7 @@ const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
 const phase = v.picklist(["lead", "application"]);
 const reapplyStatus = v.picklist(["not_applicable", "unknown", "not_allowed", "cooldown", "eligible"]);
-const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100), v.description("Employer/opening fit against saved selection criteria, 0–100 with higher better. Never encode application order, practice sequencing, or temporary priority."));
+const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100), v.description("Fit against saved criteria; higher is better. Use priority for explicit user list ordering."));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
 export const pipelineStageSchema = v.picklist([
   "applied", "outreach", "recruiter_screen", "assessment", "technical_interview",
@@ -52,23 +52,23 @@ export const salaryRangeSchema = v.strictObject({
   context: v.optional(v.nullable(text(2_000)), null),
 });
 const compensationFields = {
-  employer_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Pay advertised or confirmed by the employer. Full replacement; null clears only employer pay. Preserve original text and source_url; leave unknown units null. Never save the applicant's ask here.")))),
-  asked_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Salary actually requested by the applicant in a submitted form, message, or call. Use min=max for an exact amount. Full replacement; null clears only this communicated ask. context can identify the form/call and date. A private target or employer budget is not an actual ask.")))),
+  employer_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Employer-advertised/confirmed pay. Replaces this range; null clears it. Preserve source/text and unknown units.")))),
+  asked_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Applicant's actually communicated ask. Replaces this range; null clears it. Use min=max for exact pay and context for form/call/date.")))),
 };
 const salaryFields = {
-  salary_min: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Legacy employer-advertised minimum; prefer employer_salary. This is not the applicant's ask.")))),
+  salary_min: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Legacy employer pay minimum; prefer employer_salary.")))),
   salary_max: v.optional(v.nullable(salaryAmount)),
   salary_currency: v.optional(v.nullable(salaryCurrency)),
   salary_period: v.optional(v.nullable(salaryPeriod)),
 };
 const salaryAskFields = {
-  salary_ask_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Private current negotiation target. This does not establish that an amount was communicated; use asked_salary for actual asks.")))),
+  salary_ask_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Private user-approved negotiation target. Use asked_salary for communicated asks.")))),
   salary_ask_currency: v.optional(v.nullable(salaryCurrency)),
   salary_ask_period: v.optional(v.nullable(salaryPeriod)),
   salary_ask_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
 };
 const salaryDeclaredFields = {
-  salary_declared_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Legacy exact amount actually communicated by the applicant. Prefer asked_salary, which also supports ranges. This is not employer-advertised pay or a private target.")))),
+  salary_declared_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Legacy exact communicated ask; prefer asked_salary for exact amounts or ranges.")))),
   salary_declared_currency: v.optional(v.nullable(salaryCurrency)),
   salary_declared_period: v.optional(v.nullable(salaryPeriod)),
   salary_declared_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
@@ -96,8 +96,8 @@ export const closeOpeningSchema = v.strictObject({
 });
 export const pipelineSchema = v.strictObject({ limit, offset });
 export const pipelineCountsSchema = v.strictObject({
-  rejected_from: v.optional(v.pipe(timestamp, v.description("Inclusive rejection-date window start. Defaults to three calendar months before rejected_to. Does not filter current applications or interviews."))),
-  rejected_to: v.optional(v.pipe(timestamp, v.description("Inclusive rejection-date window end. Defaults to server time. Does not filter current applications or interviews."))),
+  rejected_from: v.optional(v.pipe(timestamp, v.description("Inclusive rejection window start; defaults to three calendar months before rejected_to."))),
+  rejected_to: v.optional(v.pipe(timestamp, v.description("Inclusive rejection window end; defaults to server time."))),
 });
 export const interviewPrepSchema = v.strictObject({
   job_id: v.optional(id),
@@ -202,13 +202,14 @@ export const updateJobSchema = v.strictObject({
   recruiter_name: v.optional(v.nullable(text(200))),
   recruiter_email: v.optional(v.nullable(email)),
   notes: v.optional(v.nullable(text(20_000))),
-  status: v.optional(v.pipe(jobStatus, v.description("Leads must stay active. Other statuses describe actual application outcomes only. Use remove_lead when an uncontacted lead no longer meets the selection criteria; never mark it withdrawn or rejected."))),
-  rejected_at: v.optional(v.nullable(v.pipe(v.union([timestamp, v.pipe(v.string(), v.isoDate())]), v.description("Known rejection date or time from the user or verified evidence, including historical corrections; requires a rejected application. Accepts YYYY-MM-DD (stored as midnight UTC for that calendar date) or an ISO timestamp with Z/offset. Cannot be in the future. Null marks the date unknown. Omitted dates are preserved; a new rejection defaults to server time. Never substitute updated_at, an import date, or a failed interview date.")))),
+  status: v.optional(v.pipe(jobStatus, v.description("Leads stay active; other values record actual application outcomes."))),
+  rejected_at: v.optional(v.nullable(v.pipe(v.union([timestamp, v.pipe(v.string(), v.isoDate())]), v.description("Verified rejection date: YYYY-MM-DD (midnight UTC) or timestamp; never future. Requires rejected status. Null means unknown; omission preserves or defaults to now for a new rejection. Never infer from edits/imports/failed rounds.")))),
   current_stage: v.optional(currentStage),
   recruiter_engaged_at: v.optional(v.nullable(timestamp)),
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),
   reapply_after: v.optional(v.nullable(timestamp)),
   score: v.optional(v.nullable(score)),
+  priority: v.optional(v.nullable(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1_000_000), v.description("Explicit user-requested pin; lower sorts first, ahead of fit. Null unpins. Does not authorize applying.")))),
 });
 
 export const addPrepNoteSchema = v.strictObject({

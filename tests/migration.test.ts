@@ -4,6 +4,32 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("manual priority is nullable and bounded without rewriting stored fit or application history", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const file of migrations.filter((name) => name < "0023")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec("INSERT INTO users (id, created_at) VALUES ('alice', 'created')");
+      const opening = JSON.stringify({ title: "Engineer", description: "Build developer tools", source_url: "https://jobs.example/engineer",
+        location: "Remote", status: "open", eligibility: "eligible", checked_at: "2026-10-01T00:00:00.000Z",
+        criteria_updated_at: "2026-10-01T00:00:00.000Z", eligibility_reason: "Verified eligible" });
+      db.prepare(`INSERT INTO jobs (user_id, id, company, phase, current_stage, score, notes, eligible_opening, created_at, updated_at)
+        VALUES ('alice', 'historical', 'Example employer', 'application', 'outreach', 37, 'Preserve history', ?, 'created', 'updated')`).run(opening);
+      const before = db.prepare("SELECT rowid, * FROM jobs").get();
+      db.exec(await readFile("migrations/0023_manual_priority.sql", "utf8"));
+      assert.deepEqual({ ...db.prepare("SELECT rowid, * FROM jobs").get() }, { ...before, priority: null });
+      const update = db.prepare("UPDATE jobs SET priority = ? WHERE id IS 'historical'");
+      for (const value of [0, -1, 1.5, 1_000_001, "invalid"]) assert.throws(() => update.run(value), /CHECK|cannot store/u);
+      for (const priority of [1, 1_000_000, null]) {
+        update.run(priority);
+        assert.deepEqual({ ...db.prepare("SELECT rowid, * FROM jobs").get() }, { ...before, priority });
+      }
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("rejection dates leave historical outcomes undated and constrain dates to rejected applications", async () => {
     const db = new DatabaseSync(":memory:");
     try {
