@@ -443,7 +443,8 @@ function withCompensation<T extends SalaryFields>(job: T) {
 }
 
 function withEligibleOpening<T extends SalaryFields & Pick<Job, "eligible_opening">>(job: T) {
-  return withCompensation({ ...job, eligible_opening: job.eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(job.eligible_opening)) });
+  const { eligible_opening, ...fields } = job;
+  return withCompensation({ ...fields, eligible_opening: eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(eligible_opening)) });
 }
 
 function validateSalaryRange(range: v.InferOutput<typeof salaryRangeSchema> | null) {
@@ -809,7 +810,14 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
 function listJobsResult(results: D1Result<Omit<Job, "description"> & { description?: string }>, input: ListJobs) {
   const hasMore = results.results.length > input.limit;
   return {
-    jobs: results.results.slice(0, input.limit).map(withEligibleOpening),
+    jobs: results.results.slice(0, input.limit).map(function listedJob(job) {
+      const result = withEligibleOpening(job);
+      const { notes: _notes, ...fields } = result;
+      const listed = input.include_notes ? result : fields;
+      if (input.include_descriptions || listed.eligible_opening === null) return listed;
+      const { description: _description, ...opening } = listed.eligible_opening;
+      return { ...listed, eligible_opening: opening };
+    }),
     next_offset: hasMore ? input.offset + input.limit : null,
   };
 }
@@ -820,7 +828,8 @@ export async function listJobs(scope: UserStore, input: ListJobs) {
 }
 
 export async function getLeadContext(scope: UserStore, input: ListJobs) {
-  const replacements = v.parse(listJobsSchema, { phase: "lead", opening_status: "closed", limit: input.limit, offset: input.offset });
+  const replacements = v.parse(listJobsSchema, { phase: "lead", opening_status: "closed", limit: input.limit, offset: input.offset,
+    include_descriptions: input.include_descriptions, include_notes: input.include_notes });
   const results = await execute(scope.db, [criteriaStatement(scope), listJobsStatement(scope, input), listJobsStatement(scope, replacements)]);
   return { criteria: (results[0]?.results[0] ?? null) as Criteria | null,
     replacement_search: listJobsResult(results[2] as D1Result<Omit<Job, "description"> & { description?: string }>, replacements),

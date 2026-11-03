@@ -8,7 +8,7 @@ const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
 const phase = v.picklist(["lead", "application"]);
 const reapplyStatus = v.picklist(["not_applicable", "unknown", "not_allowed", "cooldown", "eligible"]);
-const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100), v.description("Fit against saved criteria; higher is better. Use priority for explicit user list ordering."));
+const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100), v.description("Fit against saved criteria; higher is better. Manual list ordering is stored separately in priority."));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
 export const pipelineStageSchema = v.picklist([
   "applied", "outreach", "recruiter_screen", "assessment", "technical_interview",
@@ -62,7 +62,7 @@ const salaryFields = {
   salary_period: v.optional(v.nullable(salaryPeriod)),
 };
 const salaryAskFields = {
-  salary_ask_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Private user-approved negotiation target. Use asked_salary for communicated asks.")))),
+  salary_ask_amount: v.optional(v.nullable(v.pipe(salaryAmount, v.description("Private negotiation target. Communicated asks are stored separately in asked_salary.")))),
   salary_ask_currency: v.optional(v.nullable(salaryCurrency)),
   salary_ask_period: v.optional(v.nullable(salaryPeriod)),
   salary_ask_basis: v.optional(v.nullable(v.picklist(["gross", "net"]))),
@@ -171,11 +171,19 @@ export const listJobsSchema = v.strictObject({
   available_only: v.optional(v.boolean(), false),
   reapply_status: v.optional(reapplyStatus),
   as_of: v.optional(timestamp),
-  include_descriptions: v.optional(v.boolean(), false),
+  include_descriptions: v.optional(v.pipe(v.boolean(), v.description("Include top-level and selected-opening descriptions. Otherwise both are omitted.")), false),
+  include_notes: v.optional(v.pipe(v.boolean(), v.description("Include complete job notes.")), true),
   score_order: scoreOrder,
   ranked_only: v.optional(v.boolean(), false),
   limit,
   offset,
+});
+
+export const leadContextSchema = v.strictObject({
+  limit: v.optional(pageSize, 5),
+  offset,
+  include_descriptions: listJobsSchema.entries.include_descriptions,
+  include_notes: v.optional(v.pipe(v.boolean(), v.description("Include complete job notes.")), false),
 });
 
 export const nextLeadsSchema = v.strictObject({
@@ -209,7 +217,7 @@ export const updateJobSchema = v.strictObject({
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),
   reapply_after: v.optional(v.nullable(timestamp)),
   score: v.optional(v.nullable(score)),
-  priority: v.optional(v.nullable(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1_000_000), v.description("Explicit user-requested pin; lower sorts first, ahead of fit. Null unpins. Does not authorize applying.")))),
+  priority: v.optional(v.nullable(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1_000_000), v.description("Manual list pin; lower sorts first, ahead of fit. Null unpins. Does not change score, eligibility or phase.")))),
 });
 
 export const addPrepNoteSchema = v.strictObject({
