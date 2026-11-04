@@ -146,7 +146,7 @@ export const addJobSchema = v.strictObject({
   company: text(200),
   company_url: v.optional(url),
   phase: v.optional(phase, "lead"),
-  eligible_opening: v.optional(eligibleOpeningSchema),
+  eligible_opening: v.optional(v.pipe(eligibleOpeningSchema, v.description("Required for leads against current criteria. Optional historical evidence for actual applications; omit it rather than loading search/ranking context."))),
   title: v.optional(text(300)),
   nickname: v.optional(text(200)),
   description: v.optional(text(30_000)),
@@ -160,7 +160,7 @@ export const addJobSchema = v.strictObject({
 
 export const maxJobsPerBatch = 100;
 export const addJobsSchema = v.strictObject({
-  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(maxJobsPerBatch, `Save at most ${maxJobsPerBatch} employers or applications per call. Split larger imports into batches of up to ${maxJobsPerBatch}; save only opportunities that meet the criteria.`)),
+  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(maxJobsPerBatch, `Save at most ${maxJobsPerBatch} employers or applications per call. Split larger imports into batches of up to ${maxJobsPerBatch}; only leads require current eligibility evidence.`)),
 });
 
 export const listJobsSchema = v.strictObject({
@@ -201,7 +201,7 @@ export const updateJobSchema = v.strictObject({
   company: v.optional(text(200)),
   company_url: v.optional(v.nullable(url)),
   phase: v.optional(phase),
-  eligible_opening: v.optional(eligibleOpeningSchema),
+  eligible_opening: v.optional(v.pipe(eligibleOpeningSchema, v.description("Fresh evidence for lead selection/renewal. Optional for application edits or phase:application; existing evidence is preserved when omitted."))),
   title: v.optional(v.nullable(text(300))),
   nickname: v.optional(v.nullable(text(200))),
   description: v.optional(v.nullable(text(30_000))),

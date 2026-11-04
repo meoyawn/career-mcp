@@ -4,6 +4,58 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 describe("User ownership schema and lead migrations", () => {
+  test("application separation preserves every CRM row and index while requiring evidence only for leads", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const file of migrations.filter((name) => name < "0024")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec("INSERT INTO users (id, created_at) VALUES ('alice', 'created'), ('bob', 'created')");
+      const opening = JSON.stringify({ title: "Engineer", description: "Build developer tools", source_url: "https://jobs.example/engineer",
+        location: "Remote", status: "open", eligibility: "eligible", checked_at: "2026-10-01T00:00:00.000Z",
+        criteria_updated_at: "2026-10-01T00:00:00.000Z", eligibility_reason: "Historical eligible assessment" });
+      db.prepare(`INSERT INTO jobs (rowid, user_id, id, company, phase, current_stage, status, rejected_at, score, priority,
+        notes, eligible_opening, salary_min, salary_max, salary_currency, salary_period, created_at, updated_at)
+        VALUES (11, 'alice', 'attempt', 'Example employer', 'application', 'outreach', 'rejected', '2026-10-02T00:00:00.000Z',
+          37, 4, 'Preserve application history', ?, 100000, 150000, 'USD', 'year', 'created', 'updated')`).run(opening);
+      db.prepare(`INSERT INTO jobs (rowid, user_id, id, company, eligible_opening, created_at, updated_at)
+        VALUES (27, 'bob', 'lead', 'Other employer', ?, 'created', 'updated')`).run(opening);
+      db.exec(`INSERT INTO jobs (rowid, user_id, id, company, phase, current_stage, legacy_eligible_opening, created_at, updated_at)
+          VALUES (39, 'alice', 'legacy', 'Legacy application', 'application', 'applied', 1, 'created', 'updated');
+        INSERT INTO stages (rowid, user_id, id, job_id, name, status, created_at, updated_at)
+          VALUES (7, 'alice', 'round', 'attempt', 'outreach', 'completed', 'created', 'updated');
+        INSERT INTO feedback (rowid, user_id, id, stage_id, text, source, created_at, updated_at)
+          VALUES (9, 'alice', 'feedback', 'round', 'Preserve feedback', 'recruiter', 'created', 'updated');
+        INSERT INTO contacts (rowid, user_id, id, job_id, name, email, created_at, updated_at)
+          VALUES (13, 'alice', 'person', 'attempt', 'Example recruiter', 'recruiter@example.com', 'created', 'updated');
+        INSERT INTO outreach (rowid, user_id, id, job_id, contact_id, stage_id, direction, occurred_at, time_basis, follow_up_status, created_at, updated_at)
+          VALUES (17, 'alice', 'message', 'attempt', 'person', 'round', 'outbound', '2026-10-01T00:00:00.000Z', 'reported', 'pending', 'created', 'updated');
+        INSERT INTO prep_notes (rowid, user_id, id, job_id, kind, text, created_at, updated_at)
+          VALUES (19, 'alice', 'prep', 'attempt', 'question', 'Preserve private question', 'created', 'updated');`);
+      db.prepare(`INSERT INTO opening_closures (rowid, user_id, job_id, source_url, reason, checked_at, eligible_opening, created_at)
+        VALUES (23, 'alice', 'attempt', 'https://jobs.example/engineer', 'Posting closed', '2026-10-02T00:00:00.000Z', ?, 'created')`).run(opening);
+      db.prepare(`INSERT INTO job_openings (rowid, id, user_id, job_id, evidence, notes, created_at, updated_at)
+        VALUES (29, 'opening', 'alice', 'attempt', ?, 'Preserve role research', 'created', 'updated')`).run(opening);
+      const tables = ["jobs", "stages", "feedback", "contacts", "outreach", "prep_notes", "opening_closures", "job_openings", "users"];
+      const originals = tables.map((table) => db.prepare(`SELECT rowid, * FROM ${table} ORDER BY rowid`).all());
+      const indexes = db.prepare("SELECT name, sql FROM sqlite_schema WHERE type IS 'index' ORDER BY name").all();
+      const activity = db.prepare("SELECT * FROM contact_activity").all();
+      db.exec("BEGIN");
+      for (const file of migrations.filter((name) => name >= "0024")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec("COMMIT");
+      assert.deepEqual(tables.map((table) => db.prepare(`SELECT rowid, * FROM ${table} ORDER BY rowid`).all()), originals);
+      assert.deepEqual(db.prepare("SELECT name, sql FROM sqlite_schema WHERE type IS 'index' ORDER BY name").all(), indexes);
+      assert.deepEqual(db.prepare("SELECT * FROM contact_activity").all(), activity);
+      db.exec(`INSERT INTO jobs (user_id, id, company, phase, current_stage, created_at, updated_at)
+        VALUES ('alice', 'new-application', 'Explicit application', 'application', 'applied', 'created', 'updated')`);
+      assert.equal(db.prepare("SELECT legacy_eligible_opening FROM jobs WHERE id IS 'new-application'").get()?.legacy_eligible_opening, 0);
+      assert.throws(() => db.exec(`INSERT INTO jobs (user_id, id, company, created_at, updated_at)
+        VALUES ('alice', 'invalid-lead', 'Unverified lead', 'created', 'updated')`), /opening_required/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
   test("manual priority is nullable and bounded without rewriting stored fit or application history", async () => {
     const db = new DatabaseSync(":memory:");
     try {

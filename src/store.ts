@@ -292,11 +292,10 @@ function validateOpening(phase: Job["phase"], input: Pick<UpdateJob, "title" | "
 
 function validateEligibleOpening(input: unknown) {
   const result = v.safeParse(eligibleOpeningSchema, input);
-  if (!result.success) fail("Every new job record requires a verified eligible opening: title, description, source_url, location, status:open, eligibility:eligible, checked_at, criteria_updated_at, and eligibility_reason. Excluded, closed, unknown, and employer-only records cannot be saved; phase:application does not bypass this check.");
+  if (!result.success) fail("Lead intake requires a verified eligible opening: title, description, source_url, location, status:open, eligibility:eligible, checked_at, criteria_updated_at, and eligibility_reason. Actual applications may omit eligible_opening.");
   const opening = result.output;
   const checkedAt = normalizeTimestamp(opening.checked_at);
-  const age = Date.now() - Date.parse(checkedAt);
-  if (age < 0 || age > 24 * 60 * 60 * 1_000) fail("Verify the opening is still open within the last 24 hours; checked_at cannot be in the future.");
+  if (Date.parse(checkedAt) > Date.now()) fail("checked_at cannot be in the future.");
   return { ...opening, checked_at: checkedAt, criteria_updated_at: normalizeTimestamp(opening.criteria_updated_at) };
 }
 
@@ -521,7 +520,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
       validateSalary(job);
       validateSalaryAsk(job);
       validateDeclaredSalary(job);
-      job.eligible_opening = validateEligibleOpening(job.eligible_opening);
+      if (job.phase === "lead" || job.eligible_opening !== undefined) job.eligible_opening = validateEligibleOpening(job.eligible_opening);
     } catch (error) {
       if (error instanceof Error && error.cause === "user") {
         fail(`Batch rejected: 0 of ${jobs.length} records saved. Record ${index + 1}: ${error.message}`);
@@ -545,8 +544,9 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
     job.employer_salary ?? null, job.asked_salary ?? null,
   ));
   try {
-    const evidence = JSON.stringify(prepared.map((job) => job.eligible_opening));
-    const checks = [
+    const leads = prepared.filter((job) => job.phase === "lead");
+    const evidence = JSON.stringify(leads.map((job) => job.eligible_opening));
+    const checks = leads.length === 0 ? [] : [
       check(db, "criteria_required", "NOT EXISTS (SELECT 1 FROM criteria WHERE user_id IS ?)", userId),
       check(db, "outdated_criteria", `EXISTS (SELECT 1 FROM json_each(?) opening WHERE NOT EXISTS (
         SELECT 1 FROM criteria WHERE user_id IS ? AND updated_at IS json_extract(opening.value, '$.criteria_updated_at')))`, evidence, userId),
@@ -856,16 +856,18 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
       AND coalesce(?, phase) IS 'lead' AND coalesce(?, status) IS NOT 'active')`, userId, job_id, input.phase ?? null, input.status ?? null),
     check(db, "application_to_lead", `? IS 'lead' AND EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'application')`, input.phase ?? null, userId, job_id),
   ];
-  if (opening) statements.push(...openingChecks(scope, "?", [JSON.stringify(opening)]));
-  else statements.push(check(db, "opening_required", `? OR (? AND EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'lead'))`,
-    Number(input.phase !== undefined || input.company !== undefined || input.company_url !== undefined),
-    Number(input.status === "active"), userId, job_id));
+  if (opening && input.phase !== "application") statements.push(...openingChecks(scope, "?", [JSON.stringify(opening)],
+    "EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND coalesce(?, phase) IS 'lead')", [userId, job_id, input.phase ?? null]));
+  if (!opening) statements.push(check(db, "opening_required", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
+    AND coalesce(?, phase) IS 'lead' AND ?)`, userId, job_id, input.phase ?? null,
+    Number(input.phase !== undefined || input.company !== undefined || input.company_url !== undefined || input.status === "active")));
   if (opening) statements.push(openingCheck(db, "opening_closed", `EXISTS (SELECT 1 FROM opening_closures
     WHERE user_id IS ? AND job_id IS ? AND source_url IS ? AND checked_at >= ?)`, userId, job_id, opening.source_url, opening.checked_at));
   if (opening) statements.push(
     ...openingEvidenceChecks(scope, job_id, opening.source_url, opening.checked_at),
     jobOpeningCheck(db, "application_opening", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'application'
-      AND eligible_opening IS NOT NULL AND json_extract(eligible_opening, '$.source_url') IS NOT ?)`, userId, job_id, opening.source_url),
+      AND coalesce(json_extract(eligible_opening, '$.source_url'), source_url) IS NOT NULL
+      AND coalesce(json_extract(eligible_opening, '$.source_url'), source_url) IS NOT ?)`, userId, job_id, opening.source_url),
   );
   if (patch.recruiter_engaged_at) {
     patch.recruiter_engaged_at = normalizeTimestamp(patch.recruiter_engaged_at);
@@ -986,11 +988,6 @@ function startApplication(scope: UserStore, jobSql: string, bindings: unknown[],
   const targetBindings = [userId, ...bindings];
   return [
     check(db, "job_not_found", `NOT EXISTS (SELECT 1 ${target})`, ...targetBindings),
-    openingCheck(db, "opening_closed", `EXISTS (SELECT 1 ${target} AND phase IS 'lead' AND (${openingStatusSql}) IS 'closed')`, ...targetBindings),
-    jobOpeningCheck(db, "opening_unavailable", `EXISTS (SELECT 1 ${target} AND phase IS 'lead'
-      AND ((${openingStatusSql}) IS NOT 'open' OR (${openingEligibilitySql}) IS NOT 'eligible'))`, ...targetBindings),
-    ...openingChecks(scope, `SELECT eligible_opening ${target}`, targetBindings,
-      `EXISTS (SELECT 1 ${target} AND phase IS 'lead')`, targetBindings),
     db.prepare(`UPDATE jobs SET phase = 'application',
       current_stage = CASE WHEN phase IS 'lead' OR ? THEN ? ELSE current_stage END, updated_at = ?
       WHERE user_id IS ? AND id IS (${jobSql}) AND (phase IS 'lead' OR ?)`)
