@@ -11,4 +11,4 @@
 - Tracked `wrangler.jsonc` is local-only configuration with synthetic IDs. Documentation, examples, fixtures, generated types, and scripts must contain only placeholders or synthetic data; use localhost or reserved example domains for URLs. Never copy an active address or ID into this file, even to document what must remain secret.
 - Deployments and remote database commands must explicitly use `wrangler.deploy.jsonc` and fail if it is missing. Local development, checks, tests, builds, and type generation must use the sanitized configuration and must not load deployment credentials.
 - Before committing or pushing, inspect the complete staged diff and scan tracked content for secrets and private deployment/user data. Check generated files too. Do not print private values in shared logs, commit messages, PRs, or command arguments. Removing a value from current files does not erase Git history; check historical commits and report any remaining exposure.
-- Deploy with `task deploy` (server deployment plus CareerMCP tool refresh).
+- Deploy with `task deploy`.

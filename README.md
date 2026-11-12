@@ -69,7 +69,7 @@ Once configured and authenticated, every deployment uses the Taskfile workflow:
 task deploy
 ```
 
-The task requires the ignored deployment config. It runs type checking, lint, integration tests, and a bundle dry run with the sanitized local config before applying remote D1 migrations and publishing with explicit `--config wrangler.deploy.jsonc`, then refreshes CareerMCP tools with `mcp-refresh refresh CareerMCP`. Remote commands fail if the private config is missing. Create a new Codex thread afterward to verify through the refreshed tools; existing threads retain their cached schemas.
+The task requires the ignored deployment config. It runs type checking, lint, integration tests, and a bundle dry run with the sanitized local config before applying remote D1 migrations and publishing with explicit `--config wrangler.deploy.jsonc`. Remote commands fail if the private config is missing.
 
 A failed step stops the workflow. Already-applied migrations are skipped on subsequent runs. Migrations and publishing are separate operations: if publishing fails after a migration succeeds, fix the failure and rerun; future schema changes should remain compatible with the currently deployed Worker.
 
