@@ -1,6 +1,7 @@
 # Rules
 
 - Keep server instructions, tool descriptions, schemas and prompts focused on CRM operations, data semantics and API constraints. Job-search objectives, application strategy, effort budgets and approval policy belong to the calling workspace.
+- Keep shared server instructions limited to cross-tool contracts; document operation-specific semantics in the relevant tool/schema and README. Context reads must serve the operation's required inputs. Optional metadata, enrichment and ranking must not become prerequisites for recording data; a successful mutation response confirms the saved state.
 - Use `aube` only for package management and package commands. Never use `npm` or `npx`.
 - Never create SQL triggers. Enforce stored invariants with CHECK, UNIQUE, and foreign-key constraints, and perform cross-row validation explicitly in the same transaction as the mutation. Preserve historical migrations; remove their active triggers with a forward migration.
 - Each MCP tool call may execute at most one database transaction. Use one statement or one D1 batch for all validation reads, mutations, and returned data. Do not execute preliminary reads, follow-up reads, nested batches, or retries in separate transactions.

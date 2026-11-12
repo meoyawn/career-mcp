@@ -218,13 +218,16 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
     try {
       await owner.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${connection.token}` } } }));
-      const destination = "https://jobs.example/explicit-application";
+      const destination = "https://jobs.example/vacancy/123456789";
       const application = v.parse(row, await scoped("add_job", { company: "Explicit application", phase: "application",
         title: "Engineer", source_url: destination }));
       assert.equal(application.phase, "application");
       assert.equal(application.current_stage, "applied");
       assert.equal(application.eligible_opening, undefined);
       assert.equal(application.score, undefined);
+      for (const query of [destination, "123456789"]) {
+        assert.deepEqual(v.parse(jobsSchema, await scoped("list_jobs", { query })).jobs.map((job) => job.id), [application.id]);
+      }
       const historical = { title: "Engineer", description: "Build developer tools", source_url: destination,
         location: "Remote", status: "open", eligibility: "eligible", checked_at: "2000-01-01T00:00:00.000Z",
         criteria_updated_at: "2000-01-01T00:00:00.000Z", eligibility_reason: "Historical assessment; not a current search decision" };
@@ -1127,6 +1130,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         assert.equal(context.criteria.text, criteria);
         assert.deepEqual(context.jobs.map((job) => job.id), [ownJob.id]);
         assert.deepEqual((await scoped(owner, "list_jobs", { include_descriptions: true }, jobsSchema)).jobs.map((job) => job.id), [ownJob.id]);
+        assert.deepEqual((await scoped(owner, "list_jobs", { query: opening.source_url }, jobsSchema)).jobs.map((job) => job.id), [ownJob.id]);
         assert.deepEqual((await scoped(owner, "get_upcoming", { from: "2026-12-01T00:00:00Z" }, v.object({ stages: v.array(stageSchema) }))).stages.map((stage) => stage.id), [ownStage.id]);
         assert.deepEqual((await scoped(owner, "list_feedback", {}, v.object({ feedback: v.array(feedbackOutput) }))).feedback.map((feedback) => feedback.stage_id), [ownStage.id]);
         const detail = await scoped(owner, "get_job", { job_id: ownJob.id }, v.strictObject({ job: jobSchema, stages: v.array(stageSchema), feedback: v.array(feedbackOutput), prep_notes: v.array(prepNoteOutput), openings: v.array(v.unknown()), opening_closures: v.array(v.unknown()), ...outreachHistory }));
@@ -1882,6 +1886,9 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.deepEqual((await call("list_openings", { job_id: lead.id, eligibility: "unknown" }, openingPage)).openings.map((opening) => opening.id), [candidate.id]);
     assert.equal((await call("list_jobs", { query: "Multiple openings" }, jobsSchema)).jobs.length, 1);
     assert.equal((await call("list_jobs", { query: second.title }, jobsSchema)).jobs[0]?.id, lead.id);
+    for (const query of [first.source_url, second.source_url]) {
+      assert.deepEqual((await call("list_jobs", { query }, jobsSchema)).jobs.map((job) => job.id), [lead.id]);
+    }
     const selection = v.object({ ...jobSchema.entries, selected_opening_id: v.string(), opening_count: v.number(),
       opening_eligibility: v.string(), eligible_opening: v.object({ source_url: v.string() }),
       employer_salary: v.optional(v.object({ min: v.number() })), salary_target: v.optional(v.unknown()) });

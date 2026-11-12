@@ -8,7 +8,7 @@ const timestamp = v.pipe(v.string(), v.isoTimestamp());
 const jobStatus = v.picklist(["active", "rejected", "withdrawn", "offer", "accepted"]);
 const phase = v.picklist(["lead", "application"]);
 const reapplyStatus = v.picklist(["not_applicable", "unknown", "not_allowed", "cooldown", "eligible"]);
-const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100), v.description("Fit against saved criteria; higher is better. Manual list ordering is stored separately in priority."));
+const score = v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(100), v.description("Optional fit against saved criteria; higher is better. Not required to save a record. Manual list ordering is stored separately in priority."));
 const stageStatus = v.picklist(["planned", "in_progress", "passed", "failed", "completed", "cancelled"]);
 export const pipelineStageSchema = v.picklist([
   "applied", "outreach", "recruiter_screen", "assessment", "technical_interview",
@@ -107,14 +107,14 @@ export const interviewPrepSchema = v.strictObject({
 
 export const eligibleOpeningSchema = v.strictObject({
   title: text(300),
-  description: text(30_000),
+  description: v.pipe(text(30_000), v.description("The fetched vacancy description. Reuse the source text; no applicant assessment is needed here.")),
   source_url: url,
   location: text(500),
   status: v.literal("open"),
   eligibility: v.literal("eligible"),
   checked_at: timestamp,
   criteria_updated_at: timestamp,
-  eligibility_reason: text(5_000),
+  eligibility_reason: v.pipe(text(5_000), v.description("Brief factual basis for eligibility against saved criteria. No ranking or exhaustive filter report is required.")),
 });
 
 export const openingSchema = v.strictObject({
@@ -164,7 +164,7 @@ export const addJobsSchema = v.strictObject({
 });
 
 export const listJobsSchema = v.strictObject({
-  query: v.optional(text(300)),
+  query: v.optional(v.pipe(text(300), v.description("Substring search across company, role titles, nickname and posting URLs, including alternative openings. A platform vacancy ID can match inside its URL."))),
   status: v.optional(jobStatus),
   phase: v.optional(phase),
   opening_status: v.optional(v.picklist(["open", "closed", "unknown"])),

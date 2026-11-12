@@ -776,11 +776,11 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
   const where: string[] = [];
   const bindings: (string | number)[] = [input.as_of ? normalizeTimestamp(input.as_of) : new Date().toISOString(), userId];
   if (input.query) {
-    where.push(`(company LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR nickname LIKE ? ESCAPE '\\'
+    where.push(`(company LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR nickname LIKE ? ESCAPE '\\' OR source_url LIKE ? ESCAPE '\\'
       OR EXISTS (SELECT 1 FROM job_openings o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id
-        AND json_extract(o.evidence, '$.title') LIKE ? ESCAPE '\\'))`);
+        AND (json_extract(o.evidence, '$.title') LIKE ? ESCAPE '\\' OR o.source_url LIKE ? ESCAPE '\\')))`);
     const pattern = searchPattern(input.query);
-    bindings.push(pattern, pattern, pattern, pattern);
+    bindings.push(pattern, pattern, pattern, pattern, pattern, pattern);
   }
   if (input.status) { where.push("status IS ?"); bindings.push(input.status); }
   if (input.phase) { where.push("phase IS ?"); bindings.push(input.phase); }
