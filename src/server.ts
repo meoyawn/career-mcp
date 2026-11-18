@@ -97,7 +97,7 @@ export function createServer(database: D1Database, userId: string) {
     schemas.addPrepNoteSchema, false, (input, db) => store.addPrepNote(db, input));
   tool("update_prep_note", "Edit a private prep note's text, scope or status. Resolving/cancelling stamps closed_at; reopening clears resolution and closed_at. stage_name:null applies to all rounds.",
     schemas.updatePrepNoteSchema, false, (input, db) => store.updatePrepNote(db, input));
-  tool("update_job", "Update fields, notes, pay, outcome, fit or priority. phase:application records actual submission/communication without search criteria or fresh evidence. Lead employer changes/reconfirmation need fresh evidence. Histories remain attached. Reapply policy belongs to rejected attempts; reapply_after requires allowed, and allowed without a deadline is eligible now.",
+  tool("update_job", "Update fields, notes, pay, status, fit or priority. Record a status change's verbatim message and stated reason in outcome, not notes. phase:application records actual submission/communication without search criteria or fresh evidence. Lead employer changes/reconfirmation need fresh evidence. Histories remain attached. Reapply policy belongs to rejected attempts; reapply_after requires allowed, and allowed without a deadline is eligible now.",
     schemas.updateJobSchema, false, (input, db) => store.updateJob(db, input));
   tool("close_opening", "Record the selected posting's closure and clear fit, preserving the employer and history. Does not change an application outcome or fetch the posting. Closed leads appear in get_lead_context.replacement_search or list_jobs with phase:lead, opening_status:closed.",
     schemas.closeOpeningSchema, false, (input, db) => store.closeOpening(db, input));

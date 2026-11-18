@@ -1,6 +1,6 @@
 import * as v from "valibot";
 import { check, execute, fail, first, jobOpeningCheck, openingCheck, type Database, type Statement } from "./database.ts";
-import { eligibleOpeningSchema, openingSchema, jobLifecycleSchema, listJobsSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type CloseOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type ListOpenings, type Pipeline, type PipelineCounts, type RecordOutreach, type SaveOpening, type SelectOpening, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
+import { eligibleOpeningSchema, openingSchema, jobLifecycleSchema, outcomeSchema, listJobsSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type CloseOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type ListOpenings, type Pipeline, type PipelineCounts, type RecordOutreach, type SaveOpening, type SelectOpening, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: Database;
@@ -69,6 +69,7 @@ interface JobDetails extends SalaryFields {
   created_at: string;
   updated_at: string;
   rejected_at: string | null;
+  outcome: string | null;
 }
 
 type Job = JobDetails & v.InferOutput<typeof jobLifecycleSchema>;
@@ -441,9 +442,13 @@ function withCompensation<T extends SalaryFields>(job: T) {
   };
 }
 
-function withEligibleOpening<T extends SalaryFields & Pick<Job, "eligible_opening">>(job: T) {
-  const { eligible_opening, ...fields } = job;
-  return withCompensation({ ...fields, eligible_opening: eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(eligible_opening)) });
+function withEligibleOpening<T extends SalaryFields & Pick<Job, "eligible_opening"> & { outcome?: string | null }>(job: T) {
+  const { eligible_opening, outcome, ...fields } = job;
+  return withCompensation({
+    ...fields,
+    ...(outcome === undefined ? {} : { outcome: outcome === null ? null : v.parse(outcomeSchema, JSON.parse(outcome)) }),
+    eligible_opening: eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(eligible_opening)),
+  });
 }
 
 function validateSalaryRange(range: v.InferOutput<typeof salaryRangeSchema> | null) {
@@ -790,7 +795,7 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
   if (input.ranked_only) where.push("(score IS NOT NULL OR priority IS NOT NULL)");
   const scoreDirection = input.score_order === "lowest" ? "ASC" : "DESC";
   const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, eligible_opening, opening_status, opening_eligibility, selected_opening_id, opening_count, title, nickname, source_url, location,
-    recruiter_name, recruiter_email, notes, status, rejected_at, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
+    recruiter_name, recruiter_email, notes, status, rejected_at, outcome, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
     score, priority, salary_min, salary_max, salary_currency, salary_period,
     salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
     salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis,
@@ -812,7 +817,7 @@ function listJobsResult(results: D1Result<Omit<Job, "description"> & { descripti
   return {
     jobs: results.results.slice(0, input.limit).map(function listedJob(job) {
       const result = withEligibleOpening(job);
-      const { notes: _notes, ...fields } = result;
+      const { notes: _notes, outcome: _outcome, ...fields } = result;
       const listed = input.include_notes ? result : fields;
       if (input.include_descriptions || listed.eligible_opening === null) return listed;
       const { description: _description, ...opening } = listed.eligible_opening;
@@ -849,8 +854,9 @@ function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "f
 
 export async function updateJob(scope: UserStore, input: UpdateJob) {
   const { db, userId } = scope;
-  const { job_id, eligible_opening, ...patch } = prepareSalaryInput(input);
+  const { job_id, eligible_opening, outcome, ...patch } = prepareSalaryInput(input);
   const opening = eligible_opening === undefined ? undefined : validateEligibleOpening(eligible_opening);
+  if (outcome && outcome.message === null && outcome.reason === null) fail("An outcome needs the verbatim message or the stated reason.");
   const statements = [requireRow(scope, "jobs", job_id, "job_not_found"),
     check(db, "leads_stay_active", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
       AND coalesce(?, phase) IS 'lead' AND coalesce(?, status) IS NOT 'active')`, userId, job_id, input.phase ?? null, input.status ?? null),
@@ -888,6 +894,10 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
       ? "CASE WHEN status IS 'rejected' THEN rejected_at ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now') END"
       : "NULL";
   }
+  // A reason recorded for one status must not carry over to another.
+  if (input.status !== undefined && outcome === undefined) {
+    expressions.outcome = `CASE WHEN status IS '${input.status}' THEN outcome ELSE NULL END`;
+  }
   try {
     if (opening) statements.push(db.prepare(`UPDATE jobs SET employer_salary = (SELECT employer_salary FROM job_openings WHERE user_id IS ? AND job_id IS ? AND source_url IS ?),
       salary_min = NULL, salary_max = NULL, salary_currency = NULL, salary_period = NULL,
@@ -896,7 +906,8 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
           json_extract(salary_target, '$.period'), json_extract(salary_target, '$.basis') FROM job_openings WHERE user_id IS ? AND job_id IS ? AND source_url IS ?)
       WHERE user_id IS ? AND id IS ? AND phase IS 'lead' AND json_extract(eligible_opening, '$.source_url') IS NOT ?`)
       .bind(userId, job_id, opening.source_url, userId, job_id, opening.source_url, userId, job_id, opening.source_url));
-    statements.push(patchStatement(scope, "jobs", job_id, { ...patch, eligible_opening: opening ? JSON.stringify(opening) : undefined }, expressions));
+    statements.push(patchStatement(scope, "jobs", job_id, { ...patch, eligible_opening: opening ? JSON.stringify(opening) : undefined,
+      outcome: outcome === undefined || outcome === null ? outcome : JSON.stringify(outcome) }, expressions));
     if (opening || [input.employer_salary, input.salary_min, input.salary_max, input.salary_currency, input.salary_period,
       input.salary_ask_amount, input.salary_ask_currency, input.salary_ask_period, input.salary_ask_basis].some((field) => field !== undefined)) {
       statements.push(syncOpeningStatement(scope, job_id, opening !== undefined));

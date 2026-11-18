@@ -40,7 +40,7 @@ describe("User ownership schema and lead migrations", () => {
       const indexes = db.prepare("SELECT name, sql FROM sqlite_schema WHERE type IS 'index' ORDER BY name").all();
       const activity = db.prepare("SELECT * FROM contact_activity").all();
       db.exec("BEGIN");
-      for (const file of migrations.filter((name) => name >= "0024")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      for (const file of migrations.filter((name) => name.startsWith("0024"))) db.exec(await readFile(`migrations/${file}`, "utf8"));
       db.exec("COMMIT");
       assert.deepEqual(tables.map((table) => db.prepare(`SELECT rowid, * FROM ${table} ORDER BY rowid`).all()), originals);
       assert.deepEqual(db.prepare("SELECT name, sql FROM sqlite_schema WHERE type IS 'index' ORDER BY name").all(), indexes);
@@ -50,6 +50,41 @@ describe("User ownership schema and lead migrations", () => {
       assert.equal(db.prepare("SELECT legacy_eligible_opening FROM jobs WHERE id IS 'new-application'").get()?.legacy_eligible_opening, 0);
       assert.throws(() => db.exec(`INSERT INTO jobs (user_id, id, company, created_at, updated_at)
         VALUES ('alice', 'invalid-lead', 'Unverified lead', 'created', 'updated')`), /opening_required/u);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("status outcomes are added empty and stay on non-active applications with a message or stated reason", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const file of migrations.filter((name) => name < "0025")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec("INSERT INTO users (id, created_at) VALUES ('alice', 'created')");
+      const opening = JSON.stringify({ title: "Engineer", description: "Build developer tools", source_url: "https://jobs.example/engineer",
+        location: "Remote", status: "open", eligibility: "eligible", checked_at: "2026-10-01T00:00:00.000Z",
+        criteria_updated_at: "2026-10-01T00:00:00.000Z", eligibility_reason: "Verified eligible" });
+      db.exec(`INSERT INTO jobs (user_id, id, company, phase, current_stage, status, rejected_at, notes, created_at, updated_at)
+        VALUES ('alice', 'rejected', 'Example employer', 'application', 'applied', 'rejected', '2026-10-02T00:00:00.000Z',
+          'Rejection text kept in old notes', 'created', 'updated')`);
+      db.prepare(`INSERT INTO jobs (user_id, id, company, eligible_opening, created_at, updated_at)
+        VALUES ('alice', 'lead', 'Lead employer', ?, 'created', 'updated')`).run(opening);
+      const before = db.prepare("SELECT rowid, * FROM jobs ORDER BY rowid").all();
+      db.exec(await readFile("migrations/0025_job_outcomes.sql", "utf8"));
+      assert.deepEqual(db.prepare("SELECT rowid, * FROM jobs ORDER BY rowid").all().map((row) => ({ ...row })), before.map((row) => ({ ...row, outcome: null })));
+      const update = db.prepare("UPDATE jobs SET outcome = ? WHERE id IS ?");
+      for (const invalid of ["not json", "[]", JSON.stringify({ source_url: "https://chat.example/1" }), JSON.stringify({ message: 7 })]) {
+        assert.throws(() => update.run(invalid, "rejected"), /CHECK/u);
+      }
+      const outcome = JSON.stringify({ message: "We will not move forward.", reason: null });
+      assert.throws(() => update.run(outcome, "lead"), /CHECK/u);
+      update.run(outcome, "rejected");
+      assert.equal(db.prepare("SELECT notes FROM jobs WHERE id IS 'rejected'").get()?.notes, "Rejection text kept in old notes");
+      assert.throws(() => db.exec("UPDATE jobs SET status = 'active', rejected_at = NULL WHERE id IS 'rejected'"), /CHECK/u);
+      db.exec("UPDATE jobs SET status = 'withdrawn', rejected_at = NULL WHERE id IS 'rejected'");
+      db.exec("UPDATE jobs SET status = 'active', outcome = NULL WHERE id IS 'rejected'");
+      assert.throws(() => update.run(outcome, "rejected"), /CHECK/u);
       assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
     } finally {
       db.close();

@@ -51,6 +51,12 @@ export const salaryRangeSchema = v.strictObject({
   source_url: v.optional(v.nullable(url), null),
   context: v.optional(v.nullable(text(2_000)), null),
 });
+export const outcomeSchema = v.strictObject({
+  message: v.optional(v.nullable(v.pipe(text(30_000), v.description("Verbatim communication behind the status, such as the employer's rejection or the applicant's withdrawal note."))), null),
+  reason: v.optional(v.nullable(v.pipe(text(2_000), v.description("Reason stated by the deciding party. Omit when none was given; never infer one."))), null),
+  source_url: v.optional(v.nullable(url), null),
+  context: v.optional(v.nullable(v.pipe(text(5_000), v.description("Provenance such as sender, message ID or snapshot path. Not a stated reason."))), null),
+});
 const compensationFields = {
   employer_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Employer-advertised/confirmed pay. Replaces this range; null clears it. Preserve source/text and unknown units.")))),
   asked_salary: v.optional(v.nullable(v.pipe(salaryRangeSchema, v.description("Applicant's actually communicated ask. Replaces this range; null clears it. Use min=max for exact pay and context for form/call/date.")))),
@@ -172,7 +178,7 @@ export const listJobsSchema = v.strictObject({
   reapply_status: v.optional(reapplyStatus),
   as_of: v.optional(timestamp),
   include_descriptions: v.optional(v.pipe(v.boolean(), v.description("Include top-level and selected-opening descriptions. Otherwise both are omitted.")), false),
-  include_notes: v.optional(v.pipe(v.boolean(), v.description("Include complete job notes.")), true),
+  include_notes: v.optional(v.pipe(v.boolean(), v.description("Include complete job notes and status outcomes.")), true),
   score_order: scoreOrder,
   ranked_only: v.optional(v.boolean(), false),
   limit,
@@ -183,7 +189,7 @@ export const leadContextSchema = v.strictObject({
   limit: v.optional(pageSize, 5),
   offset,
   include_descriptions: listJobsSchema.entries.include_descriptions,
-  include_notes: v.optional(v.pipe(v.boolean(), v.description("Include complete job notes.")), false),
+  include_notes: v.optional(v.pipe(v.boolean(), v.description("Include complete job notes and status outcomes.")), false),
 });
 
 export const nextLeadsSchema = v.strictObject({
@@ -212,6 +218,7 @@ export const updateJobSchema = v.strictObject({
   notes: v.optional(v.nullable(text(20_000))),
   status: v.optional(v.pipe(jobStatus, v.description("Leads stay active; other values record actual application outcomes."))),
   rejected_at: v.optional(v.nullable(v.pipe(v.union([timestamp, v.pipe(v.string(), v.isoDate())]), v.description("Verified rejection date: YYYY-MM-DD (midnight UTC) or timestamp; never future. Requires rejected status. Null means unknown; omission preserves or defaults to now for a new rejection. Never infer from edits/imports/failed rounds.")))),
+  outcome: v.optional(v.nullable(v.pipe(outcomeSchema, v.description("Message and stated reason for the current non-active status, kept out of notes. Needs message or reason. Replaces the saved outcome; null clears it. Changing to another status without outcome clears the old one.")))),
   current_stage: v.optional(currentStage),
   recruiter_engaged_at: v.optional(v.nullable(timestamp)),
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),

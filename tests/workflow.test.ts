@@ -863,6 +863,47 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.deepEqual(offeredAttempt.feedback.map((entry) => entry.id), [nextFeedback.id]);
   });
 
+  test("status outcomes keep the message and stated reason out of notes and never carry over to another status", async () => {
+    const outcomeOutput = v.object({ message: v.optional(v.string()), reason: v.optional(v.string()), source_url: v.optional(v.string()), context: v.optional(v.string()) });
+    const outcomeJob = v.object({ ...jobSchema.entries, notes: v.optional(v.string()), rejected_at: v.optional(v.string()), outcome: v.optional(outcomeOutput) });
+    const notes = "Applied with the general backend résumé.";
+    const application = await call("add_job", { company: "Outcome Co", phase: "application", notes }, outcomeJob);
+    assert.equal(application.outcome, undefined);
+    const outcome = { message: "Thank you for applying. We will not move forward.", source_url: "https://chat.example/1", context: "Message 1 from the recruiter." };
+    const rejected = await call("update_job", { job_id: application.id, status: "rejected", rejected_at: "2000-01-15", outcome }, outcomeJob);
+    assert.deepEqual(rejected.outcome, outcome);
+    assert.equal(rejected.notes, notes);
+    assert.equal(rejected.rejected_at, "2000-01-15T00:00:00.000Z");
+    assert.deepEqual((await call("get_job", { job_id: application.id }, v.object({ job: outcomeJob }))).job.outcome, outcome);
+    assert.deepEqual((await call("list_jobs", { query: "Outcome Co" }, v.object({ jobs: v.array(outcomeJob) }))).jobs[0]?.outcome, outcome);
+    const compact = await call("list_jobs", { query: "Outcome Co", include_notes: false }, v.object({ jobs: v.array(v.record(v.string(), v.unknown())) }));
+    assert.ok(compact.jobs[0] && !("outcome" in compact.jobs[0]) && !("notes" in compact.jobs[0]));
+    for (const patch of [{ status: "rejected" }, { reapply_policy: "not_allowed" }, { notes: `${notes} Reviewed.` }]) {
+      assert.deepEqual((await call("update_job", { job_id: application.id, ...patch }, outcomeJob)).outcome, outcome);
+    }
+    const stated = { message: outcome.message, reason: "The team needs production Kafka experience." };
+    assert.deepEqual((await call("update_job", { job_id: application.id, outcome: stated }, outcomeJob)).outcome, stated);
+    await error("update_job", { job_id: application.id, outcome: { source_url: "https://chat.example/1" } }, /message or the stated reason/u);
+    await error("update_job", { job_id: application.id, status: "active", outcome: stated }, /non-active application status/u);
+    const unchanged = await call("get_job", { job_id: application.id }, v.object({ job: outcomeJob }));
+    assert.equal(unchanged.job.status, "rejected");
+    assert.deepEqual(unchanged.job.outcome, stated);
+    const withdrawn = await call("update_job", { job_id: application.id, status: "withdrawn", reapply_policy: null }, outcomeJob);
+    assert.equal(withdrawn.outcome, undefined);
+    assert.equal(withdrawn.rejected_at, undefined);
+    const withdrawal = { message: "I accepted another offer and am withdrawing.", reason: "Accepted another offer." };
+    assert.deepEqual((await call("update_job", { job_id: application.id, outcome: withdrawal }, outcomeJob)).outcome, withdrawal);
+    assert.equal((await call("update_job", { job_id: application.id, outcome: null }, outcomeJob)).outcome, undefined);
+    await call("update_job", { job_id: application.id, outcome: withdrawal }, outcomeJob);
+    const reopened = await call("update_job", { job_id: application.id, status: "active" }, outcomeJob);
+    assert.equal(reopened.outcome, undefined);
+    assert.equal(reopened.notes, notes + " Reviewed.");
+    await error("update_job", { job_id: application.id, outcome: withdrawal }, /non-active application status/u);
+    await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
+    const lead = await call("add_job", { company: "Outcome lead", eligible_opening: await verifiedOpening("Outcome lead") }, outcomeJob);
+    await error("update_job", { job_id: lead.id, outcome: withdrawal }, /non-active application status/u);
+  });
+
   test("UTC scheduling produces Google Calendar arguments and retains event IDs for rescheduling and cancellation", async () => {
     const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Calendar Co", eligible_opening: await verifiedOpening("Calendar Co"), title: "Engineer", description: "Remote", notes: "Private salary target" }] }, jobsSchema);
     assert.ok(imported.jobs[0]);

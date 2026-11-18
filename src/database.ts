@@ -32,6 +32,7 @@ export function createToolStore(database: D1Database, userId: string) {
 
 const errors: Record<string, string> = {
   rejected_at: "rejected_at requires a rejected application. Set status:rejected with the known rejection date, or clear the date with null.",
+  outcome: "outcome describes a non-active application status. Set status rejected, withdrawn, offer or accepted with it, or clear it with null.",
   opening_not_found: "Opening not found for this employer. Use list_openings with its job_id to resolve opening_id.",
   opening_unavailable: "Selecting a lead opening requires it to be open and eligible. Unknown or ineligible roles can be retained with save_opening.",
   opening_outdated: "New opening evidence predates a saved check or closure. list_openings returns the current evidence timestamps.",
