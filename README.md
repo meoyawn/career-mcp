@@ -71,6 +71,8 @@ task deploy
 
 The task requires the ignored deployment config. It runs type checking, lint, integration tests, and a bundle dry run with the sanitized local config before applying remote D1 migrations and publishing with explicit `--config wrangler.deploy.jsonc`. Remote commands fail if the private config is missing.
 
+Pushes to `master` also deploy through `.github/workflows/deploy.yml`, which runs the same `task deploy`. It needs two repository secrets: `CLOUDFLARE_API_TOKEN` (scoped as above) and `WRANGLER_DEPLOY_CONFIG` (the full contents of `wrangler.deploy.jsonc`); the job writes the config only for the run. Because Actions logs of a public repository are public, Wrangler output stays in a temporary file and only a redacted tail is printed on failure. The job refuses to run when production has pending D1 migrations: back up and rehearse them locally, then run `task deploy` locally; later code-only pushes deploy automatically.
+
 A failed step stops the workflow. Already-applied migrations are skipped on subsequent runs. Migrations and publishing are separate operations: if publishing fails after a migration succeeds, fix the failure and rerun; future schema changes should remain compatible with the currently deployed Worker.
 
 For a new account, create the database once with `aube exec -- wrangler d1 create example-database --config wrangler.deploy.jsonc --update-config=false`, then set the returned name and ID only in `wrangler.deploy.jsonc`. Local and remote D1 storage are separate. Generate types with `aube run types`, which explicitly uses the sanitized local config and placeholder environment file.
