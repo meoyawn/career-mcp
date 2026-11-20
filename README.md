@@ -40,7 +40,7 @@ The account page lets you add another passkey, sign out, or disconnect all MCP c
 
 ## Deploy
 
-`wrangler.jsonc` is the real deployment configuration: Worker name, Cloudflare account ID and D1 database ID. These IDs are not credentials; deploying requires Cloudflare authentication. Credentials, auth profile names and user data stay out of Git.
+`wrangler.jsonc` is the real deployment configuration: Worker name and D1 database ID. It has no `account_id`; Wrangler takes the account from your credentials (an account-owned API token, or a profile with access to one account). The database ID is not a credential; deploying requires Cloudflare authentication. Credentials, auth profile names and user data stay out of Git.
 
 Authenticate locally with your own Wrangler profile:
 
