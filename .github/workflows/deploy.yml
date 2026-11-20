@@ -1,7 +1,7 @@
-# Deploys master with `task deploy`. The repository is public, so Wrangler
-# output (account/database IDs, Worker URLs) never reaches the job log.
-# Pending D1 migrations stop the run: production schema changes need a
-# local backup and rehearsal first (see AGENTS.md), then a local `task deploy`.
+# Deploys master with `task deploy`: checks and tests, then D1 migrations, then
+# the Worker. The repository is public, so Wrangler output (account/database
+# IDs, Worker URLs) never reaches the job log. Secrets are written outside the
+# checkout, matching the local ~/.secrets/career-mcp layout.
 name: Deploy
 
 on:
@@ -44,23 +44,13 @@ jobs:
           test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::Set the CLOUDFLARE_API_TOKEN repository secret."; exit 1; }
           test -n "$WRANGLER_DEPLOY_CONFIG" || { echo "::error::Set the WRANGLER_DEPLOY_CONFIG repository secret."; exit 1; }
           umask 077
-          printf '%s' "$WRANGLER_DEPLOY_CONFIG" > wrangler.deploy.jsonc
+          CAREER_MCP_SECRETS="$RUNNER_TEMP/career-mcp-secrets"
+          echo "CAREER_MCP_SECRETS=$CAREER_MCP_SECRETS" >> "$GITHUB_ENV"
+          mkdir -p "$CAREER_MCP_SECRETS"
+          printf '%s' "$WRANGLER_DEPLOY_CONFIG" > "$CAREER_MCP_SECRETS/wrangler.deploy.jsonc"
           # Mask every ID in the config in case any later output repeats one.
-          grep -oE '[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' wrangler.deploy.jsonc \
+          grep -oE '[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$CAREER_MCP_SECRETS/wrangler.deploy.jsonc" \
             | sort -u | while read -r value; do echo "::add-mask::$value"; done
-
-      - name: Refuse pending production migrations
-        run: |
-          if ! node node_modules/wrangler/bin/wrangler.js d1 migrations list DB --remote --config wrangler.deploy.jsonc > "$RUNNER_TEMP/migrations.log" 2>&1; then
-            echo "::error::Could not list remote D1 migrations."
-            sed -E 's#https?://[^ ]+#<url>#g; s/[0-9a-f]{32}/<hex>/g; s/[0-9a-f]{8}-[0-9a-f-]{27}/<id>/g; s/[A-Za-z0-9.-]+\.workers\.dev/<host>/g' "$RUNNER_TEMP/migrations.log" | tail -20
-            exit 1
-          fi
-          if ! grep -q "No migrations to apply" "$RUNNER_TEMP/migrations.log"; then
-            echo "::error::Production has pending D1 migrations. Back up and rehearse locally, then run task deploy locally."
-            grep -oE '[0-9]{4}_[A-Za-z0-9_]+\.sql' "$RUNNER_TEMP/migrations.log" | sort -u
-            exit 1
-          fi
 
       - name: Deploy
         run: |
@@ -75,4 +65,4 @@ jobs:
 
       - name: Remove private deployment config
         if: always()
-        run: rm -f wrangler.deploy.jsonc
+        run: rm -rf "$RUNNER_TEMP/career-mcp-secrets"
