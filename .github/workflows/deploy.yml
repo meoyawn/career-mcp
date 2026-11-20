@@ -30,4 +30,6 @@ jobs:
             "github:aubepkg/aube" = "2.5.1"
             task = "latest"
       - run: aube install --frozen-lockfile
-      - run: task deploy
+      # Logs of this public repository are public: hide the Worker's address.
+      - run: task deploy 2>&1 | sed -E 's#[A-Za-z0-9.-]+\.workers\.dev#<worker>.workers.dev#g'
+        shell: bash
