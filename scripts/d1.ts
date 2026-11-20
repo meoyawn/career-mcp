@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
-import { remoteConfig, root, wrangler } from "./remote-wrangler.ts";
+import { fileURLToPath, URL } from "node:url";
 import { promisify } from "node:util";
 import * as v from "valibot";
 
 const execute = promisify(execFile);
+const root = fileURLToPath(new URL("../", import.meta.url));
+const wrangler = fileURLToPath(new URL("../node_modules/wrangler/bin/wrangler.js", import.meta.url));
 const readQueryStart = /^(?:(?:\s+)|(?:--[^\r\n]*(?:\r?\n|$))|(?:\/\*[\s\S]*?\*\/))*(?:select|with)\b/iu;
 const queryResultSchema = v.array(v.object({
   success: v.literal(true),
@@ -22,15 +24,13 @@ function normalizeReadQuery(sql: string) {
 async function main() {
   if (process.argv.length !== 3 || !process.argv[2]) throw new Error("Usage: node scripts/d1.ts '<sql>'");
   const sql = normalizeReadQuery(process.argv[2]);
-  const config = remoteConfig();
   // A subquery only accepts a read, including when the input starts with WITH.
   const { stdout } = await execute(process.execPath, [wrangler, "d1", "execute", "DB", "--remote",
-    ...config.args,
     "--command", `SELECT * FROM (\n${sql}\n)`, "--json"], {
     cwd: root,
     env: { ...process.env, WRANGLER_SEND_METRICS: "false" },
     maxBuffer: 10 * 1024 * 1024,
-  }).finally(config.cleanup);
+  });
   const results = v.parse(queryResultSchema, JSON.parse(stdout));
   if (results.length !== 1 || !results[0]) throw new Error("D1 did not return one successful query result.");
   if (results[0].meta.changed_db || results[0].meta.rows_written !== 0) throw new Error("D1 reported an unexpected write from a read-only query.");

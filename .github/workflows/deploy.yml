@@ -1,7 +1,4 @@
-# Deploys master with `task deploy`: checks and tests, then D1 migrations, then
-# the Worker. The repository is public, so Wrangler output (account/database
-# IDs, Worker URLs) never reaches the job log. Secrets are written outside the
-# checkout, matching the local ~/.secrets/career-mcp layout.
+# Deploys master: checks and tests, then D1 migrations, then the Worker.
 name: Deploy
 
 on:
@@ -25,7 +22,6 @@ jobs:
       WRANGLER_SEND_METRICS: "false"
     steps:
       - uses: actions/checkout@v7
-
       - uses: jdx/mise-action@v5
         with:
           mise_toml: |
@@ -33,36 +29,5 @@ jobs:
             node = "24"
             "github:aubepkg/aube" = "2.5.1"
             task = "latest"
-
-      - name: Install dependencies
-        run: aube install --frozen-lockfile
-
-      - name: Write private deployment config
-        env:
-          WRANGLER_DEPLOY_CONFIG: ${{ secrets.WRANGLER_DEPLOY_CONFIG }}
-        run: |
-          test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::Set the CLOUDFLARE_API_TOKEN repository secret."; exit 1; }
-          test -n "$WRANGLER_DEPLOY_CONFIG" || { echo "::error::Set the WRANGLER_DEPLOY_CONFIG repository secret."; exit 1; }
-          umask 077
-          CAREER_MCP_SECRETS="$RUNNER_TEMP/career-mcp-secrets"
-          echo "CAREER_MCP_SECRETS=$CAREER_MCP_SECRETS" >> "$GITHUB_ENV"
-          mkdir -p "$CAREER_MCP_SECRETS"
-          printf '%s' "$WRANGLER_DEPLOY_CONFIG" > "$CAREER_MCP_SECRETS/wrangler.deploy.jsonc"
-          # Mask every ID in the config in case any later output repeats one.
-          grep -oE '[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$CAREER_MCP_SECRETS/wrangler.deploy.jsonc" \
-            | sort -u | while read -r value; do echo "::add-mask::$value"; done
-
-      - name: Deploy
-        run: |
-          if task deploy > "$RUNNER_TEMP/deploy.log" 2>&1; then
-            grep -E '^ℹ (tests|pass|fail) ' "$RUNNER_TEMP/deploy.log" || true
-            echo "Deployed."
-          else
-            echo "::error::task deploy failed. Redacted log tail:"
-            sed -E 's#https?://[^ ]+#<url>#g; s/[0-9a-f]{32}/<hex>/g; s/[0-9a-f]{8}-[0-9a-f-]{27}/<id>/g; s/[A-Za-z0-9.-]+\.workers\.dev/<host>/g' "$RUNNER_TEMP/deploy.log" | tail -60
-            exit 1
-          fi
-
-      - name: Remove private deployment config
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/career-mcp-secrets"
+      - run: aube install --frozen-lockfile
+      - run: task deploy

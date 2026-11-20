@@ -3,8 +3,5 @@ version: '3'
 tasks:
   deploy:
     desc: Deploy the Worker
-    preconditions:
-      - sh: test -f "${CAREER_MCP_SECRETS:-$HOME/.secrets/career-mcp}/wrangler.deploy.jsonc"
-        msg: Put your private deployment settings in ~/.secrets/career-mcp/wrangler.deploy.jsonc (or set CAREER_MCP_SECRETS) before deploying.
     cmds:
       - aube run deploy
