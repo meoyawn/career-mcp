@@ -56,6 +56,59 @@ describe("User ownership schema and lead migrations", () => {
     }
   });
 
+  test("eligibility removal strips stored verdicts, drops generated columns and keeps every row", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = (await readdir("migrations")).filter((name) => name.endsWith(".sql")).sort();
+      for (const file of migrations.filter((name) => name < "0026")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      db.exec("INSERT INTO users (id, created_at) VALUES ('alice', 'created')");
+      const role = { title: "Engineer", description: "Build developer tools", source_url: "https://jobs.example/engineer",
+        location: "Remote", status: "open", checked_at: "2026-10-01T00:00:00.000Z" };
+      const assessed = JSON.stringify({ ...role, eligibility: "eligible", criteria_updated_at: "2026-10-01T00:00:00.000Z", eligibility_reason: "Fits" });
+      db.prepare(`INSERT INTO jobs (rowid, user_id, id, company, eligible_opening, score, created_at, updated_at)
+        VALUES (5, 'alice', 'lead', 'Lead employer', ?, 80, 'created', 'updated')`).run(assessed);
+      db.prepare(`INSERT INTO jobs (rowid, user_id, id, company, phase, current_stage, status, outcome, eligible_opening, created_at, updated_at)
+        VALUES (8, 'alice', 'attempt', 'Applied employer', 'application', 'outreach', 'rejected', '{"reason":"Filled"}', ?, 'created', 'updated')`).run(assessed);
+      db.exec(`INSERT INTO stages (rowid, user_id, id, job_id, name, status, created_at, updated_at)
+          VALUES (7, 'alice', 'round', 'attempt', 'outreach', 'completed', 'created', 'updated');
+        INSERT INTO feedback (rowid, user_id, id, stage_id, text, source, created_at, updated_at)
+          VALUES (9, 'alice', 'feedback', 'round', 'Preserve feedback', 'recruiter', 'created', 'updated');
+        INSERT INTO contacts (rowid, user_id, id, job_id, name, created_at, updated_at)
+          VALUES (13, 'alice', 'person', 'attempt', 'Example recruiter', 'created', 'updated');
+        INSERT INTO outreach (rowid, user_id, id, job_id, contact_id, stage_id, direction, occurred_at, time_basis, follow_up_status, created_at, updated_at)
+          VALUES (17, 'alice', 'message', 'attempt', 'person', 'round', 'outbound', '2026-10-01T00:00:00.000Z', 'reported', 'pending', 'created', 'updated');
+        INSERT INTO prep_notes (rowid, user_id, id, job_id, kind, text, created_at, updated_at)
+          VALUES (19, 'alice', 'prep', 'attempt', 'question', 'Preserve question', 'created', 'updated');`);
+      db.prepare(`INSERT INTO opening_closures (rowid, user_id, job_id, source_url, reason, checked_at, eligible_opening, created_at)
+        VALUES (23, 'alice', 'attempt', 'https://jobs.example/engineer', 'Posting closed', '2026-10-02T00:00:00.000Z', ?, 'created')`).run(assessed);
+      db.prepare(`INSERT INTO job_openings (rowid, id, user_id, job_id, evidence, notes, created_at, updated_at)
+        VALUES (29, 'opening', 'alice', 'lead', ?, 'Keep research', 'created', 'updated')`).run(assessed);
+      const kept = ["feedback", "contacts", "prep_notes"].map((table) => db.prepare(`SELECT rowid, * FROM ${table} ORDER BY rowid`).all());
+      const activity = db.prepare("SELECT * FROM contact_activity").all();
+      db.exec("BEGIN");
+      db.exec(await readFile("migrations/0026_remove_eligibility.sql", "utf8"));
+      db.exec("COMMIT");
+      assert.deepEqual(["feedback", "contacts", "prep_notes"].map((table) => db.prepare(`SELECT rowid, * FROM ${table} ORDER BY rowid`).all()), kept);
+      assert.deepEqual(db.prepare("SELECT * FROM contact_activity").all(), activity);
+      assert.deepEqual(db.prepare("SELECT rowid, id, score, outcome, opening FROM jobs ORDER BY rowid").all().map((row) => ({ ...row, opening: JSON.parse(String(row.opening)) })), [
+        { rowid: 5, id: "lead", score: 80, outcome: null, opening: role },
+        { rowid: 8, id: "attempt", score: null, outcome: '{"reason":"Filled"}', opening: role },
+      ]);
+      assert.deepEqual({ ...db.prepare("SELECT rowid, * FROM job_openings").get() }, { rowid: 29, id: "opening", user_id: "alice", job_id: "lead", ...role,
+        employer_salary: null, salary_target: null, notes: "Keep research", created_at: "created", updated_at: "updated" });
+      assert.deepEqual(JSON.parse(String(db.prepare("SELECT opening FROM opening_closures WHERE rowid IS 23").get()?.opening)), role);
+      assert.deepEqual(db.prepare("SELECT rowid, id FROM stages").all().map((row) => ({ ...row })), [{ rowid: 7, id: "round" }]);
+      assert.deepEqual(db.prepare("SELECT rowid, id FROM outreach").all().map((row) => ({ ...row })), [{ rowid: 17, id: "message" }]);
+      assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema WHERE sql LIKE '%GENERATED%' OR sql LIKE '%eligib%' OR name LIKE 'rebuild%'").all(), []);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      assert.throws(() => db.prepare(`UPDATE jobs SET opening = ? WHERE id IS 'lead'`).run(JSON.stringify({ ...role, status: "closed" })), /CHECK/u);
+      assert.throws(() => db.exec(`INSERT INTO job_openings (id, user_id, job_id, title, description, source_url, location, status, checked_at, created_at, updated_at)
+        VALUES ('bad', 'alice', 'lead', 'Engineer', 'Role', 'https://jobs.example/bad', 'Remote', 'gone', '2026-10-01T00:00:00.000Z', 'c', 'u')`), /CHECK/u);
+    } finally {
+      db.close();
+    }
+  });
+
   test("status outcomes are added empty and stay on non-active applications with a message or stated reason", async () => {
     const db = new DatabaseSync(":memory:");
     try {
@@ -221,7 +274,7 @@ describe("User ownership schema and lead migrations", () => {
         columns: db.prepare(`PRAGMA table_info(${table})`).all().map((column) => String(column.name)),
         rows: db.prepare(`SELECT rowid, * FROM ${table} ORDER BY rowid`).all(),
       }));
-      for (const file of migrations.filter((name) => name >= "0018")) db.exec(await readFile(`migrations/${file}`, "utf8"));
+      for (const file of migrations.filter((name) => name >= "0018" && name < "0026")) db.exec(await readFile(`migrations/${file}`, "utf8"));
       assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema WHERE type IS 'trigger'").all(), []);
       for (const { table, columns, rows } of snapshots) {
         assert.deepEqual(db.prepare(`SELECT rowid, ${columns.join(", ")} FROM ${table} ORDER BY rowid`).all(), rows);

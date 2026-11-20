@@ -111,23 +111,18 @@ export const interviewPrepSchema = v.strictObject({
   stage_name: v.optional(pipelineStageSchema),
 });
 
-export const eligibleOpeningSchema = v.strictObject({
+export const leadOpeningSchema = v.strictObject({
   title: text(300),
-  description: v.pipe(text(30_000), v.description("The fetched vacancy description. Reuse the source text; no applicant assessment is needed here.")),
+  description: v.pipe(text(30_000), v.description("The fetched vacancy description.")),
   source_url: url,
   location: text(500),
   status: v.literal("open"),
-  eligibility: v.literal("eligible"),
   checked_at: timestamp,
-  criteria_updated_at: timestamp,
-  eligibility_reason: v.pipe(text(5_000), v.description("Brief factual basis for eligibility against saved criteria. No ranking or exhaustive filter report is required.")),
 });
 
 export const openingSchema = v.strictObject({
-  ...eligibleOpeningSchema.entries,
+  ...leadOpeningSchema.entries,
   status: v.picklist(["open", "closed", "unknown"]),
-  eligibility: v.picklist(["eligible", "ineligible", "unknown"]),
-  criteria_updated_at: v.nullable(timestamp),
 });
 export const saveOpeningSchema = v.strictObject({
   job_id: id,
@@ -138,7 +133,6 @@ export const saveOpeningSchema = v.strictObject({
 export const listOpeningsSchema = v.strictObject({
   job_id: id,
   status: v.optional(openingSchema.entries.status),
-  eligibility: v.optional(openingSchema.entries.eligibility),
   limit,
   offset,
 });
@@ -152,7 +146,7 @@ export const addJobSchema = v.strictObject({
   company: text(200),
   company_url: v.optional(url),
   phase: v.optional(phase, "lead"),
-  eligible_opening: v.optional(v.pipe(eligibleOpeningSchema, v.description("Required for leads against current criteria. Optional historical evidence for actual applications; omit it rather than loading search/ranking context."))),
+  opening: v.optional(v.pipe(leadOpeningSchema, v.description("The lead's open role, checked within 24 hours. Optional for actual applications."))),
   title: v.optional(text(300)),
   nickname: v.optional(text(200)),
   description: v.optional(text(30_000)),
@@ -166,7 +160,7 @@ export const addJobSchema = v.strictObject({
 
 export const maxJobsPerBatch = 100;
 export const addJobsSchema = v.strictObject({
-  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(maxJobsPerBatch, `Save at most ${maxJobsPerBatch} employers or applications per call. Split larger imports into batches of up to ${maxJobsPerBatch}; only leads require current eligibility evidence.`)),
+  jobs: v.pipe(v.array(addJobSchema), v.minLength(1), v.maxLength(maxJobsPerBatch, `Save at most ${maxJobsPerBatch} employers or applications per call. Split larger imports into batches of up to ${maxJobsPerBatch}; only leads require an open role.`)),
 });
 
 export const listJobsSchema = v.strictObject({
@@ -207,7 +201,7 @@ export const updateJobSchema = v.strictObject({
   company: v.optional(text(200)),
   company_url: v.optional(v.nullable(url)),
   phase: v.optional(phase),
-  eligible_opening: v.optional(v.pipe(eligibleOpeningSchema, v.description("Fresh evidence for lead selection/renewal. Optional for application edits or phase:application; existing evidence is preserved when omitted."))),
+  opening: v.optional(v.pipe(leadOpeningSchema, v.description("Replaces a lead's open role, checked within 24 hours. Optional for application edits or phase:application; the saved role is kept when omitted."))),
   title: v.optional(v.nullable(text(300))),
   nickname: v.optional(v.nullable(text(200))),
   description: v.optional(v.nullable(text(30_000))),
@@ -224,7 +218,7 @@ export const updateJobSchema = v.strictObject({
   reapply_policy: v.optional(v.nullable(v.picklist(["allowed", "not_allowed"]))),
   reapply_after: v.optional(v.nullable(timestamp)),
   score: v.optional(v.nullable(score)),
-  priority: v.optional(v.nullable(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1_000_000), v.description("Manual list pin; lower sorts first, ahead of fit. Null unpins. Does not change score, eligibility or phase.")))),
+  priority: v.optional(v.nullable(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1_000_000), v.description("Manual list pin; lower sorts first, ahead of fit. Null unpins. Does not change score or phase.")))),
 });
 
 export const addPrepNoteSchema = v.strictObject({
@@ -362,7 +356,7 @@ export const rankPromptSchema = v.strictObject({
 });
 
 export type AddJobs = v.InferOutput<typeof addJobsSchema>;
-export type EligibleOpening = v.InferOutput<typeof eligibleOpeningSchema>;
+export type LeadOpening = v.InferOutput<typeof leadOpeningSchema>;
 export type SaveOpening = v.InferOutput<typeof saveOpeningSchema>;
 export type ListOpenings = v.InferOutput<typeof listOpeningsSchema>;
 export type SelectOpening = v.InferOutput<typeof selectOpeningSchema>;

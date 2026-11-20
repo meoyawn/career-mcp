@@ -11,9 +11,9 @@ const instructions = `Personal job-search CRM. Tools store and retrieve records;
 
 get_lead_context returns saved criteria/version and paginated opportunities. get_application_context returns applicant facts and optional job history, without criteria; get_job returns job history without applicant context. Load only data needed for the operation. Saving vacancy facts needs no applicant context. Application reads/writes need no selection criteria or ranking. rank_jobs is an optional prompt, not a tool or a save prerequisite.
 
-New leads require company and eligible_opening: fetched role details, brief eligibility_reason, open/eligible status, checked_at within 24 hours and not future, and criteria_updated_at matching saved criteria. Role fields belong inside eligible_opening for leads. score and enrichment fields are optional. Actual applications need no opening assessment; preparation stays lead. Existing evidence and history survive application transitions; applications cannot return to leads or change their destination. Separate attempts use separate records.
+New leads require company and opening: fetched role details, status open and checked_at within 24 hours and not future. Decide whether a role fits before saving it; the CRM stores no eligibility verdict. Role fields belong inside opening for leads. score and enrichment fields are optional. Actual applications need no opening; preparation stays lead. Existing evidence and history survive application transitions; applications cannot return to leads or change their destination. Separate attempts use separate records.
 
-Mutations use exact UUIDs from record reads. A successful write returns saved state; additional reads are needed only for missing data or an uncertain outcome. Check state before retrying uncertain writes; appended records are not generally idempotent. Batches are atomic. Current opening_status/opening_eligibility may differ from historical eligible_opening evidence.
+Mutations use exact UUIDs from record reads. A successful write returns saved state; additional reads are needed only for missing data or an uncertain outcome. Check state before retrying uncertain writes; appended records are not generally idempotent. Batches are atomic. Current opening_status may differ from the saved opening.
 
 employer_salary is employer pay; asked_salary is a communicated ask; salary_target/salary_ask_* is private. Never substitute one for another. Range objects replace their group; null clears it. Do not combine a range with its legacy scalar fields. Optional unknown values may be omitted.
 
@@ -74,22 +74,22 @@ export function createServer(database: D1Database, userId: string) {
     schemas.applicantProfileSchema, false, ({ gender }, db) => store.setApplicantProfile(db, gender));
   tool("set_cv", "Store a CV URL by case-insensitive language tag. url:null removes that language only. Stores the URL, not file contents.",
     schemas.cvSchema, false, ({ language, url }, db) => store.setCV(db, language, url));
-  tool("add_job", "Save one lead from fetched vacancy data and current criteria, or record an actual application. Leads require fresh eligible_opening; brief eligibility_reason is enough. score, company_url and pay are optional; no ranking or applicant-context read is required. phase:application needs no criteria or opening evidence. Returns saved state.",
+  tool("add_job", "Save one lead from fetched vacancy data, or record an actual application. Leads require a fresh open opening. score, company_url and pay are optional; no ranking or applicant-context read is required. phase:application needs no opening. Returns saved state.",
     schemas.addJobSchema, false, async function add(input, db) {
       const result = await store.addJobs(db, { jobs: [input] });
       return result.jobs[0];
     });
-  tool("add_jobs", "Save 1–100 leads/applications atomically with the same inputs as add_job; ranking and enrichment are optional. Only leads need fresh eligible_opening/current criteria. Any invalid entry saves none. Returns saved records; check list_jobs before retrying an uncertain import.",
+  tool("add_jobs", "Save 1–100 leads/applications atomically with the same inputs as add_job; ranking and enrichment are optional. Only leads need a fresh open opening. Any invalid entry saves none. Returns saved records; check list_jobs before retrying an uncertain import.",
     schemas.addJobsSchema, false, (input, db) => store.addJobs(db, input));
-  tool("list_jobs", "Search company, role, nickname or posting URL, including alternative openings; a vacancy ID matches inside its URL. Use URL/ID lookup for duplicates. Supports filters/pagination; available_only requires open/eligible evidence. Pins precede fit. Use get_pipeline for active applications.",
+  tool("list_jobs", "Search company, role, nickname or posting URL, including alternative openings; a vacancy ID matches inside its URL. Use URL/ID lookup for duplicates. Supports filters/pagination; available_only requires an open role. Pins precede fit. Use get_pipeline for active applications.",
     schemas.listJobsSchema, true, (input, db) => store.listJobs(db, input));
   tool("get_job", "Refresh one job and its latest notes, openings, compensation, stages, feedback and communication history without reloading applicant context. Find job_id with list_jobs.",
     schemas.jobIdSchema, true, ({ job_id }, db) => store.getJob(db, job_id));
-  tool("save_opening", "Upsert an existing employer’s role by canonical source_url. Unresolved eligibility stays unknown; open/eligible evidence must be fresh and older checks cannot overwrite newer evidence/closures. Omitted pay/notes stay unchanged. Does not select the role.",
+  tool("save_opening", "Upsert an existing employer’s role by canonical source_url. Refreshing a lead's selected open role needs a check within 24 hours; older checks cannot overwrite newer checks/closures. Omitted pay/notes stay unchanged. Does not select the role.",
     schemas.saveOpeningSchema, false, (input, db) => store.saveOpening(db, input));
-  tool("list_openings", "List an employer’s roles, evidence, compensation and selected flag. Includes unknown, ineligible and closed roles; supports filters and pagination.",
+  tool("list_openings", "List an employer’s roles, compensation and selected flag. Includes unknown and closed roles; supports filters and pagination.",
     schemas.listOpeningsSchema, true, (input, db) => store.listOpenings(db, input));
-  tool("select_opening", "Select a lead’s saved role using fresh open/eligible evidence against current criteria. Clears fit and switches to that role’s saved compensation, preserving other roles. Applications cannot change destination.",
+  tool("select_opening", "Select a lead’s saved open role checked within 24 hours. Clears fit and switches to that role’s saved compensation, preserving other roles. Applications cannot change destination.",
     schemas.selectOpeningSchema, false, (input, db) => store.selectOpening(db, input));
   tool("get_interview_prep", "Return a round's role, compensation, applicable private prep notes and history. Defaults to the next ongoing/scheduled round; stage_id or job_id selects another.",
     schemas.interviewPrepSchema, true, (input, db) => store.getInterviewPrep(db, input));
@@ -97,7 +97,7 @@ export function createServer(database: D1Database, userId: string) {
     schemas.addPrepNoteSchema, false, (input, db) => store.addPrepNote(db, input));
   tool("update_prep_note", "Edit a private prep note's text, scope or status. Resolving/cancelling stamps closed_at; reopening clears resolution and closed_at. stage_name:null applies to all rounds.",
     schemas.updatePrepNoteSchema, false, (input, db) => store.updatePrepNote(db, input));
-  tool("update_job", "Update fields, notes, pay, status, fit or priority. Record a status change's verbatim message and stated reason in outcome, not notes. phase:application records actual submission/communication without search criteria or fresh evidence. Lead employer changes/reconfirmation need fresh evidence. Histories remain attached. Reapply policy belongs to rejected attempts; reapply_after requires allowed, and allowed without a deadline is eligible now.",
+  tool("update_job", "Update fields, notes, pay, status, fit or priority. Record a status change's verbatim message and stated reason in outcome, not notes. phase:application records actual submission/communication without search criteria or a fresh opening. Lead employer changes/reconfirmation need a fresh opening. Histories remain attached. Reapply policy belongs to rejected attempts; reapply_after requires allowed, and allowed without a deadline allows reapplying now.",
     schemas.updateJobSchema, false, (input, db) => store.updateJob(db, input));
   tool("close_opening", "Record the selected posting's closure and clear fit, preserving the employer and history. Does not change an application outcome or fetch the posting. Closed leads appear in get_lead_context.replacement_search or list_jobs with phase:lead, opening_status:closed.",
     schemas.closeOpeningSchema, false, (input, db) => store.closeOpening(db, input));

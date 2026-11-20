@@ -1,6 +1,6 @@
 import * as v from "valibot";
 import { check, execute, fail, first, jobOpeningCheck, openingCheck, type Database, type Statement } from "./database.ts";
-import { eligibleOpeningSchema, openingSchema, jobLifecycleSchema, outcomeSchema, listJobsSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type CloseOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type ListOpenings, type Pipeline, type PipelineCounts, type RecordOutreach, type SaveOpening, type SelectOpening, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
+import { leadOpeningSchema, openingSchema, jobLifecycleSchema, outcomeSchema, listJobsSchema, maxJobsPerBatch, pipelineStageSchema, salaryRangeSchema, type AddFeedback, type AddJobs, type AddPrepNote, type AddStage, type CalendarEvent, type CloseOpening, type FollowUps, type InterviewPrep, type ListFeedback, type ListJobs, type ListOpenings, type Pipeline, type PipelineCounts, type RecordOutreach, type SaveOpening, type SelectOpening, type SetApplicantContact, type Upcoming, type UpdateContact, type UpdateFeedback, type UpdateJob, type UpdateOutreach, type UpdatePrepNote, type UpdateStage } from "./schemas.ts";
 
 export interface UserStore {
   db: Database;
@@ -55,7 +55,7 @@ interface JobDetails extends SalaryFields {
   id: string;
   company: string;
   company_url: string | null;
-  eligible_opening: string | null;
+  opening: string | null;
   title: string | null;
   nickname: string | null;
   description: string | null;
@@ -76,25 +76,27 @@ type Job = JobDetails & v.InferOutput<typeof jobLifecycleSchema>;
 
 const openingStatusSql = `CASE WHEN EXISTS (
   SELECT 1 FROM opening_closures c WHERE c.user_id IS jobs.user_id AND c.job_id IS jobs.id
-    AND c.source_url IS coalesce(json_extract(jobs.eligible_opening, '$.source_url'), jobs.source_url, c.source_url)
-    AND (jobs.eligible_opening IS NULL OR c.checked_at >= coalesce((SELECT o.checked_at FROM job_openings o
-      WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id AND o.source_url IS c.source_url), json_extract(jobs.eligible_opening, '$.checked_at')))
+    AND c.source_url IS coalesce(json_extract(jobs.opening, '$.source_url'), jobs.source_url, c.source_url)
+    AND (jobs.opening IS NULL OR c.checked_at >= coalesce((SELECT o.checked_at FROM job_openings o
+      WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id AND o.source_url IS c.source_url), json_extract(jobs.opening, '$.checked_at')))
 ) THEN 'closed' ELSE coalesce((SELECT o.status FROM job_openings o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id
-  AND o.source_url IS json_extract(jobs.eligible_opening, '$.source_url')),
-  CASE WHEN jobs.eligible_opening IS NOT NULL THEN 'open' ELSE 'unknown' END) END`;
+  AND o.source_url IS json_extract(jobs.opening, '$.source_url')),
+  CASE WHEN jobs.opening IS NOT NULL THEN 'open' ELSE 'unknown' END) END`;
 
-const openingEligibilitySql = `coalesce((SELECT o.eligibility FROM job_openings o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id
-  AND o.source_url IS json_extract(jobs.eligible_opening, '$.source_url')),
-  CASE WHEN jobs.eligible_opening IS NOT NULL THEN 'eligible' ELSE 'unknown' END)`;
-const openingMetadataSql = `${openingStatusSql} AS opening_status, ${openingEligibilitySql} AS opening_eligibility,
+const openingMetadataSql = `${openingStatusSql} AS opening_status,
   (SELECT o.id FROM job_openings o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id
-    AND o.source_url IS json_extract(jobs.eligible_opening, '$.source_url')) AS selected_opening_id,
+    AND o.source_url IS json_extract(jobs.opening, '$.source_url')) AS selected_opening_id,
   (SELECT count(*) FROM job_openings o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id) AS opening_count`;
 
 interface StoredOpening {
   id: string;
   job_id: string;
-  evidence: string;
+  title: string;
+  description: string;
+  source_url: string;
+  location: string;
+  status: string;
+  checked_at: string;
   employer_salary: string | null;
   salary_target: string | null;
   notes: string | null;
@@ -287,25 +289,24 @@ function duplicateError(error: unknown): never {
 
 function validateOpening(phase: Job["phase"], input: Pick<UpdateJob, "title" | "description" | "source_url" | "location">) {
   if (phase === "lead" && [input.title, input.description, input.source_url, input.location].some((value) => value != null)) {
-    fail("Top-level opening details require an application. For a lead, put the verified role in eligible_opening; set phase to application only when the user starts applying.");
+    fail("Top-level opening details require an application. For a lead, put the verified role in opening; set phase to application only when the user starts applying.");
   }
 }
 
-function validateEligibleOpening(input: unknown) {
-  const result = v.safeParse(eligibleOpeningSchema, input);
-  if (!result.success) fail("Lead intake requires a verified eligible opening: title, description, source_url, location, status:open, eligibility:eligible, checked_at, criteria_updated_at, and eligibility_reason. Actual applications may omit eligible_opening.");
-  const opening = result.output;
-  const checkedAt = normalizeTimestamp(opening.checked_at);
+function validateLeadOpening(input: unknown) {
+  const result = v.safeParse(leadOpeningSchema, input);
+  if (!result.success) fail("A lead requires an open role: title, description, source_url, location, status:open and checked_at. Actual applications may omit opening.");
+  const checkedAt = normalizeTimestamp(result.output.checked_at);
   if (Date.parse(checkedAt) > Date.now()) fail("checked_at cannot be in the future.");
-  return { ...opening, checked_at: checkedAt, criteria_updated_at: normalizeTimestamp(opening.criteria_updated_at) };
+  return { ...result.output, checked_at: checkedAt };
 }
 
-function openingChecks({ db, userId }: UserStore, opening: string, bindings: unknown[], condition = "1", conditionBindings: unknown[] = []) {
+const openingJsonSql = (prefix = "") => `json_object('title', ${prefix}title, 'description', ${prefix}description,
+  'source_url', ${prefix}source_url, 'location', ${prefix}location, 'status', ${prefix}status, 'checked_at', ${prefix}checked_at)`;
+
+function openingChecks({ db }: UserStore, opening: string, bindings: unknown[], condition = "1", conditionBindings: unknown[] = []) {
   return [
     check(db, "opening_required", `${condition} AND (${opening}) IS NULL`, ...conditionBindings, ...bindings),
-    check(db, "criteria_required", `${condition} AND NOT EXISTS (SELECT 1 FROM criteria WHERE user_id IS ?)`, ...conditionBindings, userId),
-    check(db, "outdated_criteria", `${condition} AND NOT EXISTS (SELECT 1 FROM criteria WHERE user_id IS ?
-      AND updated_at IS json_extract((${opening}), '$.criteria_updated_at'))`, ...conditionBindings, userId, ...bindings),
     check(db, "opening_expired", `${condition} AND coalesce(julianday(json_extract((${opening}), '$.checked_at'))
       BETWEEN julianday('now') - 1 AND julianday('now'), 0) IS 0`, ...conditionBindings, ...bindings),
   ];
@@ -320,75 +321,82 @@ function openingEvidenceChecks({ db, userId }: UserStore, jobId: string, sourceU
 
 function saveOpeningStatement({ db, userId }: UserStore, jobId: string, opening: SaveOpening["opening"], employerSalary?: string | null, notes?: string | null) {
   const now = new Date().toISOString();
-  return db.prepare(`INSERT INTO job_openings (id, user_id, job_id, evidence, employer_salary, notes, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, job_id, source_url) DO UPDATE SET
-      evidence = excluded.evidence, employer_salary = CASE WHEN ? THEN excluded.employer_salary ELSE job_openings.employer_salary END,
+  return db.prepare(`INSERT INTO job_openings (id, user_id, job_id, title, description, source_url, location, status, checked_at,
+      employer_salary, notes, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, job_id, source_url) DO UPDATE SET
+      title = excluded.title, description = excluded.description, location = excluded.location,
+      status = excluded.status, checked_at = excluded.checked_at, employer_salary = CASE WHEN ? THEN excluded.employer_salary ELSE job_openings.employer_salary END,
       notes = CASE WHEN ? THEN excluded.notes ELSE job_openings.notes END, updated_at = excluded.updated_at`)
-    .bind(crypto.randomUUID(), userId, jobId, JSON.stringify(opening), employerSalary ?? null, notes ?? null, now, now,
+    .bind(crypto.randomUUID(), userId, jobId, opening.title, opening.description, opening.source_url, opening.location,
+      opening.status, opening.checked_at, employerSalary ?? null, notes ?? null, now, now,
       Number(employerSalary !== undefined), Number(notes !== undefined));
 }
 
 function syncOpeningStatement({ db, userId }: UserStore, jobId: string, refreshEvidence = true) {
-  return db.prepare(`INSERT INTO job_openings (id, user_id, job_id, evidence, employer_salary, salary_target, created_at, updated_at)
-    SELECT ?, user_id, id, eligible_opening,
+  return db.prepare(`INSERT INTO job_openings (id, user_id, job_id, title, description, source_url, location, status, checked_at,
+      employer_salary, salary_target, created_at, updated_at)
+    SELECT ?, user_id, id, json_extract(opening, '$.title'), json_extract(opening, '$.description'), json_extract(opening, '$.source_url'),
+      json_extract(opening, '$.location'), json_extract(opening, '$.status'), json_extract(opening, '$.checked_at'),
       CASE WHEN employer_salary IS NOT NULL THEN employer_salary
         WHEN salary_min IS NOT NULL OR salary_max IS NOT NULL THEN json_object(
           'min', salary_min, 'max', salary_max, 'currency', salary_currency, 'period', salary_period)
         ELSE NULL END,
       CASE WHEN salary_ask_amount IS NOT NULL THEN json_object('amount', salary_ask_amount,
         'currency', salary_ask_currency, 'period', salary_ask_period, 'basis', salary_ask_basis) ELSE NULL END, created_at, updated_at
-    FROM jobs WHERE user_id IS ? AND id IS ? AND eligible_opening IS NOT NULL
-    ON CONFLICT (user_id, job_id, source_url) DO UPDATE SET evidence = CASE WHEN ? THEN excluded.evidence ELSE job_openings.evidence END,
+    FROM jobs WHERE user_id IS ? AND id IS ? AND opening IS NOT NULL
+    ON CONFLICT (user_id, job_id, source_url) DO UPDATE SET
+      title = CASE WHEN ? THEN excluded.title ELSE job_openings.title END,
+      description = CASE WHEN ? THEN excluded.description ELSE job_openings.description END,
+      location = CASE WHEN ? THEN excluded.location ELSE job_openings.location END,
+      status = CASE WHEN ? THEN excluded.status ELSE job_openings.status END,
+      checked_at = CASE WHEN ? THEN excluded.checked_at ELSE job_openings.checked_at END,
       employer_salary = excluded.employer_salary, salary_target = excluded.salary_target, updated_at = excluded.updated_at`)
-    .bind(crypto.randomUUID(), userId, jobId, Number(refreshEvidence));
+    .bind(crypto.randomUUID(), userId, jobId, ...Array(5).fill(Number(refreshEvidence)));
 }
 
 function openingsStatement({ db, userId }: UserStore, jobId: string, input?: ListOpenings) {
   const where = ["o.user_id IS ?", "o.job_id IS ?"];
   const bindings: (string | number)[] = [userId, jobId];
   if (input?.status) { where.push("o.status IS ?"); bindings.push(input.status); }
-  if (input?.eligibility) { where.push("o.eligibility IS ?"); bindings.push(input.eligibility); }
-  return db.prepare(`SELECT o.*, o.source_url IS json_extract(j.eligible_opening, '$.source_url') AS selected
+  return db.prepare(`SELECT o.*, o.source_url IS json_extract(j.opening, '$.source_url') AS selected
     FROM job_openings o JOIN jobs j ON j.user_id IS o.user_id AND j.id IS o.job_id
     WHERE ${where.join(" AND ")} ORDER BY selected DESC, o.created_at, o.id LIMIT ? OFFSET ?`)
     .bind(...bindings, input ? input.limit + 1 : -1, input?.offset ?? 0);
 }
 
 function withOpening(row: StoredOpening) {
-  return { id: row.id, job_id: row.job_id, ...v.parse(openingSchema, JSON.parse(row.evidence)),
+  return { id: row.id, job_id: row.job_id, ...v.parse(openingSchema, { title: row.title, description: row.description,
+      source_url: row.source_url, location: row.location, status: row.status, checked_at: row.checked_at }),
     employer_salary: row.employer_salary === null ? null : v.parse(salaryRangeSchema, JSON.parse(row.employer_salary)),
     salary_target: row.salary_target === null ? null : v.parse(v.object({ amount: v.number(), currency: v.string(), period: v.string(), basis: v.nullable(v.picklist(["gross", "net"])) }), JSON.parse(row.salary_target)),
     notes: row.notes, created_at: row.created_at, updated_at: row.updated_at, selected: row.selected === 1 };
 }
 
 export async function saveOpening(scope: UserStore, input: SaveOpening) {
-  const opening = { ...input.opening, checked_at: normalizeTimestamp(input.opening.checked_at),
-    criteria_updated_at: input.opening.criteria_updated_at === null ? null : normalizeTimestamp(input.opening.criteria_updated_at) };
+  const opening = { ...input.opening, checked_at: normalizeTimestamp(input.opening.checked_at) };
   if (Date.parse(opening.checked_at) > Date.now()) fail("An opening check cannot be in the future.");
-  if (opening.eligibility === "eligible") {
-    if (opening.criteria_updated_at === null) fail("Eligible openings require criteria_updated_at from get_lead_context.");
-    const age = Date.now() - Date.parse(opening.checked_at);
-    if (opening.status === "open" && age > 24 * 60 * 60 * 1_000) fail("Verify an eligible opening within the last 24 hours.");
-  }
   if (input.employer_salary !== undefined) validateSalaryRange(input.employer_salary);
   const { db, userId } = scope;
   const statements = [requireRow(scope, "jobs", input.job_id, "job_not_found"),
     ...openingEvidenceChecks(scope, input.job_id, opening.source_url, opening.checked_at)];
-  if (opening.status === "open" && opening.eligibility === "eligible") statements.push(...openingChecks(scope, "?", [JSON.stringify(opening)]));
+  // Refreshing a lead's selected open role must keep it current.
+  if (opening.status === "open") statements.push(...openingChecks(scope, "?", [JSON.stringify(opening)],
+    "EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'lead' AND json_extract(opening, '$.source_url') IS ?)",
+    [userId, input.job_id, opening.source_url]));
   statements.push(saveOpeningStatement(scope, input.job_id, opening,
     input.employer_salary === undefined ? undefined : input.employer_salary === null ? null : JSON.stringify(input.employer_salary), input.notes));
   statements.push(db.prepare(`UPDATE jobs SET score = NULL, updated_at = ?,
-    eligible_opening = CASE WHEN phase IS 'lead' AND ? IS 'open' AND ? IS 'eligible' THEN ? ELSE eligible_opening END,
+    opening = CASE WHEN phase IS 'lead' AND ? IS 'open' THEN ? ELSE opening END,
     employer_salary = CASE WHEN phase IS 'lead' AND ? THEN ? ELSE employer_salary END,
     salary_min = CASE WHEN phase IS 'lead' AND ? THEN NULL ELSE salary_min END,
     salary_max = CASE WHEN phase IS 'lead' AND ? THEN NULL ELSE salary_max END,
     salary_currency = CASE WHEN phase IS 'lead' AND ? THEN NULL ELSE salary_currency END,
     salary_period = CASE WHEN phase IS 'lead' AND ? THEN NULL ELSE salary_period END
-    WHERE user_id IS ? AND id IS ? AND json_extract(eligible_opening, '$.source_url') IS ?`)
-    .bind(new Date().toISOString(), opening.status, opening.eligibility, JSON.stringify(opening),
+    WHERE user_id IS ? AND id IS ? AND json_extract(opening, '$.source_url') IS ?`)
+    .bind(new Date().toISOString(), opening.status, JSON.stringify(opening),
       Number(input.employer_salary !== undefined), input.employer_salary == null ? null : JSON.stringify(input.employer_salary),
       ...Array(4).fill(Number(input.employer_salary !== undefined)), userId, input.job_id, opening.source_url));
-  statements.push(db.prepare(`SELECT o.*, o.source_url IS json_extract(j.eligible_opening, '$.source_url') AS selected
+  statements.push(db.prepare(`SELECT o.*, o.source_url IS json_extract(j.opening, '$.source_url') AS selected
     FROM job_openings o JOIN jobs j ON j.user_id IS o.user_id AND j.id IS o.job_id
     WHERE o.user_id IS ? AND o.job_id IS ? AND o.source_url IS ?`).bind(userId, input.job_id, opening.source_url));
   const results = await execute<StoredOpening>(db, statements);
@@ -408,12 +416,12 @@ export async function selectOpening(scope: UserStore, input: SelectOpening) {
   const results = await execute<Job>(db, [requireRow(scope, "jobs", input.job_id, "job_not_found"),
     jobOpeningCheck(db, "application_opening", "EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'application')", userId, input.job_id),
     jobOpeningCheck(db, "opening_not_found", `NOT EXISTS (SELECT 1 ${target})`, ...bindings),
-    jobOpeningCheck(db, "opening_unavailable", `EXISTS (SELECT 1 ${target} AND (status IS NOT 'open' OR eligibility IS NOT 'eligible'))`, ...bindings),
-    ...openingChecks(scope, `SELECT evidence ${target}`, bindings),
+    jobOpeningCheck(db, "opening_unavailable", `EXISTS (SELECT 1 ${target} AND status IS NOT 'open')`, ...bindings),
+    ...openingChecks(scope, `SELECT ${openingJsonSql()} ${target}`, bindings),
     openingCheck(db, "opening_closed", `EXISTS (SELECT 1 FROM opening_closures c JOIN job_openings o
       ON c.user_id IS o.user_id AND c.job_id IS o.job_id AND c.source_url IS o.source_url
       WHERE o.user_id IS ? AND o.job_id IS ? AND o.id IS ? AND c.checked_at >= o.checked_at)`, ...bindings),
-    db.prepare(`UPDATE jobs SET eligible_opening = (SELECT evidence ${target}),
+    db.prepare(`UPDATE jobs SET opening = (SELECT ${openingJsonSql()} ${target}),
       employer_salary = (SELECT employer_salary ${target}), salary_min = NULL, salary_max = NULL, salary_currency = NULL, salary_period = NULL,
       (salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis) =
         (SELECT json_extract(salary_target, '$.amount'), json_extract(salary_target, '$.currency'),
@@ -421,7 +429,7 @@ export async function selectOpening(scope: UserStore, input: SelectOpening) {
       score = NULL, updated_at = ? WHERE user_id IS ? AND id IS ?`).bind(...bindings, ...bindings, ...bindings, new Date().toISOString(), userId, input.job_id),
     db.prepare(`SELECT *, ${openingMetadataSql} FROM jobs WHERE user_id IS ? AND id IS ?`).bind(userId, input.job_id),
   ]);
-  return withEligibleOpening(results.at(-1)!.results[0]!);
+  return withLeadOpening(results.at(-1)!.results[0]!);
 }
 
 function withCompensation<T extends SalaryFields>(job: T) {
@@ -442,12 +450,12 @@ function withCompensation<T extends SalaryFields>(job: T) {
   };
 }
 
-function withEligibleOpening<T extends SalaryFields & Pick<Job, "eligible_opening"> & { outcome?: string | null }>(job: T) {
-  const { eligible_opening, outcome, ...fields } = job;
+function withLeadOpening<T extends SalaryFields & Pick<Job, "opening"> & { outcome?: string | null }>(job: T) {
+  const { opening, outcome, ...fields } = job;
   return withCompensation({
     ...fields,
     ...(outcome === undefined ? {} : { outcome: outcome === null ? null : v.parse(outcomeSchema, JSON.parse(outcome)) }),
-    eligible_opening: eligible_opening === null ? null : v.parse(eligibleOpeningSchema, JSON.parse(eligible_opening)),
+    opening: opening === null ? null : v.parse(leadOpeningSchema, JSON.parse(opening)),
   });
 }
 
@@ -525,7 +533,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
       validateSalary(job);
       validateSalaryAsk(job);
       validateDeclaredSalary(job);
-      if (job.phase === "lead" || job.eligible_opening !== undefined) job.eligible_opening = validateEligibleOpening(job.eligible_opening);
+      if (job.phase === "lead" || job.opening !== undefined) job.opening = validateLeadOpening(job.opening);
     } catch (error) {
       if (error instanceof Error && error.cause === "user") {
         fail(`Batch rejected: 0 of ${jobs.length} records saved. Record ${index + 1}: ${error.message}`);
@@ -537,7 +545,7 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
   const statements = prepared.map((job, index) => db.prepare(`INSERT INTO jobs
     (user_id, id, company, company_url, phase, current_stage, title, nickname, description, source_url, location, recruiter_name, recruiter_email, notes, score,
       salary_min, salary_max, salary_currency, salary_period, salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
-      salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis, created_at, updated_at, eligible_opening, employer_salary, asked_salary)
+      salary_declared_amount, salary_declared_currency, salary_declared_period, salary_declared_basis, created_at, updated_at, opening, employer_salary, asked_salary)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).bind(
     userId, ids[index], job.company, job.company_url ?? null, job.phase, job.phase === "lead" ? "lead" : "applied",
     job.title ?? null, job.nickname ?? null, job.description ?? null, job.source_url ?? null,
@@ -545,23 +553,20 @@ export async function addJobs(scope: UserStore, { jobs }: AddJobs) {
     job.salary_min ?? null, job.salary_max ?? null, job.salary_currency ?? null, job.salary_period ?? null,
     job.salary_ask_amount ?? null, job.salary_ask_currency ?? null, job.salary_ask_period ?? null, job.salary_ask_basis ?? null,
     job.salary_declared_amount ?? null, job.salary_declared_currency ?? null, job.salary_declared_period ?? null, job.salary_declared_basis ?? null, now, now,
-    job.eligible_opening ? JSON.stringify(job.eligible_opening) : null,
+    job.opening ? JSON.stringify(job.opening) : null,
     job.employer_salary ?? null, job.asked_salary ?? null,
   ));
   try {
     const leads = prepared.filter((job) => job.phase === "lead");
-    const evidence = JSON.stringify(leads.map((job) => job.eligible_opening));
+    const openings = JSON.stringify(leads.map((job) => job.opening));
     const checks = leads.length === 0 ? [] : [
-      check(db, "criteria_required", "NOT EXISTS (SELECT 1 FROM criteria WHERE user_id IS ?)", userId),
-      check(db, "outdated_criteria", `EXISTS (SELECT 1 FROM json_each(?) opening WHERE NOT EXISTS (
-        SELECT 1 FROM criteria WHERE user_id IS ? AND updated_at IS json_extract(opening.value, '$.criteria_updated_at')))`, evidence, userId),
       check(db, "opening_expired", `EXISTS (SELECT 1 FROM json_each(?) opening WHERE coalesce(
-        julianday(json_extract(opening.value, '$.checked_at')) BETWEEN julianday('now') - 1 AND julianday('now'), 0) IS 0)`, evidence),
+        julianday(json_extract(opening.value, '$.checked_at')) BETWEEN julianday('now') - 1 AND julianday('now'), 0) IS 0)`, openings),
     ];
     const results = await execute<Job>(db, [...checks, ...statements,
       ...ids.map((id) => syncOpeningStatement(scope, id)),
     ]);
-    return { jobs: results.flatMap((result) => result.results).map(withEligibleOpening) };
+    return { jobs: results.flatMap((result) => result.results).map(withLeadOpening) };
   } catch (error) {
     duplicateError(error);
   }
@@ -586,9 +591,9 @@ function jobStatements(scope: UserStore, idSql: string, bindings: unknown[]) {
     db.prepare(`SELECT * FROM outreach WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY occurred_at, created_at, rowid`).bind(userId, ...bindings),
     db.prepare(`SELECT id, job_id, kind, text, stage_name, status, resolution, closed_at, created_at, updated_at FROM prep_notes
       WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY created_at, rowid`).bind(userId, ...bindings),
-    db.prepare(`SELECT source_url, reason, checked_at, eligible_opening, created_at FROM opening_closures
+    db.prepare(`SELECT source_url, reason, checked_at, opening, created_at FROM opening_closures
       WHERE user_id IS ? AND job_id IS (${idSql}) ORDER BY checked_at, source_url`).bind(userId, ...bindings),
-    db.prepare(`SELECT o.*, o.source_url IS json_extract(j.eligible_opening, '$.source_url') AS selected FROM job_openings o
+    db.prepare(`SELECT o.*, o.source_url IS json_extract(j.opening, '$.source_url') AS selected FROM job_openings o
       JOIN jobs j ON j.user_id IS o.user_id AND j.id IS o.job_id
       WHERE o.user_id IS ? AND o.job_id IS (${idSql}) ORDER BY selected DESC, o.created_at, o.id`).bind(userId, ...bindings),
   ];
@@ -599,12 +604,12 @@ function jobResult(results: D1Result[]) {
   const job = jobs.results[0];
   if (!job) fail("Job not found. Use list_jobs to resolve a company, role, or nickname to its job_id.");
   return {
-    job: withEligibleOpening(job), stages: stages.results, feedback: feedback.results, contacts: contacts.results, outreach: outreach.results,
+    job: withLeadOpening(job), stages: stages.results, feedback: feedback.results, contacts: contacts.results, outreach: outreach.results,
     prep_notes: prepNotes.results,
     openings: (results[7] as D1Result<StoredOpening>).results.map(withOpening),
     opening_closures: results[6]!.results.map(function parseClosure(closure) {
-      const row = closure as Record<string, unknown> & { eligible_opening: string | null };
-      return { ...row, eligible_opening: row.eligible_opening === null ? null : JSON.parse(row.eligible_opening) };
+      const row = closure as Record<string, unknown> & { opening: string | null };
+      return { ...row, opening: row.opening === null ? null : JSON.parse(row.opening) };
     }),
     last_outreach_at: outreach.results.filter((entry) => entry.direction === "outbound").at(-1)?.occurred_at ?? null,
     last_response_at: outreach.results.filter((entry) => entry.direction === "inbound").at(-1)?.occurred_at ?? null,
@@ -783,18 +788,18 @@ function listJobsStatement({ db, userId }: UserStore, input: ListJobs) {
   if (input.query) {
     where.push(`(company LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR nickname LIKE ? ESCAPE '\\' OR source_url LIKE ? ESCAPE '\\'
       OR EXISTS (SELECT 1 FROM job_openings o WHERE o.user_id IS jobs.user_id AND o.job_id IS jobs.id
-        AND (json_extract(o.evidence, '$.title') LIKE ? ESCAPE '\\' OR o.source_url LIKE ? ESCAPE '\\')))`);
+        AND (o.title LIKE ? ESCAPE '\\' OR o.source_url LIKE ? ESCAPE '\\')))`);
     const pattern = searchPattern(input.query);
     bindings.push(pattern, pattern, pattern, pattern, pattern, pattern);
   }
   if (input.status) { where.push("status IS ?"); bindings.push(input.status); }
   if (input.phase) { where.push("phase IS ?"); bindings.push(input.phase); }
-  if (input.available_only) where.push("(status IS 'active' OR reapply_status IS 'eligible') AND opening_status IS 'open' AND opening_eligibility IS 'eligible'");
+  if (input.available_only) where.push("(status IS 'active' OR reapply_status IS 'eligible') AND opening_status IS 'open'");
   if (input.opening_status) { where.push("opening_status IS ?"); bindings.push(input.opening_status); }
   if (input.reapply_status) { where.push("reapply_status IS ?"); bindings.push(input.reapply_status); }
   if (input.ranked_only) where.push("(score IS NOT NULL OR priority IS NOT NULL)");
   const scoreDirection = input.score_order === "lowest" ? "ASC" : "DESC";
-  const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, eligible_opening, opening_status, opening_eligibility, selected_opening_id, opening_count, title, nickname, source_url, location,
+  const columns = input.include_descriptions ? "*" : `id, company, company_url, phase, opening, opening_status, selected_opening_id, opening_count, title, nickname, source_url, location,
     recruiter_name, recruiter_email, notes, status, rejected_at, outcome, current_stage, recruiter_engaged_at, reapply_policy, reapply_after, reapply_status,
     score, priority, salary_min, salary_max, salary_currency, salary_period,
     salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis,
@@ -816,12 +821,12 @@ function listJobsResult(results: D1Result<Omit<Job, "description"> & { descripti
   const hasMore = results.results.length > input.limit;
   return {
     jobs: results.results.slice(0, input.limit).map(function listedJob(job) {
-      const result = withEligibleOpening(job);
+      const result = withLeadOpening(job);
       const { notes: _notes, outcome: _outcome, ...fields } = result;
       const listed = input.include_notes ? result : fields;
-      if (input.include_descriptions || listed.eligible_opening === null) return listed;
-      const { description: _description, ...opening } = listed.eligible_opening;
-      return { ...listed, eligible_opening: opening };
+      if (input.include_descriptions || listed.opening === null) return listed;
+      const { description: _description, ...opening } = listed.opening;
+      return { ...listed, opening: opening };
     }),
     next_offset: hasMore ? input.offset + input.limit : null,
   };
@@ -854,8 +859,8 @@ function patchStatement({ db, userId }: UserStore, table: "jobs" | "stages" | "f
 
 export async function updateJob(scope: UserStore, input: UpdateJob) {
   const { db, userId } = scope;
-  const { job_id, eligible_opening, outcome, ...patch } = prepareSalaryInput(input);
-  const opening = eligible_opening === undefined ? undefined : validateEligibleOpening(eligible_opening);
+  const { job_id, opening: openingInput, outcome, ...patch } = prepareSalaryInput(input);
+  const opening = openingInput === undefined ? undefined : validateLeadOpening(openingInput);
   if (outcome && outcome.message === null && outcome.reason === null) fail("An outcome needs the verbatim message or the stated reason.");
   const statements = [requireRow(scope, "jobs", job_id, "job_not_found"),
     check(db, "leads_stay_active", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
@@ -872,8 +877,8 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
   if (opening) statements.push(
     ...openingEvidenceChecks(scope, job_id, opening.source_url, opening.checked_at),
     jobOpeningCheck(db, "application_opening", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ? AND phase IS 'application'
-      AND coalesce(json_extract(eligible_opening, '$.source_url'), source_url) IS NOT NULL
-      AND coalesce(json_extract(eligible_opening, '$.source_url'), source_url) IS NOT ?)`, userId, job_id, opening.source_url),
+      AND coalesce(json_extract(opening, '$.source_url'), source_url) IS NOT NULL
+      AND coalesce(json_extract(opening, '$.source_url'), source_url) IS NOT ?)`, userId, job_id, opening.source_url),
   );
   if (patch.recruiter_engaged_at) {
     patch.recruiter_engaged_at = normalizeTimestamp(patch.recruiter_engaged_at);
@@ -904,9 +909,9 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
       (salary_ask_amount, salary_ask_currency, salary_ask_period, salary_ask_basis) =
         (SELECT json_extract(salary_target, '$.amount'), json_extract(salary_target, '$.currency'),
           json_extract(salary_target, '$.period'), json_extract(salary_target, '$.basis') FROM job_openings WHERE user_id IS ? AND job_id IS ? AND source_url IS ?)
-      WHERE user_id IS ? AND id IS ? AND phase IS 'lead' AND json_extract(eligible_opening, '$.source_url') IS NOT ?`)
+      WHERE user_id IS ? AND id IS ? AND phase IS 'lead' AND json_extract(opening, '$.source_url') IS NOT ?`)
       .bind(userId, job_id, opening.source_url, userId, job_id, opening.source_url, userId, job_id, opening.source_url));
-    statements.push(patchStatement(scope, "jobs", job_id, { ...patch, eligible_opening: opening ? JSON.stringify(opening) : undefined,
+    statements.push(patchStatement(scope, "jobs", job_id, { ...patch, opening: opening ? JSON.stringify(opening) : undefined,
       outcome: outcome === undefined || outcome === null ? outcome : JSON.stringify(outcome) }, expressions));
     if (opening || [input.employer_salary, input.salary_min, input.salary_max, input.salary_currency, input.salary_period,
       input.salary_ask_amount, input.salary_ask_currency, input.salary_ask_period, input.salary_ask_basis].some((field) => field !== undefined)) {
@@ -915,7 +920,7 @@ export async function updateJob(scope: UserStore, input: UpdateJob) {
     statements.push(db.prepare(`SELECT *, ${openingMetadataSql} FROM jobs WHERE user_id IS ? AND id IS ?`).bind(userId, job_id));
     const results = await execute<Job>(db, statements);
     const job = results.at(-1)!.results[0]!;
-    return withEligibleOpening({ ...job, reapply_status: job.status !== "rejected" ? "not_applicable"
+    return withLeadOpening({ ...job, reapply_status: job.status !== "rejected" ? "not_applicable"
       : job.reapply_policy === null ? "unknown" : job.reapply_policy === "not_allowed" ? "not_allowed"
       : job.reapply_after !== null && job.reapply_after > new Date().toISOString() ? "cooldown" : "eligible" });
   } catch (error) {
@@ -931,23 +936,23 @@ export async function closeOpening(scope: UserStore, input: CloseOpening) {
   const results = await execute<Job>(db, [
     requireRow(scope, "jobs", input.job_id, "job_not_found"),
     openingCheck(db, "opening_mismatch", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
-      AND coalesce(json_extract(eligible_opening, '$.source_url'), source_url, ?) IS NOT ?)`, userId, input.job_id, input.source_url, input.source_url),
+      AND coalesce(json_extract(opening, '$.source_url'), source_url, ?) IS NOT ?)`, userId, input.job_id, input.source_url, input.source_url),
     openingCheck(db, "closure_outdated", `EXISTS (SELECT 1 FROM jobs WHERE user_id IS ? AND id IS ?
-      AND json_extract(eligible_opening, '$.checked_at') > ?)`, userId, input.job_id, checkedAt),
+      AND json_extract(opening, '$.checked_at') > ?)`, userId, input.job_id, checkedAt),
     openingCheck(db, "closure_outdated", `EXISTS (SELECT 1 FROM job_openings WHERE user_id IS ? AND job_id IS ?
       AND source_url IS ? AND checked_at > ?)`, userId, input.job_id, input.source_url, checkedAt),
-    db.prepare(`INSERT INTO opening_closures (user_id, job_id, source_url, reason, checked_at, eligible_opening, created_at)
-      SELECT user_id, id, ?, ?, ?, eligible_opening, ? FROM jobs WHERE user_id IS ? AND id IS ?
+    db.prepare(`INSERT INTO opening_closures (user_id, job_id, source_url, reason, checked_at, opening, created_at)
+      SELECT user_id, id, ?, ?, ?, opening, ? FROM jobs WHERE user_id IS ? AND id IS ?
       ON CONFLICT (user_id, job_id, source_url) DO UPDATE SET reason = excluded.reason, checked_at = excluded.checked_at
       WHERE excluded.checked_at >= opening_closures.checked_at`)
       .bind(input.source_url, input.reason, checkedAt, now, userId, input.job_id),
     db.prepare(`UPDATE jobs SET score = NULL, updated_at = ? WHERE user_id IS ? AND id IS ?`).bind(now, userId, input.job_id),
-    db.prepare(`UPDATE job_openings SET evidence = json_set(evidence, '$.status', 'closed', '$.checked_at', ?), updated_at = ?
+    db.prepare(`UPDATE job_openings SET status = 'closed', checked_at = ?, updated_at = ?
       WHERE user_id IS ? AND job_id IS ? AND source_url IS ? AND checked_at <= ?`)
       .bind(checkedAt, now, userId, input.job_id, input.source_url, checkedAt),
     db.prepare(`SELECT *, ${openingMetadataSql} FROM jobs WHERE user_id IS ? AND id IS ?`).bind(userId, input.job_id),
   ]);
-  return withEligibleOpening(results.at(-1)!.results[0]!);
+  return withLeadOpening(results.at(-1)!.results[0]!);
 }
 
 export async function removeLead(scope: UserStore, id: string) {

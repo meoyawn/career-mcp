@@ -63,14 +63,11 @@ async function error(name: string, args: Record<string, unknown>, message: RegEx
   assert.match(result.content[0].text, message);
 }
 
-async function verifiedOpening(company: string, owner: Client = client) {
-  const { criteria } = parseTool(await owner.callTool({ name: "get_lead_context", arguments: {} }),
-    v.object({ criteria: v.optional(v.object({ updated_at: v.string() })) }));
+async function verifiedOpening(company: string, _owner: Client = client) {
   return {
     title: "TypeScript product engineer", description: "Build TypeScript developer tools for EMEA customers.",
     source_url: `https://jobs.example/${encodeURIComponent(company)}`, location: "Remote EMEA",
-    status: "open", eligibility: "eligible", checked_at: new Date().toISOString(),
-    criteria_updated_at: criteria?.updated_at ?? new Date().toISOString(), eligibility_reason: "Live EMEA product engineering role passes the current hard exclusions.",
+    status: "open", checked_at: new Date().toISOString(),
   };
 }
 
@@ -171,7 +168,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const notes = 'Keep literal null in text: {"answer":null}.';
       const opening = await verifiedOpening("Sparse responses", owner);
       const created = await scoped("add_job", {
-        company: "Sparse responses", score: 0, notes, eligible_opening: opening,
+        company: "Sparse responses", score: 0, notes, opening: opening,
         employer_salary: { min: 0, max: null, currency: "USD", period: "year" },
       });
       const { id } = v.parse(v.object({ id: v.string() }), created);
@@ -179,7 +176,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal(created.notes, notes);
       assert.deepEqual(created.employer_salary, { min: 0, currency: "USD", period: "year" });
       const alternative = await scoped("save_opening", { job_id: id, opening: {
-        ...opening, source_url: "https://jobs.example/sparse-alternative", status: "unknown", eligibility: "unknown", criteria_updated_at: null,
+        ...opening, source_url: "https://jobs.example/sparse-alternative", status: "unknown",
       } });
       assert.equal(alternative.selected, false);
       const queue = await scoped("get_next_leads");
@@ -212,7 +209,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const connection = await authorize(browser);
     const owner = new Client({ name: "application-without-search", version: "1" });
     const row = v.object({ ...jobSchema.entries, phase: v.string(), opening_status: v.optional(v.string()),
-      eligible_opening: v.optional(v.record(v.string(), v.unknown())) });
+      opening: v.optional(v.record(v.string(), v.unknown())) });
     async function scoped(name: string, args: Record<string, unknown>) {
       return parseTool(await owner.callTool({ name, arguments: args }), v.unknown());
     }
@@ -223,45 +220,41 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         title: "Engineer", source_url: destination }));
       assert.equal(application.phase, "application");
       assert.equal(application.current_stage, "applied");
-      assert.equal(application.eligible_opening, undefined);
+      assert.equal(application.opening, undefined);
       assert.equal(application.score, undefined);
       for (const query of [destination, "123456789"]) {
         assert.deepEqual(v.parse(jobsSchema, await scoped("list_jobs", { query })).jobs.map((job) => job.id), [application.id]);
       }
       const historical = { title: "Engineer", description: "Build developer tools", source_url: destination,
-        location: "Remote", status: "open", eligibility: "eligible", checked_at: "2000-01-01T00:00:00.000Z",
-        criteria_updated_at: "2000-01-01T00:00:00.000Z", eligibility_reason: "Historical assessment; not a current search decision" };
+        location: "Remote", status: "open", checked_at: "2000-01-01T00:00:00.000Z" };
       const imported = v.parse(v.object({ jobs: v.array(row) }), await scoped("add_jobs", { jobs: [
-        { company: "Historical application", phase: "application", eligible_opening: historical },
+        { company: "Historical application", phase: "application", opening: historical },
         { company: "Another received application", phase: "application" },
       ] }));
       assert.equal(imported.jobs.length, 2);
-      assert.deepEqual(imported.jobs[0]?.eligible_opening, historical);
+      assert.deepEqual(imported.jobs[0]?.opening, historical);
       const updated = v.parse(row, await scoped("update_job", { job_id: application.id, phase: "application",
-        company: "Corrected application employer", eligible_opening: historical }));
-      assert.deepEqual(updated.eligible_opening, historical);
+        company: "Corrected application employer", opening: historical }));
+      assert.deepEqual(updated.opening, historical);
       await scoped("update_job", { job_id: imported.jobs[1]!.id, source_url: destination });
       const changed = await owner.callTool({ name: "update_job", arguments: { job_id: imported.jobs[1]!.id,
-        eligible_opening: { ...historical, source_url: "https://jobs.example/different-role" } } });
+        opening: { ...historical, source_url: "https://jobs.example/different-role" } } });
       assert.equal(changed.isError, true);
       assert.ok(changed.content[0]?.type === "text");
       assert.match(changed.content[0].text, /historical/u);
-      const current = { ...historical, checked_at: new Date().toISOString(), criteria_updated_at: new Date().toISOString() };
-      const invalidBatch = await owner.callTool({ name: "add_jobs", arguments: { jobs: [
-        { company: "Must roll back application", phase: "application" },
-        { company: "Search lead without criteria", eligible_opening: current },
-      ] } });
-      assert.equal(invalidBatch.isError, true);
-      assert.ok(invalidBatch.content[0]?.type === "text");
-      assert.match(invalidBatch.content[0].text, /criteria/u);
-      assert.equal(v.parse(jobsSchema, await scoped("list_jobs", {})).jobs.length, 3);
+      const current = { ...historical, source_url: "https://jobs.example/lead-without-criteria", checked_at: new Date().toISOString() };
+      const leadBatch = v.parse(v.object({ jobs: v.array(row) }), await scoped("add_jobs", { jobs: [
+        { company: "Search lead without criteria", opening: current },
+      ] }));
+      assert.deepEqual(leadBatch.jobs[0]?.opening, current);
+      assert.equal(v.parse(jobsSchema, await scoped("list_jobs", {})).jobs.length, 4);
       await scoped("set_criteria", { text: "Remote product engineering." });
       const leads = [];
       for (const company of ["Explicit transition", "Milestone transition", "Communication transition"]) {
         const opening = await verifiedOpening(company, owner);
-        const lead = v.parse(row, await scoped("add_job", { company, eligible_opening: opening }));
+        const lead = v.parse(row, await scoped("add_job", { company, opening: opening }));
         await scoped("close_opening", { job_id: lead.id, source_url: opening.source_url, reason: "Posting closed after the actual event" });
-        leads.push({ ...lead, eligible_opening: opening });
+        leads.push({ ...lead, opening: opening });
       }
       await execute(process.execPath, [wrangler, "d1", "execute", "DB", "--config", join(directory, "wrangler.json"), "--local", "--persist-to", directory,
         "--command", `DELETE FROM criteria WHERE user_id IS '${passkey.userHandle}'`]);
@@ -275,7 +268,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         assert.equal(detail.job.phase, "application");
         assert.equal(detail.job.current_stage, index === 2 ? "outreach" : "applied");
         assert.equal(detail.job.opening_status, "closed");
-        assert.deepEqual(detail.job.eligible_opening, lead.eligible_opening);
+        assert.deepEqual(detail.job.opening, lead.opening);
         assert.deepEqual(detail.stages, index === 1 ? [stage] : []);
         assert.deepEqual(detail.outreach, index === 2 ? [message] : []);
       }
@@ -284,16 +277,15 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
-  test("lead imports require current criteria and opening evidence, while criteria edits preserve histories and ranking", async () => {
+  test("lead imports require an open role without saved criteria, while criteria edits preserve histories and ranking", async () => {
     const criteriaOutput = v.strictObject({ user_id: v.string(), text: v.string(), updated_at: v.string() });
-    const opening = { phase: "application", company: "Google", eligible_opening: await verifiedOpening("Google"), title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work", source_url: "https://jobs.example/google" };
+    const opening = { phase: "application", company: "Google", opening: await verifiedOpening("Google"), title: "TypeScript engineer", nickname: "google-ts", description: "Remote TypeScript platform work", source_url: "https://jobs.example/google" };
     assert.equal((await call("get_lead_context", {}, v.object({ criteria: v.optional(v.never()) }))).criteria, undefined);
-    await error("add_job", { company: "Google", eligible_opening: await verifiedOpening("Google") }, /criteria/u);
     await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, criteriaOutput);
     const importStartedAt = Date.now();
-    const google = await call("add_job", { ...opening, eligible_opening: await verifiedOpening("Google"), score: 95 }, jobSchema);
+    const google = await call("add_job", { ...opening, opening: await verifiedOpening("Google"), score: 95 }, jobSchema);
     const firstBatch = await call("add_jobs", { jobs: [
-      { phase: "application", company: "Google", eligible_opening: await verifiedOpening("Google"), title: "Backend engineer", nickname: "google-backend", description: "Remote backend work", score: 70, source_url: "http://jobs.example/google-backend" },
+      { phase: "application", company: "Google", opening: await verifiedOpening("Google"), title: "Backend engineer", nickname: "google-backend", description: "Remote backend work", score: 70, source_url: "http://jobs.example/google-backend" },
     ] }, jobsSchema);
     assert.equal((await call("list_jobs", {}, jobsSchema)).jobs.length, 2);
     const text = "\n# Job selection criteria\r\n\r\n- Remote TypeScript roles.\r\n- Exclude onsite-only work.\r\n\r\n## Ranking\nPrefer product teams; score stack fit from 0–100.\nПродуктовые команды в приоритете.\n ";
@@ -335,7 +327,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(google.score, 95);
     assert.equal(google.source_url, opening.source_url);
     const imported = await call("add_jobs", { jobs: [
-      { phase: "application", company: "New Co", eligible_opening: await verifiedOpening("New Co"), title: "Onsite engineer", description: "Onsite-only product work explicitly supplied by the user" },
+      { phase: "application", company: "New Co", opening: await verifiedOpening("New Co"), title: "Onsite engineer", description: "Onsite-only product work explicitly supplied by the user" },
     ] }, jobsSchema);
     assert.equal(imported.jobs.length, 1);
     const backend = firstBatch.jobs.find((job) => job.title === "Backend engineer");
@@ -397,7 +389,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       context: "Entered in the initial application form" };
     const target = { amount: 9_000, currency: "EUR", period: "month", basis: "gross" };
     const application = await call("add_job", { company: "Separate salary ranges", phase: "application",
-      eligible_opening: await verifiedOpening("Separate salary ranges"), employer_salary: employer, asked_salary: asked,
+      opening: await verifiedOpening("Separate salary ranges"), employer_salary: employer, asked_salary: asked,
       salary_ask_amount: target.amount, salary_ask_currency: target.currency, salary_ask_period: target.period, salary_ask_basis: target.basis,
     }, row);
     const expected = { employer_salary: employer, asked_salary: asked, salary_target: target };
@@ -432,7 +424,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(exact.salary_declared_amount, 8_500);
     assert.deepEqual(exact.salary_target, target);
     const imported = await call("add_jobs", { jobs: [{ company: "Employer range without an ask", phase: "application",
-      eligible_opening: await verifiedOpening("Employer range without an ask"),
+      opening: await verifiedOpening("Employer range without an ask"),
       salary_min: 100_000, salary_max: 120_000, salary_currency: "USD", salary_period: "year",
       salary_ask_amount: 130_000, salary_ask_currency: "USD", salary_ask_period: "year",
     }] }, v.object({ jobs: v.array(row) }));
@@ -455,8 +447,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const unknown = { salary_ask_amount: null, salary_ask_currency: null, salary_ask_period: null, salary_ask_basis: null };
     const budget = { salary_min: 100_000, salary_max: 120_000, salary_currency: "USD", salary_period: "year" };
     const imported = await call("add_jobs", { jobs: [
-      { company: "Salary ask employer", phase: "application", eligible_opening: await verifiedOpening("Salary ask employer"), score: 90, ...budget, ...ask },
-      { company: "Salary ask unknown", phase: "application", eligible_opening: await verifiedOpening("Salary ask unknown"), ...budget },
+      { company: "Salary ask employer", phase: "application", opening: await verifiedOpening("Salary ask employer"), score: 90, ...budget, ...ask },
+      { company: "Salary ask unknown", phase: "application", opening: await verifiedOpening("Salary ask unknown"), ...budget },
     ] }, v.object({ jobs: v.array(row) }));
     const asked = imported.jobs[0];
     const unasked = imported.jobs[1];
@@ -489,8 +481,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(unspecifiedBasis.salary_ask_basis, undefined);
     await call("update_job", { job_id: asked.id, ...unknown }, row);
     assert.deepEqual(v.parse(projection, (await call("get_pipeline", {}, pipeline)).applications.find((job) => job.id === asked.id)), {});
-    await error("add_jobs", { jobs: [{ company: "Salary ask atomic rollback", phase: "application", eligible_opening: await verifiedOpening("Salary ask atomic rollback") },
-      { company: "Salary ask invalid", phase: "application", eligible_opening: await verifiedOpening("Salary ask invalid"), salary_ask_amount: 5_500 }] }, /Salary ask/u);
+    await error("add_jobs", { jobs: [{ company: "Salary ask atomic rollback", phase: "application", opening: await verifiedOpening("Salary ask atomic rollback") },
+      { company: "Salary ask invalid", phase: "application", opening: await verifiedOpening("Salary ask invalid"), salary_ask_amount: 5_500 }] }, /Salary ask/u);
     assert.deepEqual((await call("list_jobs", { query: "Salary ask atomic rollback" }, jobsSchema)).jobs, []);
   });
 
@@ -506,7 +498,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     };
     const row = v.object({ ...jobSchema.entries, ...salaryFields });
     const application = await call("add_job", {
-      company: "Compensation example", phase: "application", eligible_opening: await verifiedOpening("Compensation example"),
+      company: "Compensation example", phase: "application", opening: await verifiedOpening("Compensation example"),
       notes: "Preserve internal context", ...declared, ...target,
     }, row);
     const point = await call("add_prep_note", {
@@ -560,8 +552,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(cleared.job.salary_ask_amount, 6_800);
     assert.equal(cleared.prep_notes[0]?.status, "cancelled");
     await error("add_jobs", { jobs: [
-      { company: "Declared atomic rollback", eligible_opening: await verifiedOpening("Declared atomic rollback") },
-      { company: "Declared invalid", eligible_opening: await verifiedOpening("Declared invalid"), salary_declared_amount: 4_200 },
+      { company: "Declared atomic rollback", opening: await verifiedOpening("Declared atomic rollback") },
+      { company: "Declared invalid", opening: await verifiedOpening("Declared invalid"), salary_declared_amount: 4_200 },
     ] }, /Declared salary/u);
     assert.deepEqual((await call("list_jobs", { query: "Declared atomic rollback" }, jobsSchema)).jobs, []);
   });
@@ -586,9 +578,9 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.ok(empty.content[0]?.type === "text");
       assert.match(empty.content[0].text, /No upcoming interview/u);
       await scoped("set_criteria", { text: "Remote TypeScript engineering roles." }, v.unknown());
-      const application = await scoped("add_job", { company: "Prep example", phase: "application", eligible_opening: await verifiedOpening("Prep example", owner), description: "Build distributed developer tools" }, jobSchema);
-      const other = await scoped("add_job", { company: "Prep closed", phase: "application", eligible_opening: await verifiedOpening("Prep closed", owner) }, jobSchema);
-      const lead = await scoped("add_job", { company: "Prep lead", eligible_opening: await verifiedOpening("Prep lead", owner) }, jobSchema);
+      const application = await scoped("add_job", { company: "Prep example", phase: "application", opening: await verifiedOpening("Prep example", owner), description: "Build distributed developer tools" }, jobSchema);
+      const other = await scoped("add_job", { company: "Prep closed", phase: "application", opening: await verifiedOpening("Prep closed", owner) }, jobSchema);
+      const lead = await scoped("add_job", { company: "Prep lead", opening: await verifiedOpening("Prep lead", owner) }, jobSchema);
       const general = await scoped("add_prep_note", { job_id: application.id, kind: "reminder", text: "Keep answers concise and ask for examples." }, prepNoteOutput);
       const hr = await scoped("add_prep_note", { job_id: application.id, kind: "question", stage_name: "recruiter_screen", text: "What are the next steps and hiring timeline?" }, prepNoteOutput);
       const technical = await scoped("add_prep_note", { job_id: application.id, kind: "context", stage_name: "technical_interview", text: "Review the incident response example and testing tradeoffs." }, prepNoteOutput);
@@ -635,28 +627,25 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     }
   });
 
-  test("lead intake rejects missing, closed, excluded, unverified and stale openings atomically", async () => {
+  test("lead intake rejects missing, closed, malformed and stale openings atomically", async () => {
     const opening = await verifiedOpening("No opening");
-    await error("add_job", { company: "No opening employer" }, /eligible opening/u);
-    await error("add_jobs", { jobs: [{ company: "No opening batch" }] }, /eligible opening/u);
+    await error("add_job", { company: "No opening employer" }, /open role/u);
+    await error("add_jobs", { jobs: [{ company: "No opening batch" }] }, /open role/u);
     for (const invalid of [
-      { status: "closed" }, { status: "unknown" }, { eligibility: "excluded" }, { eligibility: "unknown" },
-      { source_url: "" }, { description: "" }, { location: " " }, { eligibility_reason: " " },
-      { criteria_updated_at: "2000-01-01T00:00:00.000Z" },
+      { status: "closed" }, { status: "unknown" }, { eligibility: "eligible" }, { eligibility_reason: "Fits" },
+      { source_url: "" }, { description: "" }, { location: " " },
       { checked_at: new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString() },
       { checked_at: "2099-01-01T00:00:00.000Z" },
-    ]) await error("add_job", { company: "No opening invalid", eligible_opening: { ...opening, ...invalid } }, /Invalid|length|characters|non-blank|criteria|24 hours|future/u);
+    ]) await error("add_job", { company: "No opening invalid", opening: { ...opening, ...invalid } }, /Invalid|length|characters|non-blank|open role|24 hours|future/u);
     await error("add_jobs", { jobs: [
-      { company: "No opening rollback", eligible_opening: opening }, { company: "No opening invalid" },
-    ] }, /0 of 2 records saved.*Record 2:.*eligible opening/u);
+      { company: "No opening rollback", opening: opening }, { company: "No opening invalid" },
+    ] }, /0 of 2 records saved.*Record 2:.*open role/u);
     assert.deepEqual((await call("list_jobs", { query: "No opening" }, jobsSchema)).jobs, []);
-    await call("set_criteria", { text: "Updated remote TypeScript product roles, exclude onsite work." }, v.unknown());
-    await error("add_job", { company: "No opening stale criteria", eligible_opening: opening }, /outdated criteria/u);
   });
 
-  test("leads stay active until removed for eligibility, while application outcomes and communication history survive", async () => {
+  test("leads stay active until removed, while application outcomes and communication history survive", async () => {
     await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
-    const lead = await call("add_job", { company: "Eligibility-only lead", score: 0, eligible_opening: await verifiedOpening("Eligibility-only lead") }, jobSchema);
+    const lead = await call("add_job", { company: "Eligibility-only lead", score: 0, opening: await verifiedOpening("Eligibility-only lead") }, jobSchema);
     for (const status of ["withdrawn", "rejected", "offer", "accepted"]) {
       await error("update_job", { job_id: lead.id, status }, /leads.*active.*remove_lead/iu);
       assert.equal((await call("get_job", { job_id: lead.id }, v.object({ job: jobSchema }))).job.status, "active");
@@ -667,18 +656,18 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     ]) await error("update_job", { job_id: lead.id, ...patch }, /lead.*application/iu);
     const untouched = await call("get_job", { job_id: lead.id }, v.object({ job: v.object({ phase: v.string(), current_stage: v.string() }) }));
     assert.deepEqual(untouched.job, { phase: "lead", current_stage: "lead" });
-    const application = await call("add_job", { company: "Actual withdrawn application", phase: "application", eligible_opening: await verifiedOpening("Actual withdrawn application") }, jobSchema);
+    const application = await call("add_job", { company: "Actual withdrawn application", phase: "application", opening: await verifiedOpening("Actual withdrawn application") }, jobSchema);
     await call("update_job", { job_id: application.id, status: "withdrawn" }, jobSchema);
-    await error("update_job", { job_id: application.id, phase: "lead", eligible_opening: await verifiedOpening("Actual withdrawn application") }, /leads.*active/iu);
+    await error("update_job", { job_id: application.id, phase: "lead", opening: await verifiedOpening("Actual withdrawn application") }, /leads.*active/iu);
     await error("remove_lead", { job_id: application.id }, /application.*history/iu);
-    const contacted = await call("add_job", { company: "Contacted lead", eligible_opening: await verifiedOpening("Contacted lead") }, jobSchema);
+    const contacted = await call("add_job", { company: "Contacted lead", opening: await verifiedOpening("Contacted lead") }, jobSchema);
     const message = await call("record_outreach", { contact: { job_id: contacted.id, name: "Example referrer" }, direction: "outbound" }, outreachOutput);
     const contactedJob = await call("get_job", { job_id: contacted.id }, v.object({ job: v.object({ phase: v.string(), current_stage: v.string(), status: v.string() }) }));
     assert.deepEqual(contactedJob.job, { phase: "application", current_stage: "outreach", status: "active" });
-    await error("update_job", { job_id: contacted.id, phase: "lead", eligible_opening: await verifiedOpening("Contacted lead") }, /application.*lead/iu);
+    await error("update_job", { job_id: contacted.id, phase: "lead", opening: await verifiedOpening("Contacted lead") }, /application.*lead/iu);
     await error("remove_lead", { job_id: contacted.id }, /communication history/iu);
     assert.deepEqual((await call("get_job", { job_id: contacted.id }, v.object({ outreach: v.array(outreachOutput) }))).outreach, [message]);
-    const scheduled = await call("add_job", { company: "Scheduled lead", eligible_opening: await verifiedOpening("Scheduled lead") }, jobSchema);
+    const scheduled = await call("add_job", { company: "Scheduled lead", opening: await verifiedOpening("Scheduled lead") }, jobSchema);
     await error("add_stage", { job_id: scheduled.id, name: "recruiter_screen", starts_at: "2026-11-02T11:00:00Z", ends_at: "2026-11-02T10:00:00Z" }, /ends_at/u);
     assert.equal((await call("get_job", { job_id: scheduled.id }, v.object({ job: v.object({ phase: v.string() }) }))).job.phase, "lead");
     await call("add_stage", { job_id: scheduled.id, name: "recruiter_screen", make_current: false }, stageSchema);
@@ -692,10 +681,10 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal((await call("get_job", { job_id: application.id }, v.object({ job: jobSchema }))).job.status, "withdrawn");
   });
 
-  test("eligible leads retain proof and salary, employer changes require fresh proof, and applications cannot return to leads", async () => {
+  test("leads retain their opening and salary, employer changes require a fresh opening, and applications cannot return to leads", async () => {
     const detailSchema = v.object({ job: v.object({ ...jobSchema.entries, phase: v.string(), description: v.optional(v.string()), location: v.optional(v.string()) }) });
-    const eligibleOpening = await verifiedOpening("Employer only");
-    const lead = await call("add_job", { company: "Employer only", eligible_opening: eligibleOpening, company_url: "https://employer.example/careers",
+    const leadOpening = await verifiedOpening("Employer only");
+    const lead = await call("add_job", { company: "Employer only", opening: leadOpening, company_url: "https://employer.example/careers",
       salary_min: 120_000, salary_max: 160_000, salary_currency: "USD", salary_period: "year" }, jobSchema);
     assert.equal(lead.title, undefined);
     const salarySchema = v.object({ job: v.object({ salary_min: v.optional(v.number()), salary_max: v.optional(v.number()), salary_currency: v.optional(v.string()), salary_period: v.optional(v.string()) }) });
@@ -706,26 +695,26 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal(result.isError, true);
     }
     const fields = { title: "Engineer", description: "An opening", source_url: "https://jobs.example/employer", location: "Remote" };
-    await error("update_job", { job_id: lead.id, company: "Different employer" }, /eligible opening/u);
+    await error("update_job", { job_id: lead.id, company: "Different employer" }, /open role/u);
     for (const [key, value] of Object.entries(fields)) {
       await error("add_job", { company: `Forbidden ${key}`, [key]: value }, /application/u);
       await error("update_job", { job_id: lead.id, [key]: value }, /application/u);
     }
-    await error("add_jobs", { jobs: [{ company: "Lead batch rollback", eligible_opening: await verifiedOpening("Lead batch rollback") }, { company: "Forbidden batch", title: "Engineer" }] }, /application/u);
+    await error("add_jobs", { jobs: [{ company: "Lead batch rollback", opening: await verifiedOpening("Lead batch rollback") }, { company: "Forbidden batch", title: "Engineer" }] }, /application/u);
     assert.deepEqual((await call("list_jobs", { query: "Lead batch rollback" }, jobsSchema)).jobs, []);
     await error("update_job", { job_id: lead.id, current_stage: "outreach" }, /lead.*application/iu);
     await error("update_job", { job_id: lead.id, ...fields }, /application/u);
-    await call("update_job", { job_id: lead.id, phase: "application", eligible_opening: eligibleOpening, ...fields }, jobSchema);
+    await call("update_job", { job_id: lead.id, phase: "application", opening: leadOpening, ...fields }, jobSchema);
     const application = await call("get_job", { job_id: lead.id }, detailSchema);
     assert.equal(application.job.phase, "application");
     assert.equal(application.job.description, fields.description);
     await error("update_job", { job_id: lead.id, current_stage: "lead" }, /application.*milestone/iu);
     await error("update_job", { job_id: lead.id, phase: "lead" }, /application.*lead/iu);
-    await error("update_job", { job_id: lead.id, phase: "lead", eligible_opening: eligibleOpening }, /application.*lead/iu);
-    await call("update_job", { job_id: lead.id, status: "active", eligible_opening: eligibleOpening }, jobSchema);
-    const proof = v.object({ eligible_opening: v.record(v.string(), v.unknown()) });
-    assert.deepEqual((await call("get_job", { job_id: lead.id }, v.object({ job: proof }))).job.eligible_opening, eligibleOpening);
-    assert.deepEqual((await call("list_jobs", { query: "Employer only", include_descriptions: true }, v.object({ jobs: v.array(proof) }))).jobs[0]?.eligible_opening, eligibleOpening);
+    await error("update_job", { job_id: lead.id, phase: "lead", opening: leadOpening }, /application.*lead/iu);
+    await call("update_job", { job_id: lead.id, status: "active", opening: leadOpening }, jobSchema);
+    const proof = v.object({ opening: v.record(v.string(), v.unknown()) });
+    assert.deepEqual((await call("get_job", { job_id: lead.id }, v.object({ job: proof }))).job.opening, leadOpening);
+    assert.deepEqual((await call("list_jobs", { query: "Employer only", include_descriptions: true }, v.object({ jobs: v.array(proof) }))).jobs[0]?.opening, leadOpening);
     const returned = await call("get_job", { job_id: lead.id }, detailSchema);
     assert.equal(returned.job.phase, "application");
     assert.equal(returned.job.current_stage, "applied");
@@ -740,7 +729,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   });
 
   test("pipeline writes reject prepared and arbitrary states through every MCP mutation", async () => {
-    const application = await call("add_job", { phase: "application", company: "Fixed milestones", eligible_opening: await verifiedOpening("Fixed milestones") }, jobSchema);
+    const application = await call("add_job", { phase: "application", company: "Fixed milestones", opening: await verifiedOpening("Fixed milestones") }, jobSchema);
     for (const current_stage of ["prepared", "Prepared — awaiting human submission", "draft", "arbitrary milestone"]) {
       await error("update_job", { job_id: application.id, current_stage }, /current_stage/u);
       await error("add_stage", { job_id: application.id, name: current_stage }, /name/u);
@@ -772,8 +761,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
 
   test("concurrent applications keep independent stages, failures, optional feedback, and corrected voice transcriptions", async () => {
     const imported = await call("add_jobs", { jobs: [
-      { phase: "application", company: "Track A", eligible_opening: await verifiedOpening("Track A"), title: "Engineer", description: "Role A" },
-      { phase: "application", company: "Track B", eligible_opening: await verifiedOpening("Track B"), title: "Engineer", description: "Role B" },
+      { phase: "application", company: "Track A", opening: await verifiedOpening("Track A"), title: "Engineer", description: "Role A" },
+      { phase: "application", company: "Track B", opening: await verifiedOpening("Track B"), title: "Engineer", description: "Role B" },
     ] }, jobsSchema);
     assert.ok(imported.jobs[0] && imported.jobs[1]);
     const [screening, technical] = await Promise.all([
@@ -802,7 +791,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   test("expired rejections return to available opportunities without reopening the failed application", async () => {
     await call("set_criteria", { text: "Remote product engineering roles." }, v.unknown());
     const opening = await verifiedOpening("Reapplication Co");
-    const application = await call("add_job", { company: "Reapplication Co", phase: "application", source_url: opening.source_url, eligible_opening: opening }, jobSchema);
+    const application = await call("add_job", { company: "Reapplication Co", phase: "application", source_url: opening.source_url, opening: opening }, jobSchema);
     const stage = await call("add_stage", { job_id: application.id, name: "system_design", status: "failed" }, stageSchema);
     const feedback = await call("add_feedback", { stage_id: stage.id, source: "recruiter", text: "Please return after the cooldown." }, feedbackOutput);
     const eligibility = v.object({ ...jobSchema.entries, rejected_at: v.optional(v.string()), reapply_policy: v.optional(v.string()), reapply_after: v.optional(v.string()), reapply_status: v.string() });
@@ -842,7 +831,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal((await call("get_job", { job_id: application.id }, v.object({ job: eligibility }))).job.reapply_status, expected);
     }
     const nextAttempt = await call("add_job", {
-      company: "Reapplication Co", phase: "application", source_url: opening.source_url, eligible_opening: opening,
+      company: "Reapplication Co", phase: "application", source_url: opening.source_url, opening: opening,
     }, jobSchema);
     assert.notEqual(nextAttempt.id, application.id);
     await call("update_job", { job_id: application.id, reapply_policy: null, reapply_after: null }, jobSchema);
@@ -900,12 +889,12 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(reopened.notes, notes + " Reviewed.");
     await error("update_job", { job_id: application.id, outcome: withdrawal }, /non-active application status/u);
     await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
-    const lead = await call("add_job", { company: "Outcome lead", eligible_opening: await verifiedOpening("Outcome lead") }, outcomeJob);
+    const lead = await call("add_job", { company: "Outcome lead", opening: await verifiedOpening("Outcome lead") }, outcomeJob);
     await error("update_job", { job_id: lead.id, outcome: withdrawal }, /non-active application status/u);
   });
 
   test("UTC scheduling produces Google Calendar arguments and retains event IDs for rescheduling and cancellation", async () => {
-    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Calendar Co", eligible_opening: await verifiedOpening("Calendar Co"), title: "Engineer", description: "Remote", notes: "Private salary target" }] }, jobsSchema);
+    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Calendar Co", opening: await verifiedOpening("Calendar Co"), title: "Engineer", description: "Remote", notes: "Private salary target" }] }, jobsSchema);
     assert.ok(imported.jobs[0]);
     await call("add_prep_note", { job_id: imported.jobs[0].id, kind: "reminder", text: "Private interview preparation" }, prepNoteOutput);
     const stage = await call("add_stage", {
@@ -956,11 +945,11 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   test("invalid input and duplicate imports leave D1 unchanged; incomplete calendar details are reported", async () => {
     await error("add_jobs", { jobs: [{ phase: "application", company: " ", title: "Engineer", description: "Role" }] }, /non-blank/u);
     await error("add_jobs", { jobs: [{ phase: "application", company: "Unknown-key Co", title: "Engineer", description: "Role", ignored_typo: true }] }, /ignored_typo|Invalid key/u);
-    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Validation Co", eligible_opening: await verifiedOpening("Validation Co"), title: "Engineer", description: "Role", nickname: "unique-role" }] }, jobsSchema);
+    const imported = await call("add_jobs", { jobs: [{ phase: "application", company: "Validation Co", opening: await verifiedOpening("Validation Co"), title: "Engineer", description: "Role", nickname: "unique-role" }] }, jobsSchema);
     assert.ok(imported.jobs[0]);
     await error("add_jobs", { jobs: [
-      { phase: "application", company: "Atomic rollback", eligible_opening: await verifiedOpening("Atomic rollback"), title: "Engineer", description: "Role" },
-      { phase: "application", company: "Duplicate", eligible_opening: await verifiedOpening("Duplicate"), title: "Engineer", description: "Role", nickname: "UNIQUE-ROLE" },
+      { phase: "application", company: "Atomic rollback", opening: await verifiedOpening("Atomic rollback"), title: "Engineer", description: "Role" },
+      { phase: "application", company: "Duplicate", opening: await verifiedOpening("Duplicate"), title: "Engineer", description: "Role", nickname: "UNIQUE-ROLE" },
     ] }, /already exists/u);
     assert.deepEqual((await call("list_jobs", { query: "Atomic rollback" }, jobsSchema)).jobs, []);
     await error("add_stage", { job_id: imported.jobs[0].id, name: "technical_interview", starts_at: "2026-11-02T10:00:00" }, /timestamp/u);
@@ -1150,8 +1139,8 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       ] as const) assert.equal((await alice.callTool({ name, arguments: args })).isError, true, name);
       assert.deepEqual(await scoped(alice, "get_application_context", {}, applicationOutput), aliceApplication);
       const opening = { phase: "application", company: "Shared company", title: "Engineer", nickname: "shared-role", source_url: "https://jobs.example/shared", description: "A role both users can track" };
-      const aliceJob = (await scoped(alice, "add_jobs", { jobs: [{ ...opening, eligible_opening: await verifiedOpening("Shared company", alice) }] }, jobsSchema)).jobs[0];
-      const bobJob = (await scoped(bob, "add_jobs", { jobs: [{ ...opening, eligible_opening: await verifiedOpening("Shared company", bob) }] }, jobsSchema)).jobs[0];
+      const aliceJob = (await scoped(alice, "add_jobs", { jobs: [{ ...opening, opening: await verifiedOpening("Shared company", alice) }] }, jobsSchema)).jobs[0];
+      const bobJob = (await scoped(bob, "add_jobs", { jobs: [{ ...opening, opening: await verifiedOpening("Shared company", bob) }] }, jobsSchema)).jobs[0];
       assert.ok(aliceJob && bobJob);
       assert.notEqual(aliceJob.id, bobJob.id);
       const aliceNote = await scoped(alice, "add_prep_note", { job_id: aliceJob.id, kind: "reminder", text: "Alice private preparation" }, prepNoteOutput);
@@ -1254,7 +1243,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       await scoped(alice, "set_criteria", { text: "Alice changed again" }, v.unknown());
       assert.deepEqual((await scoped(alice, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [aliceJob.id]);
       assert.deepEqual((await scoped(bob, "list_jobs", {}, jobsSchema)).jobs.map((job) => job.id), [bobJob.id]);
-      const lead = await scoped(alice, "add_job", { company: "Alice lead", eligible_opening: await verifiedOpening("Alice lead", alice) }, jobSchema);
+      const lead = await scoped(alice, "add_job", { company: "Alice lead", opening: await verifiedOpening("Alice lead", alice) }, jobSchema);
       const foreignRemoval = await bob.callTool({ name: "remove_lead", arguments: { job_id: lead.id } });
       assert.equal(foreignRemoval.isError, true);
       assert.equal((await scoped(alice, "get_job", { job_id: lead.id }, v.object({ job: jobSchema }))).job.id, lead.id);
@@ -1307,13 +1296,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   });
 
   test("prospective contacts cannot be saved before communication", async () => {
-    const employer = await call("add_job", { company: "Uncontacted prospect example", eligible_opening: await verifiedOpening("Uncontacted prospect example") }, jobSchema);
+    const employer = await call("add_job", { company: "Uncontacted prospect example", opening: await verifiedOpening("Uncontacted prospect example") }, jobSchema);
     await assert.rejects(client.callTool({ name: "save_contact", arguments: { job_id: employer.id, name: "Uncontacted prospect" } }), /not found/u);
     await error("update_contact", { job_id: employer.id, name: "Uncontacted prospect" }, /contact_id/u);
     await error("record_outreach", { direction: "outbound" }, /exactly one/u);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Uncontacted prospect" } }, /direction/u);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Future prospect" }, direction: "outbound", occurred_at: "2099-01-01T00:00:00Z" }, /future/u);
-    const other = await call("add_job", { company: "Other prospect employer", eligible_opening: await verifiedOpening("Other prospect employer") }, jobSchema);
+    const other = await call("add_job", { company: "Other prospect employer", opening: await verifiedOpening("Other prospect employer") }, jobSchema);
     const foreignStage = await call("add_stage", { job_id: other.id, name: "technical_interview" }, stageSchema);
     await error("record_outreach", { contact: { job_id: employer.id, name: "Wrong stage prospect" }, direction: "outbound", stage_id: foreignStage.id }, /same job/u);
     const history = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
@@ -1333,7 +1322,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
   });
 
   test("referral contacts keep an event-time outreach clock across stage changes and surface actionable follow-ups", async () => {
-    const employer = await call("add_job", { company: "Referral Example", eligible_opening: await verifiedOpening("Referral Example") }, jobSchema);
+    const employer = await call("add_job", { company: "Referral Example", opening: await verifiedOpening("Referral Example") }, jobSchema);
     const activity = v.object({
       id: v.string(), company: v.string(), relationship: v.string(), current_stage: v.string(),
       first_outreach_at: v.string(), last_outreach_at: v.string(), last_interaction_time_basis: v.string(),
@@ -1408,7 +1397,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const unchanged = await call("get_job", { job_id: employer.id }, v.object(outreachHistory));
     assert.equal(unchanged.contacts.length, 2);
     assert.equal(unchanged.outreach.length, persisted.outreach.length);
-    const other = await call("add_job", { company: "Different employer", eligible_opening: await verifiedOpening("Different employer") }, jobSchema);
+    const other = await call("add_job", { company: "Different employer", opening: await verifiedOpening("Different employer") }, jobSchema);
     const otherStage = await call("add_stage", { job_id: other.id, name: "technical_interview" }, stageSchema);
     await error("record_outreach", { contact_id: friend.id, stage_id: otherStage.id, direction: "outbound" }, /same job/u);
     await error("update_contact", { job_id: other.id, contact_id: friend.id, name: "Wrong employer" }, /does not belong/u);
@@ -1431,7 +1420,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(checkBack.follow_ups[0]?.last_outreach_at, "2026-09-02T09:00:00.000Z");
     await call("update_outreach", { outreach_id: acknowledgement.id, follow_up_status: "cancelled" }, outreachOutput);
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups.map((contact) => contact.id), [friend.id]);
-    await call("update_job", { job_id: employer.id, phase: "application", current_stage: "outreach", eligible_opening: await verifiedOpening("Referral Example"), status: "withdrawn" }, jobSchema);
+    await call("update_job", { job_id: employer.id, phase: "application", current_stage: "outreach", opening: await verifiedOpening("Referral Example"), status: "withdrawn" }, jobSchema);
     assert.deepEqual((await call("get_follow_ups", { job_id: employer.id }, followUps)).follow_ups, []);
   });
 
@@ -1482,13 +1471,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal(empty.next_offset, undefined);
       await scoped("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
       const imported = await scoped("add_jobs", { jobs: [
-        { company: "Pipeline submitted", phase: "application", eligible_opening: await verifiedOpening("Pipeline submitted", owner), title: "Engineer", notes: "Private application notes", description: "Long opening description" },
-        { company: "Pipeline referral", phase: "application", eligible_opening: await verifiedOpening("Pipeline referral", owner) },
-        { company: "Pipeline offer", phase: "application", eligible_opening: await verifiedOpening("Pipeline offer", owner) },
-        { company: "Pipeline rejected", phase: "application", eligible_opening: await verifiedOpening("Pipeline rejected", owner) },
-        { company: "Pipeline withdrawn", phase: "application", eligible_opening: await verifiedOpening("Pipeline withdrawn", owner) },
-        { company: "Pipeline accepted", phase: "application", eligible_opening: await verifiedOpening("Pipeline accepted", owner) },
-        { company: "Pipeline lead", eligible_opening: await verifiedOpening("Pipeline lead", owner) },
+        { company: "Pipeline submitted", phase: "application", opening: await verifiedOpening("Pipeline submitted", owner), title: "Engineer", notes: "Private application notes", description: "Long opening description" },
+        { company: "Pipeline referral", phase: "application", opening: await verifiedOpening("Pipeline referral", owner) },
+        { company: "Pipeline offer", phase: "application", opening: await verifiedOpening("Pipeline offer", owner) },
+        { company: "Pipeline rejected", phase: "application", opening: await verifiedOpening("Pipeline rejected", owner) },
+        { company: "Pipeline withdrawn", phase: "application", opening: await verifiedOpening("Pipeline withdrawn", owner) },
+        { company: "Pipeline accepted", phase: "application", opening: await verifiedOpening("Pipeline accepted", owner) },
+        { company: "Pipeline lead", opening: await verifiedOpening("Pipeline lead", owner) },
       ] }, jobsSchema);
       const [submitted, referral, offer, rejected, withdrawn, accepted, lead] = imported.jobs;
       assert.ok(submitted && referral && offer && rejected && withdrawn && accepted && lead);
@@ -1666,7 +1655,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const pageSchema = v.strictObject({ jobs: v.array(v.object({
       ...jobSchema.entries, phase: v.string(), notes: v.optional(v.string()),
       description: v.optional(v.string()),
-      eligible_opening: v.object({ title: v.string(), source_url: v.string(), description: v.optional(v.string()) }),
+      opening: v.object({ title: v.string(), source_url: v.string(), description: v.optional(v.string()) }),
     })), next_offset: v.optional(v.number()) });
     try {
       await owner.connect(new StreamableHTTPClientTransport(endpoint, { requestInit: { headers: { Authorization: `Bearer ${connection.token}` } } }));
@@ -1684,7 +1673,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         { company: "Reapplication", phase: "application", score: 0 },
       ].map((job) => ({
         ...job, notes: job.company === "High" ? hold : undefined,
-        eligible_opening: { ...opening, description: job.company === "High" ? detailedDescription : opening.description,
+        opening: { ...opening, description: job.company === "High" ? detailedDescription : opening.description,
           source_url: `https://jobs.example/selection/${encodeURIComponent(job.company)}` },
       })) }, jobsSchema);
       const [zero, low, tieA, tieB, high, unranked, withdrawn, rejected, application, reapplication] = imported.jobs;
@@ -1694,7 +1683,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
         await scoped("update_job", { job_id: job.id, status: "rejected", reapply_policy: "allowed" }, jobSchema);
       }
       await call("set_criteria", { text: "Remote TypeScript engineering roles." }, v.unknown());
-      await call("add_job", { company: "Other user's ranked lead", score: 100, eligible_opening: await verifiedOpening("Other user's ranked lead") }, jobSchema);
+      await call("add_job", { company: "Other user's ranked lead", score: 100, opening: await verifiedOpening("Other user's ranked lead") }, jobSchema);
       const snapshotSchema = v.object({ jobs: v.array(v.record(v.string(), v.unknown())), next_offset: v.optional(v.never()) });
       const jobsBefore = await scoped("list_jobs", { include_descriptions: true }, snapshotSchema);
       const pipelineBefore = await scoped("get_pipeline", {}, v.object({ summary: v.unknown(), applications: v.array(v.unknown()) }));
@@ -1706,13 +1695,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal(remaining.next_offset, undefined);
       assert.deepEqual([...context.jobs, ...remaining.jobs].map((job) => job.id).sort(),
         [zero, low, tieA, tieB, high, unranked, rejected, application, reapplication].map((job) => job.id).sort());
-      assert.ok(context.jobs.every((job) => !Object.hasOwn(job.eligible_opening, "description")));
+      assert.ok(context.jobs.every((job) => !Object.hasOwn(job.opening, "description")));
       assert.ok(context.jobs.every((job) => !Object.hasOwn(job, "notes")));
       const fullContext = await scoped("get_lead_context", { limit: 100, include_descriptions: true, include_notes: true }, contextSchema);
-      assert.equal(fullContext.jobs.find((job) => job.id === high.id)?.eligible_opening.description, detailedDescription);
+      assert.equal(fullContext.jobs.find((job) => job.id === high.id)?.opening.description, detailedDescription);
       assert.equal(fullContext.jobs.find((job) => job.id === high.id)?.notes, hold);
-      const fullRecord = await scoped("get_job", { job_id: high.id }, v.object({ job: v.object({ eligible_opening: v.object({ description: v.string() }), notes: v.string() }) }));
-      assert.equal(fullRecord.job.eligible_opening.description, detailedDescription);
+      const fullRecord = await scoped("get_job", { job_id: high.id }, v.object({ job: v.object({ opening: v.object({ description: v.string() }), notes: v.string() }) }));
+      assert.equal(fullRecord.job.opening.description, detailedDescription);
       assert.equal(fullRecord.job.notes, hold);
       const ties = [tieA.id, tieB.id].sort();
       for (const [order, expected] of [
@@ -1733,7 +1722,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
           assert.equal(job.current_stage, "lead");
           assert.equal(job.status, "active");
           assert.equal(job.description, undefined);
-          assert.ok(!Object.hasOwn(job.eligible_opening, "description"));
+          assert.ok(!Object.hasOwn(job.opening, "description"));
           if (job.id === high.id) assert.equal(job.notes, hold);
         }
       }
@@ -1777,7 +1766,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal(cleared.job.priority, undefined);
       assert.equal(cleared.job.score, undefined);
       assert.equal(cleared.job.current_stage, "lead");
-      await scoped("update_job", { job_id: high.id, phase: "application", eligible_opening: await verifiedOpening("High", owner) }, jobSchema);
+      await scoped("update_job", { job_id: high.id, phase: "application", opening: await verifiedOpening("High", owner) }, jobSchema);
       assert.deepEqual((await scoped("get_next_leads", { limit: 100 }, pageSchema)).jobs.map((job) => job.id), [...ties, low.id, zero.id]);
       for (const job of [low, tieA, tieB]) await scoped("remove_lead", { job_id: job.id }, v.unknown());
       await scoped("update_job", { job_id: zero.id, score: null }, jobSchema);
@@ -1804,7 +1793,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       const opening = await verifiedOpening(`Bulk ${size}`);
       const jobs = Array.from({ length: size }, (_, index) => ({
         company: `Bulk ${size} employer ${index}`, nickname: `bulk-${size}-${index}`,
-        eligible_opening: { ...opening, source_url: `https://jobs.example/bulk-${size}-${index}` },
+        opening: { ...opening, source_url: `https://jobs.example/bulk-${size}-${index}` },
       }));
       const imported = await call("add_jobs", { jobs }, jobsSchema);
       assert.deepEqual(imported.jobs.map((job) => job.company).sort(), jobs.map((job) => job.company).sort());
@@ -1814,7 +1803,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
       assert.equal(saved.next_offset, undefined);
       const conflicting = Array.from({ length: size }, (_, index) => ({
         company: `Bulk rollback ${size} employer ${index}`,
-        eligible_opening: { ...opening, source_url: `https://jobs.example/rollback-${size}-${index}` },
+        opening: { ...opening, source_url: `https://jobs.example/rollback-${size}-${index}` },
         nickname: index === size - 1 ? `BULK-${size}-0` : `bulk-rollback-${size}-${index}`,
       }));
       await error("add_jobs", { jobs: conflicting }, /already exists/u);
@@ -1845,7 +1834,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     await call("set_criteria", { text: "Remote TypeScript product engineering roles." }, v.unknown());
     const opening = await verifiedOpening("Closure lifecycle");
     const lead = await call("add_job", {
-      company: "Closure lifecycle", eligible_opening: opening, score: 80, notes: "Keep employer context",
+      company: "Closure lifecycle", opening: opening, score: 80, notes: "Keep employer context",
     }, jobSchema);
     const state = v.object({ ...jobSchema.entries, opening_status: v.string() });
     const closed = await call("close_opening", {
@@ -1865,7 +1854,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.ok(research.replacement_search.jobs.some((job) => job.id === lead.id));
     const filtered = await call("list_jobs", { opening_status: "closed", query: "Closure lifecycle" }, jobsSchema);
     assert.equal(filtered.jobs[0]?.id, lead.id);
-    await error("update_job", { job_id: lead.id, eligible_opening: opening, phase: "application" }, /closed/u);
+    await error("update_job", { job_id: lead.id, opening: opening, phase: "application" }, /closed/u);
     const detail = v.object({
       job: v.object({ ...state.entries, notes: v.optional(v.string()) }),
       opening_closures: v.array(v.object({ source_url: v.string(), reason: v.string() })),
@@ -1876,7 +1865,7 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(unchanged.job.notes, "Keep employer context");
     assert.deepEqual([unchanged.stages, unchanged.contacts, unchanged.outreach], [[], [], []]);
     const replacement = { ...await verifiedOpening("Closure replacement"), title: "Replacement engineer" };
-    const refreshed = await call("update_job", { job_id: lead.id, eligible_opening: replacement }, state);
+    const refreshed = await call("update_job", { job_id: lead.id, opening: replacement }, state);
     assert.equal(refreshed.opening_status, "open");
     assert.equal(refreshed.created_at, lead.created_at);
     assert.equal(refreshed.score, undefined);
@@ -1891,13 +1880,13 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(history.job.created_at, lead.created_at);
   });
 
-  test("multiple openings retain honest eligibility under one employer and preserve the actual application destination", async () => {
+  test("multiple openings retain role status under one employer and preserve the actual application destination", async () => {
     await call("set_criteria", { text: "Remote product engineering; office work requires role-specific location permission." }, v.unknown());
     const first = await verifiedOpening("Multiple openings");
     const salary = { min: 140_000, max: 180_000, currency: "USD", period: "year", basis: "gross" };
-    const lead = await call("add_job", { company: "Multiple openings", eligible_opening: first, employer_salary: salary,
+    const lead = await call("add_job", { company: "Multiple openings", opening: first, employer_salary: salary,
       score: 80, salary_ask_amount: 170_000, salary_ask_currency: "USD", salary_ask_period: "year" }, jobSchema);
-    const openingOutput = v.object({ id: v.string(), source_url: v.string(), status: v.string(), eligibility: v.string(),
+    const openingOutput = v.object({ id: v.string(), source_url: v.string(), status: v.string(),
       selected: v.boolean(), notes: v.optional(v.string()), employer_salary: v.optional(v.object({ min: v.number() })) });
     const openingPage = v.object({ openings: v.array(openingOutput), next_offset: v.optional(v.number()) });
     const original = (await call("list_openings", { job_id: lead.id }, openingPage)).openings[0]!;
@@ -1907,16 +1896,16 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const alternative = await call("save_opening", { job_id: lead.id, opening: second,
       employer_salary: { ...salary, min: 190_000, max: 220_000 }, notes: "Explicitly keep this alternative" }, openingOutput);
     assert.equal(alternative.selected, false);
-    const refreshed = { ...second, checked_at: new Date().toISOString(), eligibility_reason: "Live and eligible; refreshed" };
+    const refreshed = { ...second, checked_at: new Date().toISOString(), location: "Remote EMEA; refreshed" };
     const updated = await call("save_opening", { job_id: lead.id, opening: refreshed }, openingOutput);
     assert.equal(updated.id, alternative.id);
     assert.equal(updated.notes, "Explicitly keep this alternative");
     assert.equal(updated.employer_salary?.min, 190_000);
     const unknown = { ...await verifiedOpening("Multiple location unresolved"), title: "Internal agent security engineer",
-      location: "Office; requested city not confirmed", eligibility: "unknown", criteria_updated_at: null,
-      eligibility_reason: "Role-specific permission for the requested office is unknown" };
+      location: "Office; requested city not confirmed", status: "unknown" };
     const candidate = await call("save_opening", { job_id: lead.id, opening: unknown }, openingOutput);
-    assert.equal(candidate.eligibility, "unknown");
+    assert.equal(candidate.status, "unknown");
+    assert.equal(Object.hasOwn(candidate, "eligibility"), false);
     assert.equal(candidate.selected, false);
     const all = await call("list_openings", { job_id: lead.id }, openingPage);
     assert.equal(all.openings.length, 3);
@@ -1924,16 +1913,16 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     const page = await call("list_openings", { job_id: lead.id, limit: 1 }, openingPage);
     assert.equal(page.next_offset, 1);
     assert.equal((await call("list_openings", { job_id: lead.id, limit: 1, offset: page.next_offset }, openingPage)).openings.length, 1);
-    assert.deepEqual((await call("list_openings", { job_id: lead.id, eligibility: "unknown" }, openingPage)).openings.map((opening) => opening.id), [candidate.id]);
+    assert.deepEqual((await call("list_openings", { job_id: lead.id, status: "unknown" }, openingPage)).openings.map((opening) => opening.id), [candidate.id]);
     assert.equal((await call("list_jobs", { query: "Multiple openings" }, jobsSchema)).jobs.length, 1);
     assert.equal((await call("list_jobs", { query: second.title }, jobsSchema)).jobs[0]?.id, lead.id);
     for (const query of [first.source_url, second.source_url]) {
       assert.deepEqual((await call("list_jobs", { query }, jobsSchema)).jobs.map((job) => job.id), [lead.id]);
     }
     const selection = v.object({ ...jobSchema.entries, selected_opening_id: v.string(), opening_count: v.number(),
-      opening_eligibility: v.string(), eligible_opening: v.object({ source_url: v.string() }),
+      opening: v.object({ source_url: v.string() }),
       employer_salary: v.optional(v.object({ min: v.number() })), salary_target: v.optional(v.unknown()) });
-    await error("select_opening", { job_id: lead.id, opening_id: candidate.id }, /open and eligible/u);
+    await error("select_opening", { job_id: lead.id, opening_id: candidate.id }, /requires it to be open/u);
     await error("select_opening", { job_id: lead.id, opening_id: crypto.randomUUID() }, /not found/u);
     const selected = await call("select_opening", { job_id: lead.id, opening_id: alternative.id }, selection);
     assert.equal(selected.selected_opening_id, alternative.id);
@@ -1941,26 +1930,24 @@ describe("Careers MCP through a real local Worker and D1", { concurrency: false 
     assert.equal(selected.employer_salary?.min, 190_000);
     assert.equal(selected.salary_target, undefined);
     assert.equal(selected.score, undefined);
-    assert.equal(selected.eligible_opening.source_url, second.source_url);
+    assert.equal(selected.opening.source_url, second.source_url);
     const originalTarget = (await call("list_openings", { job_id: lead.id }, v.object({ openings: v.array(v.object({
       id: v.string(), salary_target: v.optional(v.object({ amount: v.number() })),
     })) }))).openings.find((opening) => opening.id === original.id)?.salary_target;
     assert.equal(originalTarget?.amount, 170_000);
     await call("update_job", { job_id: lead.id, employer_salary: { ...salary, min: 195_000, max: 230_000 } }, jobSchema);
     assert.equal((await call("list_openings", { job_id: lead.id }, openingPage)).openings.find((opening) => opening.id === alternative.id)?.employer_salary?.min, 195_000);
-    await error("save_opening", { job_id: lead.id, opening: { ...refreshed, checked_at: "2000-01-01T00:00:00.000Z", eligibility: "unknown" } }, /predates/u);
-    await call("save_opening", { job_id: lead.id, opening: { ...second, checked_at: new Date().toISOString(), eligibility: "unknown" } }, openingOutput);
+    await error("save_opening", { job_id: lead.id, opening: { ...refreshed, checked_at: "2000-01-01T00:00:00.000Z", status: "unknown" } }, /predates/u);
+    await call("save_opening", { job_id: lead.id, opening: { ...second, checked_at: new Date().toISOString(), status: "unknown" } }, openingOutput);
     assert.deepEqual((await call("list_jobs", { query: "Multiple openings", available_only: true }, jobsSchema)).jobs, []);
     const detail = v.object({ job: selection, openings: v.array(openingOutput), stages: v.array(stageSchema), contacts: v.array(v.unknown()), outreach: v.array(v.unknown()) });
     const blocked = await call("get_job", { job_id: lead.id }, detail);
     assert.equal(blocked.job.current_stage, "lead");
     assert.deepEqual([blocked.stages, blocked.contacts, blocked.outreach], [[], [], []]);
-    await call("set_criteria", { text: "Updated remote product engineering criteria." }, v.unknown());
-    await error("select_opening", { job_id: lead.id, opening_id: original.id }, /outdated criteria/u);
     await call("add_stage", { job_id: lead.id, name: "applied" }, stageSchema);
     const application = await call("get_job", { job_id: lead.id }, detail);
     await error("select_opening", { job_id: lead.id, opening_id: original.id }, /historical/u);
-    await error("update_job", { job_id: lead.id, eligible_opening: await verifiedOpening("Multiple openings") }, /historical/u);
+    await error("update_job", { job_id: lead.id, opening: await verifiedOpening("Multiple openings") }, /historical/u);
     await call("save_opening", { job_id: lead.id, opening: { ...first, status: "closed", checked_at: new Date().toISOString() } }, openingOutput);
     const preserved = await call("get_job", { job_id: lead.id }, detail);
     assert.deepEqual(preserved.job, application.job);
